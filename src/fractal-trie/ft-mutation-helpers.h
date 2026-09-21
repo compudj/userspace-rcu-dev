@@ -7886,6 +7886,67 @@ void ft_flip_txn_record_tag_mw_pinned(struct ft_flip_txn *t, void **slot,
 		true FT_TK_MWA(dbg_mwa));
 }
 
+#ifdef FEATURE_FT_CELL_SW
+# define FT_CELL_SW_ENABLED	1
+#else
+# define FT_CELL_SW_ENABLED	0
+#endif
+/*
+ * The flip's own check.  Defaults ON wherever the park is on: a partial
+ * conversion is the defect, so shipping the park without the guard would be
+ * shipping the thing the guard exists to catch.  -DNO_FT_CELL_OWNED_STRICT is
+ * for the RED CONTROL -- drop one take, confirm the guard fires, put it back.
+ */
+/*
+ * Stage 5 rides the same flip: one flag to turn the whole conversion on.
+ * -DNO_FEATURE_FT_ROOT_SW keeps the root pinned while the cells park, which is
+ * the ablation for "is the root's own lock what regressed this".
+ */
+#if defined(FEATURE_FT_CELL_SW) && !defined(NO_FEATURE_FT_ROOT_SW)
+# define FT_ROOT_SW_ENABLED	1
+#else
+# define FT_ROOT_SW_ENABLED	0
+#endif
+
+#if defined(FEATURE_FT_CELL_SW) && !defined(NO_FT_CELL_OWNED_STRICT)
+# define FT_CELL_OWNED_STRICT	1
+#else
+# define FT_CELL_OWNED_STRICT	0
+#endif
+
+/*
+ * The root's own two census counters, declared here because the recorder that
+ * bumps them is below and the main FT_CELL_OWNER block is above nothing.
+ */
+#ifdef FT_DEBUG_CELL_OWNER
+__attribute__((weak)) unsigned long ft_cow_root_held_e, ft_cow_root_notheld_e;
+# define FT_COW_ROOT_NPC	12
+__attribute__((weak)) void *ft_cow_root_pc[FT_COW_ROOT_NPC];
+__attribute__((weak)) unsigned long ft_cow_root_pc_n[FT_COW_ROOT_NPC];
+# define FT_COW_ROOT_HELD()	uatomic_inc(&ft_cow_root_held_e)
+# define FT_COW_ROOT_NOTHELD()	do {					\
+		void *pc__ = __builtin_return_address(0);		\
+		int k__;						\
+									\
+		uatomic_inc(&ft_cow_root_notheld_e);			\
+		for (k__ = 0; k__ < FT_COW_ROOT_NPC; k__++) {		\
+			if (uatomic_read(&ft_cow_root_pc[k__]) == pc__) {\
+				uatomic_inc(&ft_cow_root_pc_n[k__]);	\
+				break;					\
+			}						\
+			if (!uatomic_read(&ft_cow_root_pc[k__]) &&	\
+			    uatomic_cmpxchg(&ft_cow_root_pc[k__], NULL,	\
+					pc__) == NULL) {		\
+				uatomic_inc(&ft_cow_root_pc_n[k__]);	\
+				break;					\
+			}						\
+		}							\
+	} while (0)
+#else
+# define FT_COW_ROOT_HELD()	do { } while (0)
+# define FT_COW_ROOT_NOTHELD()	do { } while (0)
+#endif
+
 /*
  * Record a TRIE ROOT edge.  ALWAYS MW, whatever @t's structural_sw mode and
  * whichever trie the slot belongs to.
@@ -7928,9 +7989,49 @@ static inline
 void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
+	/*
+	 * ☞ STAGE 5: &ft->root HAS AN OWNER NOW.
+	 *
+	 * This recorder was PINNED -- MW for ever -- on the reasoning the tree
+	 * states in two places: "no node owns &ft->root" and, in the MW_ALWAYS
+	 * ROOT note, "no node to lock, NEVER converts".  Both describe the
+	 * absence of an owner, not an impossibility, and @ft->root_lock is that
+	 * owner.  So ask the same question every cell word is asked: does this
+	 * txn hold the word's lock?  Held, record through the owner-bearing
+	 * form, which parks SW under the flip; not held, the old pinned MW,
+	 * which is what shipped.
+	 *
+	 * ☠ The root is NOT a cell, so it is not ft_cell_word_lock's business:
+	 * a cell's lock is derived from the cell, the root's is a single word
+	 * per trie.  Kept separate so neither predicate has to special-case the
+	 * other.
+	 */
+	/*
+	 * ☠ THE OWNER COMES FROM THE SLOT, NOT FROM @t->ft.  A cross-trie op
+	 * records the SOURCE trie's root through the DESTINATION's txn (graft's
+	 * glue txn writes &src_ft->root), so reading @t->ft would ask whether
+	 * the wrong trie's root lock is held -- answering "not held" for a word
+	 * that is, or worse the reverse.  The slot IS &ft->root, so recover the
+	 * trie from it.
+	 */
+	{
+		struct cds_ft *owner_ft = caa_container_of(
+				(struct cds_ft_inode_flag **) slot,
+				struct cds_ft, root);
+
+		if (FT_ROOT_SW_ENABLED &&
+				ft_flip_txn_holds(t, &owner_ft->root_lock)) {
+			FT_COW_ROOT_HELD();
+			ft_flip_txn_record_tag(t, &owner_ft->root_lock,
+				slot, old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
+			return;
+		}
+	}
+	FT_COW_ROOT_NOTHELD();
 	ft_flip_txn_record_tag_mw_pinned(t, slot, old_ptr, new_ptr,
 		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_ROOT));
 }
+
 
 /*
  * ft_back_edge_owner: the HOLDER a head's back edge names, as the metadata the
@@ -11227,22 +11328,6 @@ uintptr_t ft_edge_tag(const struct ft_ord_cell_edge *edge)
  * -DFEATURE_FT_CELL_SW turns it on, which is how the conversion work and its
  * ablation leg stay alive without shipping the mix.
  */
-#ifdef FEATURE_FT_CELL_SW
-# define FT_CELL_SW_ENABLED	1
-#else
-# define FT_CELL_SW_ENABLED	0
-#endif
-/*
- * The flip's own check.  Defaults ON wherever the park is on: a partial
- * conversion is the defect, so shipping the park without the guard would be
- * shipping the thing the guard exists to catch.  -DNO_FT_CELL_OWNED_STRICT is
- * for the RED CONTROL -- drop one take, confirm the guard fires, put it back.
- */
-#if defined(FEATURE_FT_CELL_SW) && !defined(NO_FT_CELL_OWNED_STRICT)
-# define FT_CELL_OWNED_STRICT	1
-#else
-# define FT_CELL_OWNED_STRICT	0
-#endif
 
 #ifdef FT_DEBUG_CELL_OWNER
 __attribute__((weak)) unsigned long ft_cow_ok, ft_cow_noctx, ft_cow_nocell,
@@ -11332,12 +11417,34 @@ static void ft_cow_report(void)
 		"  NOT HELD (the work)         %12lu  %5.1f%%\n"
 		"    of WOULD HOLD, unparked "
 		"(no FEATURE_FT_CELL_SW) %12lu\n"
-		"  ENGINE LANE (never asked)   %12lu   [not in the total]\n",
+		"  ENGINE LANE (never asked)   %12lu   [not in the total]\n"
+		"  --- &ft->root (stage 5) ---\n"
+		"  root HELD                   %12lu\n"
+		"  root NOT HELD (pinned MW)   %12lu\n",
 		t,
 		ft_cow_ok, 100.0*ft_cow_ok/t,
 		ft_cow_nocell, 100.0*ft_cow_nocell/t,
 		ft_cow_notheld, 100.0*ft_cow_notheld/t,
-		ft_cow_disabled, ft_cow_engine_lane);
+		ft_cow_disabled, ft_cow_engine_lane,
+		ft_cow_root_held_e, ft_cow_root_notheld_e);
+	if (ft_cow_root_notheld_e) {
+		int k;
+
+		fprintf(stderr, "  the unheld ROOT records by producer "
+			"(addr2line -i -e <lib> <off>):\n");
+		for (k = 0; k < FT_COW_ROOT_NPC; k++)
+			if (ft_cow_root_pc[k]) {
+				Dl_info di;
+
+				if (dladdr(ft_cow_root_pc[k], &di) &&
+						di.dli_fbase)
+					fprintf(stderr, "    +0x%-14lx %12lu\n",
+						(unsigned long)
+						((char *) ft_cow_root_pc[k] -
+						 (char *) di.dli_fbase),
+						ft_cow_root_pc_n[k]);
+			}
+	}
 	/*
 	 * ☞ THE ROWS THAT ARE GONE ARE THE RESULT.  `sentinel`, `no ctx`,
 	 * `climb could not date holder` and `holder has no metadata` cannot fire
@@ -12701,6 +12808,34 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 }
 
 /*
+ * Take @ft->root_lock and hand it to @txn, same ownership rule as the cell
+ * locks: CAS outside the engine, registered with a terminal so the txn owns the
+ * release, never released by hand.  A miss leaves the root recording MW, which
+ * is exactly today's behaviour.
+ */
+static inline
+int ft_root_lock_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+		struct ft_flip_txn *txn)
+{
+	struct ft_dlm_member set[1] = { 0 };
+	int ret;
+
+	if (!FT_ROOT_SW_ENABLED || !txn)
+		return 0;
+	set[0].anchor = &ft->root_lock;
+	set[0].lock_only = true;
+	ret = ft_dlm_acquire_set(ft, ctx, set, 1);
+	if (ret)
+		return ret;
+	if (!set[0].held.shared) {
+		ft_flip_txn_lock_register_held(txn, &set[0].held);
+		ft_flip_txn_record_release_lock(txn, set[0].held.lock,
+			set[0].held.lock_snap);
+	}
+	return 0;
+}
+
+/*
  * THE GENERIC FORM: LOCK WHAT THE EDGES NAME, THEN PROVE THEY STILL SAY IT.
  *
  * ft_cell_plan carries a SHAPE -- single cell, insert pair, run splice,
@@ -12736,9 +12871,26 @@ int ft_cell_lockset_take_edges(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	for (i = 0; i < n_edges; i++) {
 		struct cds_ft_metadata *lock;
 
+		/*
+		 * ☞ THE ROOT RIDES THE SAME TAKE.  Most root records reach the
+		 * recorder through an EDGE ARRAY (@edges[i].root), not through a
+		 * direct ft_flip_txn_record_root call -- wiring only the six
+		 * direct callers converted 5 of 4,355.  The owner comes from the
+		 * SLOT, because a cross-trie op records the SOURCE trie's root
+		 * through the DESTINATION's txn.
+		 */
+		if (edges[i].root) {
+			struct cds_ft *rft = caa_container_of(
+				(struct cds_ft_inode_flag **) edges[i].slot,
+				struct cds_ft, root);
+
+			lock = FT_ROOT_SW_ENABLED ? &rft->root_lock : NULL;
+			goto have_lock;
+		}
 		if (ft_edge_tag(&edges[i]) != URCU_TXN_TAG)
 			continue;	/* not a cell word */
 		lock = ft_cell_word_lock(ft, &edges[i]);
+have_lock:
 		if (!lock)
 			continue;	/* no owner: stays MW, the guard says so */
 		for (j = 0; j < n; j++)

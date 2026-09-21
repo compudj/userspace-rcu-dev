@@ -2913,6 +2913,8 @@ retry_attach:
 				 * re-descends with src still full (clean, like a pre-swap
 				 * failure).
 				 */
+				/* Stage 5: the root's own lock, so this record can park SW. */
+				(void) ft_root_lock_take(src_ft, NULL, glue.txn);
 				ft_flip_txn_record_root(glue.txn,
 					(void **) &src_ft->root,
 					(void *) old_src_root,
@@ -2955,6 +2957,8 @@ retry_attach:
 				 * pre-reserved txn (readers resolve the transient root proxy
 				 * exactly as on the list-on path).
 				 */
+				/* Stage 5: the root's own lock, so this record can park SW. */
+				(void) ft_root_lock_take(src_ft, NULL, src_retire_txn);
 				ft_flip_txn_record_root(src_retire_txn,
 					(void **) &src_ft->root,
 					(void *) old_src_root,

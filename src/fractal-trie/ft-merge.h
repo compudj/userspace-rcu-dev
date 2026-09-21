@@ -2190,6 +2190,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			 * rather than a bare store followed by standalone freezes.  The
 			 * root edge normalizes to the same FT_FLIP_PROXY_TAG the swap uses.
 			 */
+			/* Stage 5: the root's own lock, so this record can park SW. */
+			(void) ft_root_lock_take(src_ft, NULL, src_side_txn);
 			ft_flip_txn_record_root(src_side_txn,
 				(void **) &src_ft->root,
 				(void *) src_ft->root,
@@ -3676,6 +3678,8 @@ merge_spine_retry:
 			 * (@subtree is the fresh EXCLUSIVE trie, so its root reset
 			 * below stays a plain store.)
 			 */
+			/* Stage 5: the root's own lock, so this record can park SW. */
+			(void) ft_root_lock_take(dst_ft, NULL, appear_txn);
 			ft_flip_txn_record_root(appear_txn,
 				(void **) &dst_ft->root,
 				(void *) dst_root_fenced, (void *) subtree->root);
