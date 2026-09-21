@@ -11232,6 +11232,17 @@ uintptr_t ft_edge_tag(const struct ft_ord_cell_edge *edge)
 #else
 # define FT_CELL_SW_ENABLED	0
 #endif
+/*
+ * The flip's own check.  Defaults ON wherever the park is on: a partial
+ * conversion is the defect, so shipping the park without the guard would be
+ * shipping the thing the guard exists to catch.  -DNO_FT_CELL_OWNED_STRICT is
+ * for the RED CONTROL -- drop one take, confirm the guard fires, put it back.
+ */
+#if defined(FEATURE_FT_CELL_SW) && !defined(NO_FT_CELL_OWNED_STRICT)
+# define FT_CELL_OWNED_STRICT	1
+#else
+# define FT_CELL_OWNED_STRICT	0
+#endif
 
 #ifdef FT_DEBUG_CELL_OWNER
 __attribute__((weak)) unsigned long ft_cow_ok, ft_cow_noctx, ft_cow_nocell,
@@ -11524,6 +11535,30 @@ struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
 	if (!ft_cell_word_held(t, e, lock)) {
 		FT_COW_NOTHELD(t);
 		FT_COW_NH_PC();
+		/*
+		 * ☠ STAGE 4'S GUARD: WITH THE PARK ON, AN UNHELD CELL WORD IS
+		 * THE DEFECT ITSELF.
+		 *
+		 * Recording it MW while a peer that DOES hold the word parks it
+		 * SW is the partial conversion this whole transition exists to
+		 * remove -- one word, two writer disciplines, and the engine's
+		 * per-descriptor kind detector cannot see it.  Degrading to MW
+		 * is exactly how the mix is built, so with the park enabled this
+		 * must not be a silent fallback.
+		 *
+		 * It names the PRODUCER (the record's return address), because
+		 * the txn site names an op that reaches several builders and
+		 * only some of them forgot the take.
+		 */
+		if (FT_CELL_SW_ENABLED && FT_CELL_OWNED_STRICT) {
+			fprintf(stderr, "FT CELL UNHELD: slot %p owner %p "
+				"producer %p -- a cell word recorded without "
+				"its lock while the SW park is on\n",
+				(void *) e->slot, (void *) lock,
+				__builtin_return_address(0));
+			fflush(stderr);
+			abort();
+		}
 		return NULL;
 	}
 	FT_COW_HELD(t);
@@ -21859,9 +21894,28 @@ enum urcu_txn_status ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
 	unsigned int n = 0;
 	enum urcu_txn_status cst;
 
-	if (run)
+	if (run) {
+		/*
+		 * ☞ THE SECOND RUN-SPLICE SITE.  ft_store_at_graft_point_commit
+		 * has one; this is the other, and it builds the same four-word
+		 * shape, so it owes the same four locks.  The stage-4 guard is
+		 * what found it -- it aborted here on the first graft test with
+		 * the park on, naming this producer, where the per-txn census
+		 * had only said "ft-graft.h, 92 records".
+		 */
+		struct ft_cell_plan plan = {
+			.cell = run->run_first,
+			.last = run->run_last,
+			.splice = true,
+			.pred = ft_ord_or_sentinel(ft, run->pred),
+			.succ = ft_ord_or_sentinel(ft, run->succ),
+		};
+
+		if (g->txn && ft_cell_lockset_take(ft, NULL, g->txn, &plan))
+			return URCU_TXN_STATUS_ABORT;
 		n = ft_ord_cell_run_splice_edges(ft, run->run_first,
 			run->run_last, run->pred, run->succ, cedges, 0);
+	}
 	cst = ft_glue_txn_commit_edges(ft, g, cedges, n);
 	/*
 	 * ARM ONLY when the edges took effect: on a COMMITTED flip, or under
