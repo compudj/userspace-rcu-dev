@@ -12439,6 +12439,24 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
 }
 
 /*
+ * ☠ WHAT A CELL LOCK SET COSTS THE TXN'S RESERVATION.
+ *
+ * Riding the txn is what makes the release unmissable, and it is not free: each
+ * taken lock adds ONE state-word record ({LOCK|s -> s}).  A plan is at most
+ * {cell, pred, succ}, so THREE.  The record path ends in
+ * `assert(!ret); /* reserved up front -> never fails *\/`, and -DNDEBUG DELETES
+ * that assert -- so an unreserved record is not a crash, it is a SILENTLY
+ * DROPPED release, i.e. a permanently held lock.  That is the same failure the
+ * first widening attempt died of; reserve for it explicitly rather than relying
+ * on a site happening to have slack.
+ *
+ * (The records settle LAST whatever order they were added in: the FT tags them
+ * FT_STATE_PROXY and urcu_txn_desc_set_late_tag defers every such record to the
+ * late pass.)
+ */
+#define FT_CELL_LOCKSET_MAX_RECORDS	3
+
+/*
  * THE CELL-LIST LOCK PLAN: the cells whose list words an op is about to write.
  *
  * @cell is the cell the op retires or replaces (NULL for an insert, whose new
@@ -12504,16 +12522,26 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
  * @txn MUST already exist: that is what makes "a bail before the txn" -- the
  * only shape with nothing to release the locks -- unconstructible.
  *
- * On success every lock is the txn's.  ON FAILURE @txn IS DESTROYED and nothing
- * is held -- the set take is all-or-none, and the destroy releases everything
- * already registered.  The caller must treat @txn as gone and must not destroy
- * it again.
+ * ☞ THE LOCK IS TAKEN OUTSIDE THE TXN AND RELEASED THROUGH IT, and that
+ * asymmetry is the whole shape.  ft_dlm_acquire_set reaches ft_dlm_lock_now, a
+ * plain uatomic_cmpxchg on &meta->state: no descriptor, no record, no commit,
+ * no grace period (@0349e989 took the DLM acquire entirely outside the engine,
+ * and ordered-always finished the job).  The word is held the instant the CAS
+ * lands.  Only the REGISTER + TERMINAL below put anything in @txn, and from
+ * that point the commit -- or the abort, or the destroy -- is what clears the
+ * LOCK bit.
  *
- * ☠ THEREFORE NOT FOR A CALLER-OWNED SHARED TXN.  A producer that FOLDS into
- * a txn belonging to its caller (the record_only / shared_txn paths) must not
- * use this form: it would destroy a txn the caller still means to commit.
- * Those sites need a variant that reports the failure and leaves the txn
- * alone.
+ * ☠ THIS FUNCTION NEVER DESTROYS @txn.  Two consequences follow from the
+ * asymmetry and they make one rule sufficient at every call site:
+ *   - an ACQUIRE miss is all-or-none and unwinds by ft_meta_lock_release, so
+ *     @txn is untouched and there is nothing to clean up;
+ *   - a VALIDATION failure leaves holds registered WITH terminals, so whatever
+ *     terminal the caller was already going to reach releases them.
+ * So the contract is only: ON FAILURE THE CALLER MUST REACH A TERMINAL
+ * (ft_flip_txn_destroy, or a commit that aborts).  Every existing bail already
+ * does.  That is also what lets a producer FOLDING into a caller-owned txn
+ * (record_only) use this same helper: it must not destroy a txn its caller
+ * still means to commit, and it does not.
  */
 static inline
 int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
@@ -12536,19 +12564,8 @@ int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	if (!n)
 		return 0;
 	ret = ft_dlm_acquire_set(ft, ctx, set, n);
-	if (ret) {
-		/*
-		 * ☠ DESTROY ON EVERY FAILURE, NOT JUST THE VALIDATION ONE.
-		 * Two exits that differ in whether the caller still owns @txn is
-		 * an invitation to leak it at one of five call sites; one rule
-		 * -- "on failure @txn is gone" -- cannot be got wrong.  The set
-		 * take is all-or-none so no cell lock is held here; the destroy
-		 * is for the txn and for anything the caller recorded into it
-		 * before the take.
-		 */
-		ft_flip_txn_destroy(txn);
-		return ret;
-	}
+	if (ret)
+		return ret;		/* all-or-none: @txn untouched */
 	for (i = 0; i < n; i++) {
 		/*
 		 * A SHARED hold deduped onto a word this op already had (a
@@ -12562,10 +12579,8 @@ int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		ft_flip_txn_record_release_lock(txn, set[i].held.lock,
 			set[i].held.lock_snap);
 	}
-	if (!ft_cell_plan_still_valid(ft, p)) {
-		ft_flip_txn_destroy(txn);	/* releases every registration */
-		return -EAGAIN;
-	}
+	if (!ft_cell_plan_still_valid(ft, p))
+		return -EAGAIN;		/* held, and owned by @txn: see above */
 	return 0;
 }
 
@@ -15305,8 +15320,41 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	if (run)
 		n = ft_ord_cell_run_detach_edges(ft, run->rfirst, run->rlast,
 			&run->first, &run->last, edges, n);
-	else if (dead_cell)
-		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
+		else if (dead_cell) {
+			/*
+			 * \u261e STAGE 1: TAKE THE CELL WORDS THE UNSPLICE WILL
+			 * WRITE, before the edges name them.
+			 *
+			 * ft_ord_cell_unsplice_edges writes &pred->lnode.next
+			 * (owner pred), &succ->lnode.prev (owner succ) and the
+			 * deletion mark on &dead_cell->lnode.next (owner
+			 * dead_cell) -- the same three-word shape as the swap.
+			 *
+			 * \u2620 ONLY WITH A @txn.  The lock is taken by CAS
+			 * outside the engine but RELEASED through the txn's
+			 * terminal record, so with no txn there is nothing to
+			 * own the release and the edges stay MW -- which is
+			 * sound, just unconverted.
+			 *
+			 * The helper never destroys @txn; a failure here returns
+			 * through the caller's existing terminal, which is what
+			 * releases anything it registered.
+			 */
+			if (txn) {
+				struct ft_cell_plan plan = {
+					.cell = dead_cell,
+					.pred = ft_ord_cell_resolve_ord(
+						&dead_cell->lnode.prev),
+					.succ = ft_ord_cell_resolve_ord(
+						&dead_cell->lnode.next),
+				};
+
+				if (ft_cell_lockset_take(ft, NULL, txn, &plan))
+					return -EAGAIN;
+			}
+			n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
+		}
+
 	/*
 	 * A removed external leaf freezes atomically with this same commit that
 	 * unlinks it (doc §4.B): record its one MARK edge (freeze_leaf->next ->
@@ -15712,8 +15760,40 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 	if (run)
 		n = ft_ord_cell_run_detach_edges(ft, run->rfirst, run->rlast,
 			&run->first, &run->last, edges, n);
-	else if (dead_cell)
-		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
+		else if (dead_cell) {
+			/*
+			 * \u261e STAGE 1: TAKE THE CELL WORDS THE UNSPLICE WILL
+			 * WRITE, before the edges name them.
+			 *
+			 * ft_ord_cell_unsplice_edges writes &pred->lnode.next
+			 * (owner pred), &succ->lnode.prev (owner succ) and the
+			 * deletion mark on &dead_cell->lnode.next (owner
+			 * dead_cell) -- the same three-word shape as the swap.
+			 *
+			 * \u2620 ONLY WITH A @txn.  The lock is taken by CAS
+			 * outside the engine but RELEASED through the txn's
+			 * terminal record, so with no txn there is nothing to
+			 * own the release and the edges stay MW -- which is
+			 * sound, just unconverted.
+			 *
+			 * The helper never destroys @txn; a failure here returns
+			 * through the caller's existing terminal, which is what
+			 * releases anything it registered.
+			 */
+			if (txn) {
+				struct ft_cell_plan plan = {
+					.cell = dead_cell,
+					.pred = ft_ord_cell_resolve_ord(
+						&dead_cell->lnode.prev),
+					.succ = ft_ord_cell_resolve_ord(
+						&dead_cell->lnode.next),
+				};
+
+				if (ft_cell_lockset_take(ft, rec->ctx, txn, &plan))
+					return URCU_TXN_STATUS_ABORT;
+			}
+			n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
+		}
 	if (record_only) {
 		/*
 		 * FOLD (coherent rekey one-decide writer): record the recompaction's

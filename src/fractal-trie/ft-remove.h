@@ -1517,6 +1517,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		txn = shared_txn;
 	} else {
 		txn = ft_flip_txn_create_bounded(ft, FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
+				+ FT_CELL_LOCKSET_MAX_RECORDS
 				+ 1 /* §4.B parent guard */
 				+ 1 /* back-edge (parent, offset) pair: the state-word edge */
 				+ ft_freeze_reserve(ft, (unsigned int) nr_orphans
@@ -4844,6 +4845,7 @@ int ft_detach_node(struct cds_ft *ft,
 			} else {
 				commit_txn = ft_flip_txn_create_bounded(ft,
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
+					+ FT_CELL_LOCKSET_MAX_RECORDS
 					+ 1 /* §4.B parent guard (Site 1 arms excl.) */
 					+ ft_freeze_reserve(ft, (unsigned int) nr_to_free
 						+ (trailing_skip_cn_flag ? 1 : 0))
@@ -6227,7 +6229,8 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		}
 		txn = ft_flip_txn_create_bounded(ft,
 			FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
-			FT_HLIST_FREEZE_MAX_EDGES + 3);	/* +1 §4.B parent guard, +1 next_node->prev fold,
+			FT_HLIST_FREEZE_MAX_EDGES + 3 +
+			FT_CELL_LOCKSET_MAX_RECORDS);	/* +1 §4.B parent guard, +1 next_node->prev fold,
 							 * +1 the SKIP_X dual GP's release-or-guard */
 		if (!txn) {
 			ft_ord_cell_free_unpublished(ft,
@@ -6458,13 +6461,23 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 
 			if (cret) {
 				/*
-				 * Nothing is held and, on the validation path,
-				 * @txn is already destroyed -- so this bail owes
-				 * only what the pre-txn bails above owe.
+				 * ☠ @held_holder IS NOT RELEASED HERE.
+				 * ft_flip_txn_hold_or_lock_parent above already
+				 * REGISTERED it on @txn, so the destroy drops it
+				 * -- exactly as the acquire_miss bail a few lines
+				 * up does, and for the same reason this file
+				 * states: every bail that releases it explicitly
+				 * stays ABOVE that call.  Releasing it again here
+				 * cleared a LOCK bit another thread owned, and
+				 * the assert then fired in that thread's own
+				 * release (ft_unchain_node's -ESTALE path), which
+				 * is the confusing way to find this out.
+				 *
+				 * The destroy also drops any cell lock the take
+				 * registered before failing.
 				 */
+				ft_flip_txn_destroy(txn);
 				ft_ord_cell_free_unpublished(ft, new_cell);
-				if (held_holder)
-					ft_meta_lock_release(held_holder);
 				return -EAGAIN;
 			}
 		}
