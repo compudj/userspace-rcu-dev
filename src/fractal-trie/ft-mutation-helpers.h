@@ -8964,120 +8964,7 @@ void ft_flip_txn_record_state_kind(struct ft_flip_txn *t,
  * and NOTHING is acquired on failure (all-or-none -> abort-and-regrow).
  */
 
-/*
- * Record {clean -> LOCK} for @meta onto the acquire txn @t, capturing the
- * clean word in @snap.  -EAGAIN if @meta is already PROXY|TOMBSTONE|LOCK
- * (dirty): the caller destroys @t and re-plans.  The edge must be reserved
- * (create_bounded); the actual set is atomic at the commit, not here.
- */
-static inline
-int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
-		uintptr_t *snap)
-{
-	uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
-	/*
-	 * The acquire MUST be a validated CAS: ft_flip_txn_record_tag dispatches
-	 * SW-vs-MW on @t->structural_sw alone, so a structural_sw acquire txn
-	 * would degrade the {clean -> LOCK} edge to a plain store -- a lock
-	 * that cannot fail against a peer, i.e. two owners.  Every caller today
-	 * builds a FRESH acquire txn for the lock-set (never the content lane,
-	 * see the composition sketch above), and the fold's structural_sw lives
-	 * only on content txns; assert it rather than rely on that reading.
-	 */
-	assert(!t->structural_sw);
-#ifdef FEATURE_FT_AGREEMENT_RED
-	/*
-	 * RED CONTROL for the E.2 exclusion oracle (NOT a shipping
-	 * configuration), moved here from ft_meta_lock_acquire when the DLM
-	 * conversion made that primitive cold: take DESPITE a held lock.  The
-	 * record degrades to a benign {LOCK|x -> LOCK|x} no-op, so two
-	 * writers both "hold" the word -- exactly what a lock-set that
-	 * excludes nothing produces -- and the SECOND owner-stamp claim on
-	 * any shared member is the violation the oracle must fire.  (The
-	 * loser's release record then mismatches and its op retries; that
-	 * churn is red-only noise, and the oracle fires before it.  The
-	 * held-release helpers may strip a winner's bit under red -- more
-	 * shared ownership, in-spirit for a control that dies in under a
-	 * second.)
-	 */
-	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE)))
-		return -EAGAIN;
-#else
-	if (caa_unlikely(s & (FT_STATE_PROXY | FT_SA_DEAD_REFUSE |
-			FT_STATE_LOCK))) {
-#ifdef FT_DEBUG_OP_RETRY_CAP
-		ft_dbg_lock_refuse_state = (unsigned long) s;
-		if (meta == ft_dbg_lock_refuse_meta) {
-			ft_dbg_lock_refuse_streak++;
-		} else {
-			ft_dbg_lock_refuse_meta = meta;
-			ft_dbg_lock_refuse_streak = 1;
-			ft_dbg_lock_refuse_switches++;
-		}
-		if (s & FT_STATE_TOMBSTONE)
-			ft_dbg_lock_refuse_tomb++;
-		else if (s & FT_STATE_PROXY) {
-			const struct urcu_txn_record *r =
-				(const struct urcu_txn_record *)
-				(s & ~FT_STATE_PROXY);
-			const struct urcu_txn_desc *d = r->desc;
-
-			ft_dbg_lock_refuse_proxy++;
-			/*
-			 * ASK THE DESCRIPTOR (see the PROXY PARKER note in
-			 * fractal-trie-trace.h): a settle is an act, and a word
-			 * that stays proxied is a claim that it never ran.
-			 * Racy by construction -- the parker may settle under
-			 * this read and free the descriptor; the descriptor is
-			 * RCU-freed and this site runs inside the op's read-side
-			 * section, so the load cannot fault.
-			 */
-			if (d != ft_dbg_proxy_desc) {
-				ft_dbg_proxy_desc = d;
-				ft_dbg_proxy_streak = 1;
-				ft_dbg_proxy_switches++;
-			} else
-				ft_dbg_proxy_streak++;
-			ft_dbg_proxy_status = urcu_txn_desc_status(d);
-			ft_dbg_proxy_nr = d->nr;
-			ft_dbg_proxy_nr_mw = d->nr_mw;
-			ft_dbg_proxy_poisoned = d->poisoned;
-			ft_dbg_proxy_retry = d->retry;
-			ft_dbg_proxy_rec_old = (unsigned long) r->old_ptr;
-			ft_dbg_proxy_rec_new = (unsigned long) r->new_ptr;
-		} else
-			ft_dbg_lock_refuse_lock++;
-#endif
-#ifdef FT_DLM_LINGER
-		if (s & FT_STATE_LOCK)
-			ft_linger_word = meta;
-#endif
-#ifdef FT_DEBUG_REMOVE_RETRY_CAP
-		if (s & FT_STATE_LOCK) {
-			ft_dbg_acq_dirty_lock++;
-			if (meta == ft_dbg_last_refused) {
-				ft_dbg_refused_streak++;
-			} else {
-				ft_dbg_last_refused = meta;
-				ft_dbg_refused_streak = 1;
-			}
-		} else {
-			ft_dbg_acq_dirty_other++;
-		}
-#endif
-		return -EAGAIN;
-	}
-#endif /* !FEATURE_FT_AGREEMENT_RED */
-	*snap = s;
-	FT_TK_TXN_SET_TAKE(t, true);
-	ft_flip_txn_record_state(t, meta,
-			(void *) s, (void *) (s | FT_STATE_LOCK));
-	FT_TK_TXN_SET_TAKE(t, false);
-	return 0;
-}
-
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
 /*
  * TAKE THE WORD NOW, with a plain CAS, instead of recording the edge for a
  * commit to install.
@@ -9381,44 +9268,9 @@ bool ft_acq_guards_ok(const struct ft_acq_guard *g, int nr)
 			return false;
 	return true;
 }
-#endif /* FEATURE_FT_LOCK_TAKE_ORDERED */
 
-/*
- * Guard a back-edge into the SAME acquire commit: the commit aborts unless
- * @child->parent still holds @expected_pf (the tagged parent flag the plan
- * resolved).  This is the read-set validation -- a peer re-homing @child between
- * the plan's racy read of its parent and the acquire's linearization point (or a
- * flip-proxy parked mid-re-home) fails the whole-word value-CAS and aborts the
- * acquire, so the op re-plans against the settled tree.
- */
-static inline
-void ft_dlm_guard_parent(struct ft_flip_txn *t, struct cds_ft_metadata *child,
-		struct cds_ft_inode_flag *expected_pf)
-{
-	FT_TK_COUNT_REC(t, FT_TK_VALIDATE);
-	FT_AB_ARM(FT_AB_VALIDATE, FT_AB_OWN_NA);
-	urcu_txn_validate(t->mtxn, (void **) &child->parent_word,
-			(void *) expected_pf, FT_FLIP_PROXY_TAG);
-}
 
-/*
- * Guard a coarsened member's OWN state word into the acquire commit, from the
- * value ft_held_anchor_sample_node ratified: the anchor excludes every mutator
- * of the node only from the linearization point on, so a peer that changes the
- * word between the sample and that point must abort the whole acquire -- else
- * the op retires the node against a stale expected old.  The per-node acquire
- * needs none of this: ft_dlm_lock's own CAS is the guard, the word being the
- * same one it locks.
- */
-static inline
-void ft_held_anchor_guard_node(struct ft_flip_txn *t,
-		struct cds_ft_metadata *node, uintptr_t node_snap)
-{
-	FT_TK_COUNT_REC(t, FT_TK_VALIDATE);
-	FT_AB_ARM(FT_AB_VALIDATE, FT_AB_OWN_NA);
-	urcu_txn_validate(t->mtxn, (void **) &node->state,
-			(void *) node_snap, FT_STATE_PROXY);
-}
+
 
 /*
  * One member of a DLM lock-set: the node @nf to protect, sitting at byte-depth
@@ -10143,13 +9995,10 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct ft_dlm_member *set, int nr)
 {
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
-	bool ordered = false;
 	int lock_order[FT_LOCK_ORDER_MAX];
 	struct cds_ft_metadata *lock_anchor[FT_LOCK_ORDER_MAX];
 	struct ft_acq_guard guards[FT_ACQ_GUARD_MAX];
 	int nr_guards = 0;
-#endif
 	int ii;
 	struct cds_ft_metadata *taken_embed[FT_FLIP_TXN_MAX_LOCKS];
 	uintptr_t taken_snap_embed[FT_FLIP_TXN_MAX_LOCKS];
@@ -10167,7 +10016,6 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	uintptr_t *taken_snap = taken_snap_embed;
 	void *taken_heap = NULL;
 	unsigned int nr_taken = 0;
-	struct ft_flip_txn *acq;
 	int i, nr_present = 0;
 
 	/*
@@ -10306,7 +10154,6 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * its descriptor and its install lane, which measured WORSE (median 9.5
 	 * starving removes against 4 for aging alone, complete separation).
 	 */
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
 	/*
 	 * ASCENDING ANCHOR ORDER, and the whole deadlock argument rides on it:
 	 * with a total order on the words no cycle can form, which is what lets
@@ -10315,28 +10162,28 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * ☞ DECIDED BEFORE THE TRANSACTION EXISTS, because on this path there is
 	 * no transaction: takes are CASes and guards are loads (ft_acq_guard),
 	 * so nothing is allocated, nothing is committed, and nothing is handed
-	 * to call_rcu.  @acq stays NULL and only the fallback builds one.
+	 * to call_rcu.
+	 *
+	 * ☠ AND THERE IS NO UNORDERED FALLBACK ANY MORE.  A path that takes the
+	 * same set in some other order is not a degraded mode, it is the bug --
+	 * a wrong order does not fault, it LIVELOCKS, and a livelock reads as
+	 * "the box was busy".  ft_lock_set_order_by_anchor refuses exactly one
+	 * thing, a set larger than FT_LOCK_ORDER_MAX (16), and the largest set
+	 * any caller declares is 4 (ft-remove.h).  So this is unreachable: say
+	 * so loudly rather than silently ordering by array index.
 	 */
-	ordered = ft_lock_set_order_by_anchor(ft, ctx, set, nr, lock_order,
-			lock_anchor);
-	acq = NULL;
-	if (!ordered)
-#endif
-	{
-		acq = ft_flip_txn_acquire_bounded(3 * nr_present);
-		if (!acq) {
-			free(taken_heap);	/* nothing acquired yet */
-			return -ENOMEM;
-		}
+	if (caa_unlikely(!ft_lock_set_order_by_anchor(ft, ctx, set, nr,
+			lock_order, lock_anchor))) {
+		fprintf(stderr, "FT: lock set of %d members exceeds "
+			"FT_LOCK_ORDER_MAX %d at %s:%d -- the ordered take is "
+			"the deadlock argument and has no fallback\n",
+			nr, FT_LOCK_ORDER_MAX, fn, line);
+		abort();
 	}
 	for (ii = 0; ii < nr; ii++) {
 		struct cds_ft_metadata *node, *lock;
 		uintptr_t node_snap = 0, lock_snap, held_snap = 0;
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
-		i = ordered ? lock_order[ii] : ii;
-#else
-		i = ii;
-#endif
+		i = lock_order[ii];
 		bool coarsened, deduped = false, held_ratified = true;
 		bool node_held = false;
 
@@ -10389,14 +10236,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		 * (a set wider than FT_LOCK_ORDER_MAX, which takes no CASes and
 		 * so needs no total order) resolves here.
 		 */
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
-		lock = ordered ? lock_anchor[i] :
-			ft_anchor_meta(ft, ft_lock_ctx_descent(ctx), set[i].nf,
-				node, set[i].depth);
-#else
-		lock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx), set[i].nf,
-			node, set[i].depth);
-#endif
+		lock = lock_anchor[i];
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 		ft_sa_check(fn, line, ft, ctx, set[i].nf, node, set[i].depth,
 			lock);
@@ -10420,18 +10260,11 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			 * already in force, and validating the CLEAN value against
 			 * a word carrying the op's own LOCK aborts every attempt.
 			 */
-			if (!node_held) {
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
-				if (ordered)
-					ft_acq_guard_add(guards, &nr_guards,
-						(void **) &node->state,
-						(void *) node_snap,
-						FT_STATE_PROXY);
-				else
-#endif
-					ft_held_anchor_guard_node(acq, node,
-						node_snap);
-			}
+			if (!node_held)
+				ft_acq_guard_add(guards, &nr_guards,
+					(void **) &node->state,
+					(void *) node_snap,
+					FT_STATE_PROXY);
 		}
 		/*
 		 * The guard is a read-set validation of the MEMBER's own
@@ -10440,18 +10273,11 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		 * validated.  It rides the commit for EVERY member, deduped or
 		 * not -- dedupe merges LOCKS, never guards (§7.3).
 		 */
-		if (set[i].guard_child) {
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
-			if (ordered)
-				ft_acq_guard_add(guards, &nr_guards,
-					(void **) &set[i].guard_child->parent_word,
-					(void *) set[i].guard_pf,
-					FT_FLIP_PROXY_TAG);
-			else
-#endif
-				ft_dlm_guard_parent(acq, set[i].guard_child,
-					set[i].guard_pf);
-		}
+		if (set[i].guard_child)
+			ft_acq_guard_add(guards, &nr_guards,
+				(void **) &set[i].guard_child->parent_word,
+				(void *) set[i].guard_pf,
+				FT_FLIP_PROXY_TAG);
 		/*
 		 * Dedupe against the op's held set AND against this set's own
 		 * earlier members, taking the CLEAN word from whichever holds it:
@@ -10663,12 +10489,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 #endif
 			continue;
 		}
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
-		if (ordered ? ft_dlm_lock_now(lock, &lock_snap)
-			    : ft_dlm_lock(acq, lock, &lock_snap)) {
-#else
-		if (ft_dlm_lock(acq, lock, &lock_snap)) {
-#endif
+		if (ft_dlm_lock_now(lock, &lock_snap)) {
 			ft_hold_trace_refused(lock, fn, line);
 			do { FT_DBG_ACQ_SITE(); goto eagain; } while (0);
 		}
@@ -10681,39 +10502,28 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		set[i].held.oracle_skip = false;
 #endif
 	}
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
-	if (ordered) {
-		/*
-		 * THE READ SET, CHECKED ONCE, NOW THAT EVERY TAKE HAS SUCCEEDED.
-		 * This is what the acquire commit used to do -- and all it did,
-		 * the takes having become CASes -- so with it here the acquire
-		 * allocates no descriptor, commits nothing, and owes no grace
-		 * period.  See ft_acq_guards_ok.
-		 */
-		if (!ft_acq_guards_ok(guards, nr_guards)) {
-#ifdef FT_DEBUG_REMOVE_RETRY_CAP
-			ft_dbg_acq_cabort++;
-#endif
-			/*
-			 * ☠ A CAS TAKE IS HELD THE INSTANT IT SUCCEEDS, so this
-			 * exit owes the release the commit would have skipped.
-			 * A leaked lock is PERMANENT: peers refuse it forever
-			 * and the op retries forever -- measured once as an
-			 * ft_inv HANG at test 40 (rc=124), not as a failure.
-			 */
-			while (nr_taken)
-				ft_meta_lock_release(taken[--nr_taken]);
-			free(taken_heap);
-			return -EAGAIN;
-		}
-	} else
-#endif
-	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK) {
+	/*
+	 * THE READ SET, CHECKED ONCE, NOW THAT EVERY TAKE HAS SUCCEEDED.
+	 * This is what the acquire commit used to do -- and all it did, the
+	 * takes having become CASes -- so with it here the acquire allocates no
+	 * descriptor, commits nothing, and owes no grace period.  See
+	 * ft_acq_guards_ok.
+	 */
+	if (!ft_acq_guards_ok(guards, nr_guards)) {
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		ft_dbg_acq_cabort++;
 #endif
+		/*
+		 * ☠ A CAS TAKE IS HELD THE INSTANT IT SUCCEEDS, so this exit
+		 * owes the release the commit would have skipped.  A leaked lock
+		 * is PERMANENT: peers refuse it forever and the op retries
+		 * forever -- measured once as an ft_inv HANG at test 40
+		 * (rc=124), not as a failure.
+		 */
+		while (nr_taken)
+			ft_meta_lock_release(taken[--nr_taken]);
 		free(taken_heap);
-		return -EAGAIN;		/* commit freed @acq; nothing acquired */
+		return -EAGAIN;
 	}
 	/*
 	 * ☞ A LOCK ON A STALE ANCHOR IS NO LOCK (doc/design/ft-lockset-inventory.md
@@ -10897,19 +10707,13 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	free(taken_heap);
 	return 0;
 eagain:
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
 	/*
-	 * ☠ THE RECORDED PATH APPLIES NOTHING UNTIL ITS COMMIT, so its bail is
-	 * "nothing acquired" by construction.  A CAS take is visible the instant
-	 * it succeeds, so this path owes the release the commit would have
-	 * skipped.  Same primitive the post-commit stale-anchor bail uses.
+	 * ☠ A CAS TAKE IS VISIBLE THE INSTANT IT SUCCEEDS, so this path owes
+	 * the release the recorded path's commit would have skipped.  Same
+	 * primitive the post-commit stale-anchor bail uses.
 	 */
-	if (ordered)
-		while (nr_taken)
-			ft_meta_lock_release(taken[--nr_taken]);
-#endif
-	if (acq)			/* NULL on the ordered path: none built */
-		ft_flip_txn_destroy(acq);
+	while (nr_taken)
+		ft_meta_lock_release(taken[--nr_taken]);
 	free(taken_heap);
 	/*
 	 * RECORD the refusal for the op's retry loop; do not age here.  Aging at
@@ -10925,15 +10729,12 @@ eagain:
 	 */
 	if (ctx && ctx->op)
 		ft_acq_contended++;
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
 	/*
 	 * The arbitration the engine acquire used to provide; see
 	 * ft_acq_lane_backoff.  After the unwind above, so this queues holding
 	 * nothing.
 	 */
-	if (ordered)
-		ft_acq_lane_backoff(ft, ctx);
-#endif
+	ft_acq_lane_backoff(ft, ctx);
 	return -EAGAIN;			/* nothing acquired (all-or-none) */
 }
 

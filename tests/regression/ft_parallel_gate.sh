@@ -358,8 +358,12 @@ ALL_CONFIGS=(
 	# invisible single-threaded: an in-place sort of the caller's set (SEGV,
 	# caught by ft_unit) and a leaked lock on the commit-failure exit (a HANG
 	# at ft_inv test 40 with ZERO test failures, which only the MW oracle
-	# reaches).  A config that ran u alone would have shipped the second.
-	"lockordered|-DFEATURE_FT_LOCK_TAKE_ORDERED|u ion ioff imw"
+	# ★ "lockordered" IS GONE, and its absence is the point.  The ordered take
+	# is no longer a configuration: FEATURE_FT_LOCK_TAKE_ORDERED was removed
+	# and ft_dlm_acquire_set_at now sorts every lock set by anchor address
+	# unconditionally, with no unordered fallback to select between.  A config
+	# defining a macro nothing reads would run the DEFAULT build under a name
+	# that claims otherwise -- coverage theatre, and worse than no config.
 	# -DNO_FEATURE_FT_MERGE compiles out the merge subsystem (~20 KiB .text;
 	# cds_ft_merge then returns NOT_SUPPORTED).  It had no gate config and had
 	# ROTTED: the rekey fold's occupied-dst arm -- which IS a merge -- was not
