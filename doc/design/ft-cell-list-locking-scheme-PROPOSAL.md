@@ -694,8 +694,32 @@ Callers pass `p` (not a re-resolution) to the edge builders:
    depth/`@ctx` plumbing that anchoring-on-the-holder needs. Cell locks first;
    anchor-folding afterwards, gated on measurement.
 
-   ☠ Note the asymmetry when that optimisation is attempted: "typically already
-   locked" is not "always locked", and a cell whose anchor this op does NOT hold
-   must still fall back to taking the cell's own lock — otherwise the word goes
-   back to carrying two disciplines, which is the defect this whole document
-   exists to close.
+   ☠☠ **AND THERE IS NO FALLBACK TO THE PER-CELL LOCK. I wrote that there was;
+   Mathieu corrected it, and the correction is the whole discipline:**
+
+   > *"when the anchor differs between the cell and its immediate neighbor, we
+   > need to lookup the neighbor anchor and lock THAT. We CANNOT fallback to
+   > per-cell lock, because we need the locking to agree between updaters for a
+   > given cell."*
+
+   **THE LOCK THAT PROTECTS A WORD MUST BE A FUNCTION OF THE WORD, COMPUTED
+   IDENTICALLY BY EVERY WRITER — never a function of the op.** An op that takes
+   "the anchor when I happen to hold it, the cell's own lock otherwise" is two
+   writers taking DIFFERENT locks for the same word, and two different locks
+   exclude nothing. That is the same defect as the SW/MW mix wearing a different
+   hat: not a disagreement about the RECORD KIND, but about the LOCK IDENTITY.
+   Both end in a writer proceeding while another writer is inside the same word.
+
+   So under anchor-folding, a writer whose op does not already hold the
+   neighbour's anchor must **derive that anchor and take it** — which needs the
+   depth/descent machinery (`ft_lock_ctx_depth_of_climb`, and `@ctx` threaded to
+   the cell producers). That plumbing is the real cost of the optimisation, and
+   it is exactly why it comes AFTER the correctness work rather than instead of
+   it.
+
+   ☞ This is also the sharpest argument FOR the cell-locking scheme in stages
+   0-4: `lock(word) = the cell that owns the word` is already a function of the
+   word alone, with nothing to derive and nothing for two writers to disagree
+   about. Anchor-folding replaces a zero-derivation rule with one that is still
+   deterministic per word — `ft_anchor_meta` off a fixed schedule, so "two ops
+   that reach the node agree" (§1) — but only once every writer can compute it.
