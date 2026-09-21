@@ -6051,6 +6051,23 @@ struct ft_dlm_member {
 	struct cds_ft_metadata *guard_child;
 	struct cds_ft_inode_flag *guard_pf;
 	struct ft_held_anchor held;
+	/*
+	 * ☞ THE LOCK-ONLY FORM: a word to take that is NOT a trie node.
+	 *
+	 * An ordered cell, and the sentinel's two list ends, own their own lock
+	 * words -- they are lock-bearing without being reachable through a
+	 * parent edge, so there is no @nf to name them, no depth to date them
+	 * and no parent edge to guard.  @anchor IS the word; the acquire takes
+	 * it directly and the sort keys on it.
+	 *
+	 * ☠ THE DISCRIMINATOR IS @lock_only, NOT `!nf`.  A NULL @nf already
+	 * means a HOLE -- ft_dlm_acquire_set_at counts @nr_present by it and
+	 * ft_lock_set_order_by_anchor skips it (that is what @7c0b6749 fixed) --
+	 * so reusing NULL would make every lock-only member silently vanish from
+	 * the set it was added to.
+	 */
+	struct cds_ft_metadata *anchor;
+	bool lock_only;
 };
 
 /* Defined below; the single-member acquire is a one-element set. */
@@ -9051,9 +9068,11 @@ bool ft_lock_set_order_by_anchor(const struct cds_ft *ft,
 		 * members keep their relative order -- which is all the
 		 * deadlock argument needs.
 		 */
-		key[i] = set[i].nf ?
-			ft_anchor_meta(ft, ft_lock_ctx_descent(ctx),
-				set[i].nf, set[i].node, set[i].depth) : NULL;
+		key[i] = set[i].lock_only ? set[i].anchor :
+			(set[i].nf ?
+				ft_anchor_meta(ft, ft_lock_ctx_descent(ctx),
+					set[i].nf, set[i].node,
+					set[i].depth) : NULL);
 		/*
 		 * ☞ KEEP THE RESOLVED ANCHOR: the TAKE uses THIS value rather
 		 * than resolving ft_anchor_meta a second time.
@@ -10032,7 +10051,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	ft_delay_seam(FT_DELAY_SITE_ACQUIRE);
 
 	for (i = 0; i < nr; i++)
-		if (set[i].nf)
+		if (set[i].nf || set[i].lock_only)
 			nr_present++;
 	if (!nr_present)
 		return 0;
@@ -10187,8 +10206,25 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		bool coarsened, deduped = false, held_ratified = true;
 		bool node_held = false;
 
-		if (!set[i].nf)
+		if (!set[i].nf && !set[i].lock_only)
 			continue;
+		/*
+		 * ☞ A LOCK-ONLY MEMBER IS ITS OWN ANCHOR AND ITS OWN MEMBER.
+		 * It has no parent edge, so it skips the link gate and the
+		 * structural-anchor check below -- both ask what a member's
+		 * PARENT says, and a cell or sentinel end has no parent word.
+		 * It needs neither guard either: @lock == @node makes
+		 * @coarsened false, so no node-state guard is added, and
+		 * @guard_child is NULL.  What it KEEPS is the dedupe and the
+		 * take, which is the whole point of putting it in the same set
+		 * rather than a second one -- a separate take gets a fresh
+		 * taken[] and cannot dedupe against this one's holds.
+		 */
+		if (set[i].lock_only) {
+			node = set[i].anchor;
+			lock = set[i].anchor;
+			goto take;
+		}
 		node = set[i].node;
 #ifdef FT_ACQUIRE_LINK_GATE
 		/*
@@ -10278,6 +10314,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 				(void **) &set[i].guard_child->parent_word,
 				(void *) set[i].guard_pf,
 				FT_FLIP_PROXY_TAG);
+take:
 		/*
 		 * Dedupe against the op's held set AND against this set's own
 		 * earlier members, taking the CLEAN word from whichever holds it:
@@ -11219,30 +11256,36 @@ static inline void ft_cow_note_notheld(const struct ft_flip_txn *t) { (void) t; 
 static void ft_cow_report(void) __attribute__((destructor));
 static void ft_cow_report(void)
 {
-	unsigned long t = ft_cow_ok + ft_cow_noctx + ft_cow_nocell +
-		ft_cow_sentinel + ft_cow_nodepth + ft_cow_nometa +
-		ft_cow_notheld + ft_cow_disabled;
+	/*
+	 * ☠ @ft_cow_disabled IS A SUBSET OF @ok, NOT A BUCKET.  It counts the
+	 * edges that WOULD have parked and did not because the feature is off,
+	 * so adding it here would double-count them and the tally would stop
+	 * summing to the population.
+	 */
+	unsigned long t = ft_cow_ok + ft_cow_nocell + ft_cow_notheld;
 
 	if (!t || __atomic_fetch_add(&ft_cow_reported, 1, __ATOMIC_RELAXED))
 		return;
-	fprintf(stderr, "\n=== FT_CELL_OWNER: why a cell edge did or did not "
-		"park SW (total %lu) ===\n"
-		"  CONVERTED (anchor held)     %12lu  %5.1f%%\n"
-		"  no ctx threaded (PLUMBING)  %12lu  %5.1f%%\n"
-		"  no owner_cell recorded      %12lu  %5.1f%%\n"
-		"  neighbour is the sentinel   %12lu  %5.1f%%\n"
-		"  climb could not date holder %12lu  %5.1f%%\n"
-		"  holder has no metadata      %12lu  %5.1f%%\n"
-		"  anchor NOT HELD (ACQUIRE)   %12lu  %5.1f%%\n"
-		"  park OFF (no FEATURE_FT_CELL_SW) %7lu  %5.1f%%\n",
+	fprintf(stderr, "\n=== FT_CELL_OWNER: would this op hold the cell "
+		"word's lock (total %lu) ===\n"
+		"  WOULD HOLD                  %12lu  %5.1f%%\n"
+		"  not a cell link             %12lu  %5.1f%%\n"
+		"  NOT HELD (the work)         %12lu  %5.1f%%\n"
+		"    of WOULD HOLD, unparked "
+		"(no FEATURE_FT_CELL_SW) %12lu\n",
 		t,
-		ft_cow_ok, 100.0*ft_cow_ok/t, ft_cow_noctx, 100.0*ft_cow_noctx/t,
+		ft_cow_ok, 100.0*ft_cow_ok/t,
 		ft_cow_nocell, 100.0*ft_cow_nocell/t,
-		ft_cow_sentinel, 100.0*ft_cow_sentinel/t,
-		ft_cow_nodepth, 100.0*ft_cow_nodepth/t,
-		ft_cow_nometa, 100.0*ft_cow_nometa/t,
 		ft_cow_notheld, 100.0*ft_cow_notheld/t,
-		ft_cow_disabled, 100.0*ft_cow_disabled/t);
+		ft_cow_disabled);
+	/*
+	 * ☞ THE ROWS THAT ARE GONE ARE THE RESULT.  `sentinel`, `no ctx`,
+	 * `climb could not date holder` and `holder has no metadata` cannot fire
+	 * any more: the lock is now the cell's OWN word (or the sentinel end's),
+	 * so there is no holder to name, no depth to date and no descent to
+	 * need -- which is also why this converts identically at fine and
+	 * exponential instead of 0%% at the latter.
+	 */
 #if FT_COW_SITES
 	if (ft_cow_notheld) {
 		unsigned long named = 0;
@@ -11291,162 +11334,130 @@ static void ft_cow_report(void)
 #endif
 
 static inline
-struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
-		const struct ft_flip_txn *t, const struct ft_ord_cell_edge *e)
+struct cds_ft_metadata *ft_cell_word_lock(const struct cds_ft *ft,
+		const struct ft_ord_cell_edge *e)
 {
-	struct cds_ft_inode_flag *holder;
-	struct cds_ft_metadata *hmeta, *anchor;
-	unsigned int depth;
+	if (!e->owner_cell)
+		return NULL;		/* not a cell link at all */
+	/*
+	 * ☠ THE SENTINEL'S TWO ENDS ARE TOLD APART BY THE SLOT, NOT THE CELL.
+	 * ft_ord_is_end() answers for the sentinel as a WHOLE, and its two list
+	 * words are independent -- a head splice writes .next, a tail splice
+	 * .prev -- so asking "is this the sentinel" would name one lock for two
+	 * words and serialise them against each other for nothing.
+	 */
+	if ((const void *) e->slot == (const void *) &ft->ord_sentinel.node.next)
+		return (struct cds_ft_metadata *) &ft->ord_begin_lock;
+	if ((const void *) e->slot == (const void *) &ft->ord_sentinel.node.prev)
+		return (struct cds_ft_metadata *) &ft->ord_end_lock;
+	return cds_ft_item_to_metadata((struct ft_ord_cell *) e->owner_cell);
+}
+
+/*
+ * Does @t (or @ctx) hold the word's lock?  Split out so the census can ask the
+ * SAME question the park asks, without the park having to be enabled.
+ */
+static inline
+bool ft_cell_word_held(const struct ft_flip_txn *t,
+		const struct ft_ord_cell_edge *e, struct cds_ft_metadata *lock)
+{
 	uintptr_t snap;
 	bool ratified;
 
+	if (e->ctx)
+		return ft_lock_ctx_holds(e->ctx, lock, &snap, &ratified);
 	/*
-	 * ☠ @ctx IS OPTIONAL ON AN EDGE: only the producers that route through
-	 * ft_pub_rec thread one, and both the climb and holds() need it.  No
-	 * context is not "not held" -- it is "this producer cannot answer" --
-	 * but the conservative action is the same, so it falls through to MW.
-	 */
-	/*
-	 * ☞ @ctx IS NOT THE ONLY WITNESS, AND IT IS THE ONE THAT IS USUALLY
-	 * ABSENT.  Measured: 79,476 of 79,476 cell edges refused here on "no
-	 * ctx" alone -- not a single one reached the held/not-held question --
-	 * because @ctx is threaded only by the producers that route through
-	 * ft_pub_rec, and no cell producer does.
+	 * ☠ ft_flip_txn_HOLDS, NOT ft_flip_txn_OWNS.  owns() carries a
+	 * ROOT-ONLY SHORTCUT: at that spacing it answers true for ANY queried
+	 * owner once the txn holds the root's metadata, because every trie
+	 * node's ANCHOR is the root there.  That is sound for a node, whose
+	 * lock is derived from the spacing -- and WRONG for a cell, whose lock
+	 * is its own word and is not derived from anything.
 	 *
-	 * The TXN is available at every one of those sites, and its lock
-	 * registry answers the same question NARROWLY: ft_flip_txn_owns is a
-	 * positive proof of holding when it HITS, and its own header warns that
-	 * a miss means only "the registry cannot see this hold".  That
-	 * asymmetry is exactly what gating an unfailable park needs -- hit,
-	 * park; miss, stay MW, which is conservative and always sound.
+	 * Left as owns(), root-only read 100%% "would hold" (82,839 of 82,839)
+	 * while nothing had taken a single cell lock: an op holding the ROOT
+	 * would have parked SW on a word a peer holding THAT WORD was inside.
+	 * Two writers, two different locks, no exclusion -- the same defect as
+	 * "take the anchor if held, else the cell's own lock", with the code
+	 * rather than the design doing the substituting.
 	 *
-	 * ☠ THE DEPTH STILL NEEDS A DESCENT AT COARSE SPACINGS, and only @ctx
-	 * carries one.  At PER-NODE it does not: ft_anchor_meta returns the
-	 * node itself there, so the anchor IS the holder and no climb runs --
-	 * which is the spacing the livelock lives in.  So this converts
-	 * per-node from the txn alone, and exponential waits on the @ctx
-	 * plumbing rather than blocking on it.
+	 * A cell lock admits no coarsening, at any spacing, so the query must
+	 * be the exact one.
 	 */
-	/*
-	 * ☠ THE CLASS IS NOT COMPLETE YET, SO NOTHING PARKS.  See the header
-	 * above: a partial conversion corrupts, so the park is opt-in until
-	 * every cell-edge writer holds the anchor.  Counted as its own bucket
-	 * rather than folded into a refusal, because "off" and "refused" are
-	 * different facts and a census that conflated them would read as
-	 * progress.
-	 */
-	if (!FT_CELL_SW_ENABLED) {
-		FT_COW(disabled);
-		return NULL;
-	}
-	if (!e->ctx && !t) {
-		FT_COW(noctx);
-		return NULL;
-	}
-	if (!e->ctx && ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
-		FT_COW(noctx);		/* no descent to date the holder */
-		return NULL;
-	}
-	if (!e->owner_cell) {
+	return t && ft_flip_txn_holds(t, lock);
+}
+
+static inline
+struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
+		const struct ft_flip_txn *t, const struct ft_ord_cell_edge *e)
+{
+	struct cds_ft_metadata *lock = ft_cell_word_lock(ft, e);
+
+	if (!lock) {
 		FT_COW(nocell);
 		return NULL;
 	}
 	/*
-	 * ☠ THE SENTINEL IS NOT A CELL.  @ft->ord_sentinel.node is a bare
-	 * urcu_txn_list_node, and ft_ord_cell_of() is a 0-offset cast, so a
-	 * neighbour resolved off the end ALIASES it as a "cell" whose ->parent
-	 * reads past the sentinel into whatever follows it in struct cds_ft.
-	 * ft_ord_is_end is the trie's own test for exactly this.  A splice at
-	 * the head or tail of the key order takes that branch every time, which
-	 * is why it SEGVs deterministically -- ft_inv at test 46 and ft_unit at
-	 * test 24, all four legs, the first time this ran.
-	 *
-	 * No holder means no nearest ancestor, so the edge stays MW.
+	 * ☞ ASK BEFORE THE FEATURE GATE, SO THE CENSUS MEASURES THE TRIE AND
+	 * NOT THE BUILD.  The park is still off; what the migration needs to
+	 * know at every stage is how many cell words the op WOULD hold, per
+	 * producer and at BOTH spacings.  Counting the refusal first and the
+	 * gate second is what makes `notheld` a work item rather than an
+	 * artefact of FEATURE_FT_CELL_SW being unset.
 	 */
-	if (ft_ord_is_end(ft, e->owner_cell)) {
-		FT_COW(sentinel);
-		return NULL;
-	}
-	holder = e->owner_cell->parent;
-	if (!holder || ft_node_flip_proxy(holder) || ft_node_external(holder)) {
-		FT_COW(nocell);
-		return NULL;
-	}
-	if (e->ctx) {
-		if (!ft_lock_ctx_depth_of_climb(ft, e->ctx, holder, &depth))
-			{ FT_COW(nodepth); return NULL; }	/* undatable */
-	} else {
-		depth = 0;		/* per-node: the anchor is the node */
-	}
-	hmeta = ft_flag_to_metadata((struct cds_ft *) ft, holder);
-	if (!hmeta) {
-		FT_COW(nometa);
-		return NULL;
-	}
-	anchor = ft_anchor_meta(ft, e->ctx ? ft_lock_ctx_descent(e->ctx) : NULL,
-			holder, hmeta, depth);
-	if (!anchor) {
-		FT_COW(nometa);
-		return NULL;
-	}
-	if (e->ctx ? !ft_lock_ctx_holds(e->ctx, anchor, &snap, &ratified)
-		   : !ft_flip_txn_owns(t, anchor)) {
+	if (!ft_cell_word_held(t, e, lock)) {
 		FT_COW_NOTHELD(t);
 		return NULL;
 	}
 	FT_COW(ok);
-	return anchor;
+	if (!FT_CELL_SW_ENABLED) {
+		/*
+		 * A SUBSET of @ok, not a bucket of its own: these are the edges
+		 * that would have parked.  Deliberately not added into the
+		 * total -- a tally that double-counted them would stop summing.
+		 */
+		FT_COW(disabled);
+		return NULL;
+	}
+	return lock;
 }
 
 /*
- * THE ACQUIRE SIDE OF ft_cell_edge_owner'S QUESTION.
+ * THE ACQUIRE SIDE OF ft_cell_word_lock()'S ANSWER.
  *
- * That function answers "does this op HOLD the cell's nearest-ancestor lock?"
- * and records MW when it does not.  This one builds the lock-set member that
- * would make the answer yes, so a splice can TAKE the neighbour anchors it is
- * about to write instead of falling back.
+ * That function says WHICH word protects a cell edge; this builds the lock-set
+ * member that takes it.  The two must name the same word or the widening buys
+ * nothing (hold one lock, record against another), which is why this calls it
+ * rather than re-deriving -- a guard and the operation it guards that share a
+ * predicate and disagree on one term is a defect this trie has already paid for
+ * (@7692ad8f).
  *
- * ☠ THE TWO PREDICATES MUST AGREE, WORD FOR WORD.  A guard and the operation it
- * guards that share a predicate and disagree on one term is a defect this trie
- * has already paid for (@7692ad8f).  If this acquires an anchor
- * ft_cell_edge_owner would not have named, the op holds a lock nothing uses; if
- * it names a DIFFERENT anchor, the op holds the wrong word and the edge records
- * MW anyway -- sound, but the widening silently buys nothing.  So the bail
- * sequence below mirrors ft_cell_edge_owner's exactly: sentinel, then
- * NULL/proxy/external holder, then metadata.
+ * ☞ NO SPACING TEST, NO DEPTH, NO @ctx.  The lock is the CELL'S OWN word (or
+ * the sentinel end's), so there is nothing to date and nothing to descend for:
+ * it is identical at fine and exponential.  That is the whole reason the cell
+ * owns its lock instead of borrowing its holder's anchor.
  *
- * ☞ PER-NODE ONLY, for the same reason.  ft_cell_edge_owner derives its depth
- * from @e->ctx, and no cell producer threads one (measured 79,476 of 79,476),
- * so it takes the `depth = 0` per-node arm -- where ft_anchor_meta returns the
- * holder itself.  Climbing for a depth HERE would name a coarse-spacing anchor
- * the checker never asks about.  At a coarse spacing it refuses every cell edge
- * regardless, so there is nothing to acquire for.
+ * @side_slot names WHICH word of the pair is being taken, so a sentinel
+ * neighbour resolves to the begin or the end lock rather than to one lock for
+ * both.  Pass NULL when the member is the cell itself.
  *
- * Returns false when no anchor is derivable; the edge then records MW, which is
- * the sound default and exactly today's behaviour.
+ * Returns false only when there is no cell at all.
  */
 static inline
 bool ft_cell_lock_member(const struct cds_ft *ft,
-		const struct ft_ord_cell *cell, struct ft_dlm_member *out)
+		const struct ft_ord_cell *cell, const void *side_slot,
+		struct ft_dlm_member *out)
 {
-	struct cds_ft_inode_flag *holder;
-	struct cds_ft_metadata *hmeta;
+	struct ft_ord_cell_edge probe = { 0 };
 
-	if (!FT_CELL_SW_ENABLED)
-		return false;		/* nothing parks; nothing to widen for */
-	if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE)
+	if (!cell)
 		return false;
-	if (ft_ord_is_end(ft, cell))
-		return false;		/* the sentinel owns no anchor */
-	holder = cell->parent;
-	if (!holder || ft_node_flip_proxy(holder) || ft_node_external(holder))
-		return false;
-	hmeta = ft_flag_to_metadata((struct cds_ft *) ft, holder);
-	if (!hmeta)
-		return false;
-	*out = (struct ft_dlm_member){ .nf = holder, .node = hmeta,
-		.depth = 0 };
-	return true;
+	probe.owner_cell = (struct ft_ord_cell *) cell;
+	probe.slot = (struct ft_ord_cell **) side_slot;
+	*out = (struct ft_dlm_member){
+		.anchor = ft_cell_word_lock(ft, &probe),
+		.lock_only = true };
+	return out->anchor != NULL;
 }
 
 

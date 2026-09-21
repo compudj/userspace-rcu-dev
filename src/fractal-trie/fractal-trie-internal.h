@@ -2694,6 +2694,30 @@ struct cds_ft {
 	 * the endpoints via ft_ord_first / ft_ord_last (NULL when empty).
 	 */
 	struct urcu_txn_list_head ord_sentinel;
+	/*
+	 * ☞ THE THREE WORDS NO NODE OWNS, GIVEN OWNERS.
+	 *
+	 * @ord_sentinel's two list ends and @root are lock-BEARING words with
+	 * no lock-bearing ancestor: no node owns them, which is why they were
+	 * the permanent MW residue (the MW_ALWAYS ROOT class, and the cell
+	 * census's `sentinel` bucket).  "No node owns it" describes the absence
+	 * of an owner, not an impossibility -- so give them owners.
+	 *
+	 * Full struct cds_ft_metadata rather than a bare word so every existing
+	 * primitive works unchanged: ft_meta_lock_acquire/release CAS the same
+	 * @state bit, ft_flip_txn_lock_register_held files the same anchor, and
+	 * ft_dlm_acquire_set sorts them by address alongside node anchors.
+	 *
+	 * ☠ ONE LOCK PER END, NOT ONE FOR THE LIST.  @ord_sentinel.node.next
+	 * (the list BEGIN) and .prev (the END) are independent words; sharing a
+	 * lock would serialise a head splice against a tail splice for nothing.
+	 *
+	 * These are lock ANCHORS only -- never reachable as trie nodes, never
+	 * handed to a descent, and named by a lock-only ft_dlm_member.
+	 */
+	struct cds_ft_metadata ord_begin_lock;	/* &ord_sentinel.node.next */
+	struct cds_ft_metadata ord_end_lock;	/* &ord_sentinel.node.prev */
+	struct cds_ft_metadata root_lock;	/* &root */
 
 #ifdef FEATURE_FT_EXCL_VALIDATE
 	/*

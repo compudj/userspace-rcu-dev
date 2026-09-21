@@ -949,6 +949,14 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 */
 	urcu_txn_list_init(&ft->ord_sentinel);
 	/*
+	 * The three ownerless words' lock anchors.  A zeroed @state is CLEAN,
+	 * which is what ft_meta_lock_acquire expects to CAS from; nothing else
+	 * in cds_ft_metadata is read for a lock-only anchor.
+	 */
+	memset(&ft->ord_begin_lock, 0, sizeof(ft->ord_begin_lock));
+	memset(&ft->ord_end_lock, 0, sizeof(ft->ord_end_lock));
+	memset(&ft->root_lock, 0, sizeof(ft->root_lock));
+	/*
 	 * Effective per-trie speculative-key state: the group is configured for
 	 * speculative result-key capture AND this trie did not opt out via
 	 * cds_ft_attr_set_speculative_keys(attr, false).  Set BEFORE
