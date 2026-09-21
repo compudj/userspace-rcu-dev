@@ -723,3 +723,27 @@ Callers pass `p` (not a re-resolution) to the edge builders:
    about. Anchor-folding replaces a zero-derivation rule with one that is still
    deterministic per word — `ft_anchor_meta` off a fixed schedule, so "two ops
    that reach the node agree" (§1) — but only once every writer can compute it.
+
+### ☑ CONFIRMED 2026-09-21: all SW under locks, root and list ends included
+
+Mathieu: *"I confirm that we go for all SW with locks, including for root and
+begin/end of cell siblings list."*
+
+This closes the reversal this document flagged. The earlier position — that the
+root pointer and the cell sibling list are **MW on purpose** — is **superseded**.
+Consequences:
+
+* **Stage 5 (`&ft->root` -> `root_lock`) is in scope**, not conditional. The
+  tree's own claims that it "NEVER converts" (`fractal-trie-internal.h`'s
+  `MW_ALWAYS`/`ROOT` note, and `ft_cell_edge_owner`'s *"no node owns
+  &ft->root"*) describe the absence of an owner, not an impossibility, and both
+  should be retired with the stage rather than left to contradict the code.
+* **The sentinel's two words convert** via `ord_begin_lock` / `ord_end_lock`
+  (one each, not one shared — the begin and end words are independent and a
+  shared lock would serialise a head splice against a tail splice for nothing).
+* The end state has **no cell-list word left MW**, so §(g)'s "which words stay
+  MW forever" answer is: none. Every remaining uniform-MW class is a MIGRATION
+  state, to be driven to zero by the census rather than tolerated.
+* The target is therefore literally **100% SW records** for this class — the
+  census's `notheld`, `sentinel`, `nocell`, `nodepth`, `nometa` and the engine
+  lanes all read 0, at fine AND exponential.
