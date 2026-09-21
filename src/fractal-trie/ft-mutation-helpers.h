@@ -11290,9 +11290,54 @@ uintptr_t ft_edge_tag(const struct ft_ord_cell_edge *edge)
  * ☠ HELD, NOT MERELY NAMED.  This answers with the anchor ONLY when the op
  * actually holds it.  A named-but-unheld owner must keep recording MW: the SW
  * park cannot fail, so parking one on a word this op does not exclude silently
- * erases whatever a peer left there.  The unheld remainder is the work that
- * follows -- widening the splice's lock set to TAKE these anchors -- and until
- * then it degrades to exactly today's behaviour.
+ * erases whatever a peer left there.
+ *
+ * ☠☠☠ AND "THE UNHELD REMAINDER DEGRADES TO TODAY'S BEHAVIOUR" IS FALSE -- IT
+ * WAS THE CLAIM THIS COMMENT USED TO MAKE, AND IT IS WHY THE PARK IS NOW
+ * OFF BY DEFAULT.  Today's behaviour was ALL-MW, where every writer of a cell
+ * word arbitrates by CAS and a loser retries.  A PARTIAL conversion is not
+ * that: it leaves ONE WORD CARRYING TWO WRITER DISCIPLINES.
+ *
+ *   SW commit  uatomic_store(slot, new, CMM_RELEASE)   -- validates NOTHING
+ *   MW commit  uatomic_cmpxchg(slot, old, new)
+ *
+ * and settle "stores old_ptr (abort) or new_ptr (commit) BLIND"
+ * (urcu_txn_add's header).  So writer X, which HOLDS the anchor, parks SW and
+ * stores unconditionally; writer Y, which does NOT hold it, CASes -- and they
+ * run concurrently PRECISELY BECAUSE Y never took the lock X holds.  Y's CAS
+ * succeeds, X's blind store lands on top of it, and Y's committed edge is
+ * gone.  A lost list link is a lost key.  (The other order is safe: X stores,
+ * Y's CAS sees a changed word and retries -- which is why this is rare and
+ * load-shaped rather than deterministic.)
+ *
+ * ☠ THE ENGINE'S SW/MW KIND DETECTOR CANNOT SEE IT, so a green
+ * --enable-rcu-debug gate is not evidence either way.  urcu_txn_record_chain
+ * resolves via urcu_txn_find(t, slot) and the duplicate-slot assert loops over
+ * t->recs[] -- ONE descriptor.  Two CONCURRENT txns recording one slot with
+ * different kinds is outside what it examines.
+ *
+ * MEASURED, this commit's shape, per-node, 78,447 cell edges:
+ *
+ *   CONVERTED (anchor held)     43,936   56.0%
+ *   neighbour is the sentinel   10,306   13.1%   no holder exists at all
+ *   anchor NOT HELD             24,205   30.9%   3 acquires, all ft-remove.h
+ *
+ * plus a SECOND LANE the census above does not even count:
+ * ft_txn_list_insert_between_prepare records BOTH its edges
+ * urcu_txn_store_mw unconditionally (FT_AB_OWN_NA), 19,628 stores from
+ * ft-insert.h:459 -- on the same words this function parks SW.
+ *
+ * ☞ SO THE RULE IS ONE DISCIPLINE PER WORD, and the transition completes only
+ * when EVERY writer of a cell edge holds that cell's nearest-ancestor lock:
+ *   1. route ft_txn_list_insert_between_prepare through this recorder;
+ *   2. widen the three ft-remove.h acquires so NOT HELD reaches 0;
+ *   3. decide the sentinel, which no holder owns.
+ * Until all three land, -DFEATURE_FT_CELL_SW is the only way to get the park,
+ * and the default build is ALL-MW -- sound, and exactly what shipped before
+ * the conversion.  The census is the progress meter: flip the default when
+ * NOT HELD, the sentinel row and the insert lane are all zero.
+ * ⇒ Mathieu's standing rule: complete the lock-set transition FIRST; only when
+ * COMPLETE can MW become SW.  No per-class conversion, no partial flip.
  */
 /*
  * WHY a cell edge did not convert, per reason.  The conversion is gated on the
@@ -11301,16 +11346,81 @@ uintptr_t ft_edge_tag(const struct ft_ord_cell_edge *edge)
  * a PLUMBING one (no @ctx threaded to this producer) is cheap to close, a
  * NOT-HELD one means the splice's lock set has to be widened to take it.
  */
+/*
+ * THE CELL-EDGE SW PARK'S SWITCH.  Off by default: see the header above for why
+ * a partial conversion is a correctness bug and not a missed optimisation.
+ * -DFEATURE_FT_CELL_SW turns it on, which is how the conversion work and its
+ * ablation leg stay alive without shipping the mix.
+ */
+#ifdef FEATURE_FT_CELL_SW
+# define FT_CELL_SW_ENABLED	1
+#else
+# define FT_CELL_SW_ENABLED	0
+#endif
+
 #ifdef FT_DEBUG_CELL_OWNER
 __attribute__((weak)) unsigned long ft_cow_ok, ft_cow_noctx, ft_cow_nocell,
 	ft_cow_sentinel, ft_cow_nodepth, ft_cow_nometa, ft_cow_notheld,
-	ft_cow_reported;
+	ft_cow_disabled, ft_cow_reported;
+/*
+ * ☞ AND WHICH ACQUIRE OWES THE ANCHOR.  The bucket above sizes the NOT-HELD
+ * remainder; it cannot name the op, and the op is the whole deliverable --
+ * "widen the splice's lock set" is not a work item until you know WHICH lock
+ * set.  Key the unheld edges by the TXN's CREATION site, which is exactly the
+ * acquire that would have to take the neighbour's anchor.
+ *
+ * ☠ NOT a per-record attribution.  A cell edge's producer is several frames
+ * below the acquire that built the lock set, so naming the producer would name
+ * ft_ord_cell_* -- true and useless.  The txn site names the caller whose
+ * ACQUIRE is short, which is the thing that gets restructured.
+ */
+/*
+ * ☠ THE SITE TABLE NEEDS -DFT_DEBUG_TXN_KIND TOO: FT_TK_TXN_SITE is
+ * ft-txn-kind-stats.h's @dbg_site, which only EXISTS under that macro (the
+ * field is not in the struct otherwise).  So the table is armed only for the
+ * pair, and the report below SAYS SO when it is not -- an absent table that
+ * printed nothing would read as "no unheld edges have a site", which is the
+ * wrong-zero this file has been bitten by before.
+ */
+#if defined(FT_DEBUG_TXN_KIND)
+# define FT_COW_SITES	1
+# define FT_COW_NSITE	24
+__attribute__((weak)) struct ft_tk_site *ft_cow_nh_site[FT_COW_NSITE];
+__attribute__((weak)) unsigned long ft_cow_nh_n[FT_COW_NSITE];
+static inline void ft_cow_note_notheld(const struct ft_flip_txn *t)
+{
+	struct ft_tk_site *st = t ? FT_TK_TXN_SITE(t) : NULL;
+	int k;
+
+	if (!st)
+		return;
+	for (k = 0; k < FT_COW_NSITE; k++) {
+		if (uatomic_read(&ft_cow_nh_site[k]) == st) {
+			uatomic_inc(&ft_cow_nh_n[k]);
+			return;
+		}
+		if (!uatomic_read(&ft_cow_nh_site[k]) &&
+		    uatomic_cmpxchg(&ft_cow_nh_site[k], NULL, st) == NULL) {
+			uatomic_inc(&ft_cow_nh_n[k]);
+			return;
+		}
+	}
+}
+#else
+/*
+ * Unarmed: the report's table branch still has to COMPILE, so the names exist
+ * and stay empty.  Every unheld edge then falls to the "(unattributed)" row
+ * beneath the explicit NOT ARMED line, which is the honest rendering.
+ */
+# define FT_COW_SITES	0
+static inline void ft_cow_note_notheld(const struct ft_flip_txn *t) { (void) t; }
+#endif
 static void ft_cow_report(void) __attribute__((destructor));
 static void ft_cow_report(void)
 {
 	unsigned long t = ft_cow_ok + ft_cow_noctx + ft_cow_nocell +
 		ft_cow_sentinel + ft_cow_nodepth + ft_cow_nometa +
-		ft_cow_notheld;
+		ft_cow_notheld + ft_cow_disabled;
 
 	if (!t || __atomic_fetch_add(&ft_cow_reported, 1, __ATOMIC_RELAXED))
 		return;
@@ -11322,18 +11432,61 @@ static void ft_cow_report(void)
 		"  neighbour is the sentinel   %12lu  %5.1f%%\n"
 		"  climb could not date holder %12lu  %5.1f%%\n"
 		"  holder has no metadata      %12lu  %5.1f%%\n"
-		"  anchor NOT HELD (ACQUIRE)   %12lu  %5.1f%%\n",
+		"  anchor NOT HELD (ACQUIRE)   %12lu  %5.1f%%\n"
+		"  park OFF (no FEATURE_FT_CELL_SW) %7lu  %5.1f%%\n",
 		t,
 		ft_cow_ok, 100.0*ft_cow_ok/t, ft_cow_noctx, 100.0*ft_cow_noctx/t,
 		ft_cow_nocell, 100.0*ft_cow_nocell/t,
 		ft_cow_sentinel, 100.0*ft_cow_sentinel/t,
 		ft_cow_nodepth, 100.0*ft_cow_nodepth/t,
 		ft_cow_nometa, 100.0*ft_cow_nometa/t,
-		ft_cow_notheld, 100.0*ft_cow_notheld/t);
+		ft_cow_notheld, 100.0*ft_cow_notheld/t,
+		ft_cow_disabled, 100.0*ft_cow_disabled/t);
+#if FT_COW_SITES
+	if (ft_cow_notheld) {
+		unsigned long named = 0;
+		int k;
+
+		fprintf(stderr, "  the NOT-HELD edges by the TXN's creation site "
+			"-- the ACQUIRE that owes the anchor:\n");
+		for (k = 0; k < FT_COW_NSITE; k++)
+			if (ft_cow_nh_site[k]) {
+				const char *f = ft_cow_nh_site[k]->file;
+				const char *b = f ? strrchr(f, '/') : NULL;
+
+				named += ft_cow_nh_n[k];
+				fprintf(stderr, "    %-26s:%-5d %-22s %12lu\n",
+					b ? b + 1 : (f ? f : "?"),
+					ft_cow_nh_site[k]->line,
+					ft_cow_nh_site[k]->what ?
+						ft_cow_nh_site[k]->what : "?",
+					ft_cow_nh_n[k]);
+			}
+		/*
+		 * ☠ SAY WHAT THE TABLE DOES NOT COVER.  A txn with no dbg_site
+		 * (no FT_TK_TXN_BEGIN) is counted in the bucket and named by no
+		 * row, so a table that silently summed to less than the bucket
+		 * would read as a complete enumeration.  It is the same
+		 * wrong-zero as a weak hook resolving to NULL.
+		 */
+		fprintf(stderr, "    %-26s %-28s %12lu\n", "(unattributed)",
+			"no dbg_site on the txn", ft_cow_notheld - named);
+	}
+#else
+	if (ft_cow_notheld)
+		fprintf(stderr, "  (per-acquire table NOT ARMED: add "
+			"-DFT_DEBUG_TXN_KIND)\n");
+#endif
 }
 # define FT_COW(c)	uatomic_inc(&ft_cow_##c)
+/* Bucket AND attribute in one macro, so the call cannot outlive the census. */
+# define FT_COW_NOTHELD(t)	do {					\
+		FT_COW(notheld);					\
+		ft_cow_note_notheld(t);					\
+	} while (0)
 #else
 # define FT_COW(c)	do { } while (0)
+# define FT_COW_NOTHELD(t)	do { } while (0)
 #endif
 
 static inline
@@ -11373,6 +11526,18 @@ struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
 	 * per-node from the txn alone, and exponential waits on the @ctx
 	 * plumbing rather than blocking on it.
 	 */
+	/*
+	 * ☠ THE CLASS IS NOT COMPLETE YET, SO NOTHING PARKS.  See the header
+	 * above: a partial conversion corrupts, so the park is opt-in until
+	 * every cell-edge writer holds the anchor.  Counted as its own bucket
+	 * rather than folded into a refusal, because "off" and "refused" are
+	 * different facts and a census that conflated them would read as
+	 * progress.
+	 */
+	if (!FT_CELL_SW_ENABLED) {
+		FT_COW(disabled);
+		return NULL;
+	}
 	if (!e->ctx && !t) {
 		FT_COW(noctx);
 		return NULL;
@@ -11425,7 +11590,7 @@ struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
 	}
 	if (e->ctx ? !ft_lock_ctx_holds(e->ctx, anchor, &snap, &ratified)
 		   : !ft_flip_txn_owns(t, anchor)) {
-		FT_COW(notheld);
+		FT_COW_NOTHELD(t);
 		return NULL;
 	}
 	FT_COW(ok);
