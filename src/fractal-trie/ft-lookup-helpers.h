@@ -193,6 +193,27 @@ bool ft_ord_is_end(const struct cds_ft *ft, const struct ft_ord_cell *c)
 }
 
 /*
+ * ☞ THE SENTINEL, TOLD APART FROM "NO CELL AT ALL".
+ *
+ * ft_ord_is_end() above folds the two together, and for a TRAVERSAL that is
+ * exactly right -- a NULL link and the trie's own sentinel both mean "off the
+ * end".  For LOCKING they stopped being the same answer the moment the
+ * sentinel got lock words of its own (@ord_begin_lock / @ord_end_lock): a NULL
+ * owner is "not a cell link, nothing to lock", while the sentinel is a
+ * perfectly lockable owner.  Folding them would silently drop every head- and
+ * tail-of-key-order splice out of the lock set.
+ *
+ * Kept as a separate predicate rather than changing ft_ord_is_end, whose
+ * NULL-folding is load-bearing for the traversal callers (and for the
+ * cross-trie run moves that NULL-terminate a moved run's outer links).
+ */
+static inline_lookup
+bool ft_ord_is_sentinel(const struct cds_ft *ft, const struct ft_ord_cell *c)
+{
+	return c && &c->lnode == &ft->ord_sentinel.node;
+}
+
+/*
  * First cell of @ft's ordinal-cell list in key order, or NULL when the list is
  * empty -- the sentinel-model replacement for reading ord_cell_head.  Resolves a
  * flip proxy (a concurrent splice/run move flips the sentinel's next edge).

@@ -10779,6 +10779,23 @@ eagain:
 	ft_dlm_acquire_set_at(__func__, __LINE__, (ft), (ctx), (set), (nr))
 
 /*
+ * THE ENGINE-LANE COUNTER, declared here because its first user is below and a
+ * macro must exist before it is used.
+ *
+ * A cell word recorded by a producer that never ASKED who owns it: the engine's
+ * urcu_txn_list_replace_prepare lanes and the direct urcu_txn_store_mw pair in
+ * ft_txn_list_insert_between_prepare.  Invisible to every FT_CELL_OWNER bucket,
+ * because those are counted INSIDE the predicate this lane skips -- so it needs
+ * a counter of its own and cannot be inferred from a shortfall in the total.
+ */
+#ifdef FT_DEBUG_CELL_OWNER
+__attribute__((weak)) unsigned long ft_cow_engine_lane;
+# define FT_COW_ENGINE_LANE()	uatomic_inc(&ft_cow_engine_lane)
+#else
+# define FT_COW_ENGINE_LANE()	do { } while (0)
+#endif
+
+/*
  * FT-local order-pinned insert-between (was the engine's
  * urcu_txn_list_insert_between_prepare, dropped when the transaction engine was
  * adopted wholesale -- it only calls class-A primitives, so it lives here now).
@@ -10818,9 +10835,11 @@ int ft_txn_list_insert_between_prepare(struct urcu_txn *txn,
 	newp->next = succ_expected;
 	newp->prev = pos;
 	FT_TK_COUNT_CELL_MW();		/* a cell edge: see ft_hlist_store_mw */
+	FT_COW_ENGINE_LANE();
 	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	urcu_txn_store_mw(txn, (void **) &pos->next, succ_expected, newp, URCU_TXN_TAG);
 	FT_TK_COUNT_CELL_MW();
+	FT_COW_ENGINE_LANE();
 	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	urcu_txn_store_mw(txn, (void **) &succ_expected->prev, pos, newp, URCU_TXN_TAG);
 	return 0;
@@ -11225,7 +11244,14 @@ __attribute__((weak)) unsigned long ft_cow_ok, ft_cow_noctx, ft_cow_nocell,
 # define FT_COW_NSITE	24
 __attribute__((weak)) struct ft_tk_site *ft_cow_nh_site[FT_COW_NSITE];
 __attribute__((weak)) unsigned long ft_cow_nh_n[FT_COW_NSITE];
-static inline void ft_cow_note_notheld(const struct ft_flip_txn *t)
+__attribute__((weak)) unsigned long ft_cow_h_n[FT_COW_NSITE];
+/*
+ * ☞ BOTH ANSWERS PER PRODUCER, not just the refusals.  The migration's
+ * question at every stage is "which producers hold the cell word yet", so a
+ * table that only listed the misses would show a site vanishing when it
+ * converted and could not tell that from the site no longer running.
+ */
+static inline void ft_cow_note_site(const struct ft_flip_txn *t, bool held)
 {
 	struct ft_tk_site *st = t ? FT_TK_TXN_SITE(t) : NULL;
 	int k;
@@ -11234,12 +11260,12 @@ static inline void ft_cow_note_notheld(const struct ft_flip_txn *t)
 		return;
 	for (k = 0; k < FT_COW_NSITE; k++) {
 		if (uatomic_read(&ft_cow_nh_site[k]) == st) {
-			uatomic_inc(&ft_cow_nh_n[k]);
+			uatomic_inc(held ? &ft_cow_h_n[k] : &ft_cow_nh_n[k]);
 			return;
 		}
 		if (!uatomic_read(&ft_cow_nh_site[k]) &&
 		    uatomic_cmpxchg(&ft_cow_nh_site[k], NULL, st) == NULL) {
-			uatomic_inc(&ft_cow_nh_n[k]);
+			uatomic_inc(held ? &ft_cow_h_n[k] : &ft_cow_nh_n[k]);
 			return;
 		}
 	}
@@ -11251,7 +11277,8 @@ static inline void ft_cow_note_notheld(const struct ft_flip_txn *t)
  * beneath the explicit NOT ARMED line, which is the honest rendering.
  */
 # define FT_COW_SITES	0
-static inline void ft_cow_note_notheld(const struct ft_flip_txn *t) { (void) t; }
+static inline void ft_cow_note_site(const struct ft_flip_txn *t, bool held)
+{ (void) t; (void) held; }
 #endif
 static void ft_cow_report(void) __attribute__((destructor));
 static void ft_cow_report(void)
@@ -11272,12 +11299,13 @@ static void ft_cow_report(void)
 		"  not a cell link             %12lu  %5.1f%%\n"
 		"  NOT HELD (the work)         %12lu  %5.1f%%\n"
 		"    of WOULD HOLD, unparked "
-		"(no FEATURE_FT_CELL_SW) %12lu\n",
+		"(no FEATURE_FT_CELL_SW) %12lu\n"
+		"  ENGINE LANE (never asked)   %12lu   [not in the total]\n",
 		t,
 		ft_cow_ok, 100.0*ft_cow_ok/t,
 		ft_cow_nocell, 100.0*ft_cow_nocell/t,
 		ft_cow_notheld, 100.0*ft_cow_notheld/t,
-		ft_cow_disabled);
+		ft_cow_disabled, ft_cow_engine_lane);
 	/*
 	 * ☞ THE ROWS THAT ARE GONE ARE THE RESULT.  `sentinel`, `no ctx`,
 	 * `climb could not date holder` and `holder has no metadata` cannot fire
@@ -11287,24 +11315,26 @@ static void ft_cow_report(void)
 	 * exponential instead of 0%% at the latter.
 	 */
 #if FT_COW_SITES
-	if (ft_cow_notheld) {
+	if (ft_cow_notheld || ft_cow_ok) {
 		unsigned long named = 0;
 		int k;
 
-		fprintf(stderr, "  the NOT-HELD edges by the TXN's creation site "
-			"-- the ACQUIRE that owes the anchor:\n");
+		fprintf(stderr, "  by the TXN's creation site -- the ACQUIRE that "
+			"owes the cell word's lock:\n");
+		fprintf(stderr, "    %-26s %-22s %12s %12s\n",
+			"file", "what", "HELD", "NOT HELD");
 		for (k = 0; k < FT_COW_NSITE; k++)
 			if (ft_cow_nh_site[k]) {
 				const char *f = ft_cow_nh_site[k]->file;
 				const char *b = f ? strrchr(f, '/') : NULL;
 
 				named += ft_cow_nh_n[k];
-				fprintf(stderr, "    %-26s:%-5d %-22s %12lu\n",
+				fprintf(stderr, "    %-20s:%-5d %-22s %12lu %12lu\n",
 					b ? b + 1 : (f ? f : "?"),
 					ft_cow_nh_site[k]->line,
 					ft_cow_nh_site[k]->what ?
 						ft_cow_nh_site[k]->what : "?",
-					ft_cow_nh_n[k]);
+					ft_cow_h_n[k], ft_cow_nh_n[k]);
 			}
 		/*
 		 * ☠ SAY WHAT THE TABLE DOES NOT COVER.  A txn with no dbg_site
@@ -11326,11 +11356,24 @@ static void ft_cow_report(void)
 /* Bucket AND attribute in one macro, so the call cannot outlive the census. */
 # define FT_COW_NOTHELD(t)	do {					\
 		FT_COW(notheld);					\
-		ft_cow_note_notheld(t);					\
+		ft_cow_note_site((t), false);				\
 	} while (0)
+# define FT_COW_HELD(t)		do {					\
+		FT_COW(ok);						\
+		ft_cow_note_site((t), true);				\
+	} while (0)
+/*
+ * A cell word recorded by a producer that never ASKED who owns it: the engine
+ * lanes (urcu_txn_list_replace_prepare) and the direct urcu_txn_store_mw pair
+ * in ft_txn_list_insert_between_prepare.  Invisible to every bucket above,
+ * because those bucket counts are taken inside the predicate this lane skips --
+ * which is exactly why it needs a counter of its own rather than being inferred
+ * from a shortfall.
+ */
 #else
 # define FT_COW(c)	do { } while (0)
 # define FT_COW_NOTHELD(t)	do { } while (0)
+# define FT_COW_HELD(t)		do { } while (0)
 #endif
 
 static inline
@@ -11409,7 +11452,7 @@ struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
 		FT_COW_NOTHELD(t);
 		return NULL;
 	}
-	FT_COW(ok);
+	FT_COW_HELD(t);
 	if (!FT_CELL_SW_ENABLED) {
 		/*
 		 * A SUBSET of @ok, not a bucket of its own: these are the edges
@@ -14759,6 +14802,9 @@ int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	 * free @old while still linked.  Both are a peer's doing, so -EAGAIN.
 	 */
 	{
+		/* Two cell words, recorded without asking who owns them. */
+		FT_COW_ENGINE_LANE();
+		FT_COW_ENGINE_LANE();
 		int pret = urcu_txn_list_replace_prepare(t->mtxn,
 			ft_ord_cell_lnode(old_cell), ft_ord_cell_lnode(new_cell));
 		enum urcu_txn_status st;

@@ -611,6 +611,9 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 		 * for the list, and committing the back edge alone would point
 		 * @head->prev at a cell that is not in the list.
 		 */
+		/* Two cell words, recorded without asking who owns them. */
+		FT_COW_ENGINE_LANE();
+		FT_COW_ENGINE_LANE();
 		sret = urcu_txn_list_replace_prepare(t->mtxn,
 			ft_ord_cell_lnode(old), ft_ord_cell_lnode(new_cell));
 		if (sret) {
