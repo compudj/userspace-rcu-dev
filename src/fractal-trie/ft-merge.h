@@ -1082,6 +1082,40 @@ struct ft_merge_src_cap {
 };
 
 /*
+ * ☠ THE SPINE-COPY CAPTURE'S BOUNDS ARE A PREMISE, NOT A DEBUG CHECK.
+ *
+ * The capture loops (ft_merge_spine_copy, ft_rekey_spine_copy) walk the src run
+ * from its first head to its last, sized by @cnt_src, and trust three facts: the
+ * walk reaches @slast before the list ends, every head's key is at least
+ * @src_key_len long, and the run holds fewer than @cnt_src + 8 heads.  They were
+ * assert()s, so a -DNDEBUG build dropped all three, and a false one became an
+ * up-walk of the sentinel (or of NULL), a wrapped @suffix_len handed to memcpy,
+ * or a store past the end of the caps array -- silent heap corruption where the
+ * debug build stopped.
+ *
+ * They are true by EXCLUSION, not by retry: a merge's source is an EXCLUSIVE
+ * trie with no peer, and a rekey runs inside the bulk gate with the FT-wide lock
+ * held, which is where point writers wait for the window.  A violation means
+ * that exclusion is broken, and bailing to a re-descend would retry against it
+ * instead of reporting it -- so keep the assert's meaning, in every build.
+ */
+static inline
+void ft_merge_src_capture_premise(bool ok, const char *what,
+		const struct ft_ord_cell *cell, const char *fn, int line)
+{
+	if (caa_likely(ok))
+		return;
+	fprintf(stderr, "FT SPINE-COPY CAPTURE: %s at cell %p (%s:%d) -- the "
+		"src run changed under a capture its exclusion says is "
+		"stable\n", what, (const void *) cell, fn, line);
+	fflush(stderr);
+	abort();
+}
+#define FT_MERGE_SRC_CAPTURE_PREMISE(ok_, what_, cell_)			\
+	ft_merge_src_capture_premise((ok_), (what_), (cell_), __func__,	\
+		__LINE__)
+
+/*
  * ☠ LOCK WHAT THE SPINE-COPY INTERLEAVE NAMES BEFORE RECORDING IT.
  *
  * A merged run that becomes the list's new minimum or maximum writes @dst_ft's
@@ -1920,12 +1954,22 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			bool oom = false;
 
 			for (;;) {
-				size_t sfl = ft_rebuild_key_upwalk(dst_ft, sc,
-						sbuf, s_max_len);
-				size_t suf_len;
+				size_t sfl, suf_len;
 
-				assert(sfl >= src_key_len &&
-					ms_nsrc < cnt_src + 8);
+				/* Premises, not asserts: see the helper. */
+				FT_MERGE_SRC_CAPTURE_PREMISE(
+					!ft_ord_is_end(src_ft, sc),
+					"walked off the list before the last head",
+					sc);
+				FT_MERGE_SRC_CAPTURE_PREMISE(
+					ms_nsrc < cnt_src + 8,
+					"more heads than @cnt_src + 8", sc);
+				sfl = ft_rebuild_key_upwalk(dst_ft, sc, sbuf,
+						s_max_len);
+				FT_MERGE_SRC_CAPTURE_PREMISE(
+					sfl >= src_key_len,
+					"a head key shorter than the merge point",
+					sc);
 				suf_len = sfl - src_key_len;
 				if (pool_len + suf_len > pool_cap) {
 					size_t ncap = pool_cap ? pool_cap * 2 : 256;

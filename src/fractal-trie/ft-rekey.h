@@ -9055,8 +9055,13 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 		 * the commit tail has no allocation left and cannot degrade to a
 		 * non-atomic per-edge fallback.  Each survivor run costs at most
 		 * two visible edges, so @ms_cap (2*merged_keys+2) bounds @ms_edges.
+		 *
+		 * ☠ CALLOC, not malloc -- the twin of ft_merge_spine_copy's
+		 * ms_edges, which 5f21b822 fixed and this one kept: the collect
+		 * fills edges FIELD BY FIELD and never sets @owner, which the
+		 * record loop below passes straight to the recorder's owns().
 		 */
-		ms_edges = malloc((size_t) ms_cap * sizeof(*ms_edges));
+		ms_edges = calloc((size_t) ms_cap, sizeof(*ms_edges));
 		if (!ms_edges) {
 			ft_flip_txn_destroy(txn);
 			if (fresh_root)
@@ -9093,12 +9098,22 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 			bool oom = false;
 
 			for (;;) {
-				size_t sfl = ft_rebuild_key_upwalk(dst_ft, sc,
-						sbuf, s_max_len);
-				size_t suf_len;
+				size_t sfl, suf_len;
 
-				assert(sfl >= src_key_len &&
-					ms_nsrc < cnt_src + 8);
+				/* Premises, not asserts: see the helper. */
+				FT_MERGE_SRC_CAPTURE_PREMISE(
+					!ft_ord_is_end(src_ft, sc),
+					"walked off the list before the last head",
+					sc);
+				FT_MERGE_SRC_CAPTURE_PREMISE(
+					ms_nsrc < cnt_src + 8,
+					"more heads than @cnt_src + 8", sc);
+				sfl = ft_rebuild_key_upwalk(dst_ft, sc, sbuf,
+						s_max_len);
+				FT_MERGE_SRC_CAPTURE_PREMISE(
+					sfl >= src_key_len,
+					"a head key shorter than the merge point",
+					sc);
 				suf_len = sfl - src_key_len;
 				if (pool_len + suf_len > pool_cap) {
 					size_t ncap = pool_cap ? pool_cap * 2 : 256;
