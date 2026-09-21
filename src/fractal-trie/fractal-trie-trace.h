@@ -524,6 +524,9 @@ void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_r
 		last_ret, ft_op_retry_nr_writers(ft),
 		r->key, r->key ? r->key_len : 0);
 	fprintf(stderr,
+		"  acquire bailed at ft-mutation-helpers.h:%u (x%lu), previous site :%u\n",
+		ft_dbg_acq_line, ft_dbg_acq_line_nr, ft_dbg_acq_line_other);
+	fprintf(stderr,
 		"FT OP RETRY LIVELOCK: op=%u attempts=%u last_ret=%d -- an "
 		"-EAGAIN no re-descent can clear.  Single-threaded this is "
 		"certain; under peers it is the leading hypothesis.\n",

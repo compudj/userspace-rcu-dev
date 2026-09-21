@@ -1,0 +1,383 @@
+diff --git a/src/fractal-trie/fractal-trie-trace.h b/src/fractal-trie/fractal-trie-trace.h
+index 3116ef36..ad838133 100644
+--- a/src/fractal-trie/fractal-trie-trace.h
++++ b/src/fractal-trie/fractal-trie-trace.h
+@@ -523,6 +523,9 @@ void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_r
+ 	FT_TP(op_retry_violation, (const void *) ft, r->op, r->attempts,
+ 		last_ret, ft_op_retry_nr_writers(ft),
+ 		r->key, r->key ? r->key_len : 0);
++	fprintf(stderr,
++		"  acquire bailed at ft-mutation-helpers.h:%u (x%lu), previous site :%u\n",
++		ft_dbg_acq_line, ft_dbg_acq_line_nr, ft_dbg_acq_line_other);
+ 	fprintf(stderr,
+ 		"FT OP RETRY LIVELOCK: op=%u attempts=%u last_ret=%d -- an "
+ 		"-EAGAIN no re-descent can clear.  Single-threaded this is "
+diff --git a/src/fractal-trie/ft-mutation-helpers.h b/src/fractal-trie/ft-mutation-helpers.h
+index 7b9e18b7..c00556f1 100644
+--- a/src/fractal-trie/ft-mutation-helpers.h
++++ b/src/fractal-trie/ft-mutation-helpers.h
+@@ -11362,6 +11362,9 @@ uintptr_t ft_edge_tag(const struct ft_ord_cell_edge *edge)
+ __attribute__((weak)) unsigned long ft_cow_ok, ft_cow_noctx, ft_cow_nocell,
+ 	ft_cow_sentinel, ft_cow_nodepth, ft_cow_nometa, ft_cow_notheld,
+ 	ft_cow_disabled, ft_cow_reported;
++/* The WIDENED take's own outcome: does adding the neighbours cost the take? */
++__attribute__((weak)) unsigned long ft_cow_take1_ok, ft_cow_take1_miss,
++	ft_cow_take3_ok, ft_cow_take3_miss;
+ /*
+  * ☞ AND WHICH ACQUIRE OWES THE ANCHOR.  The bucket above sizes the NOT-HELD
+  * remainder; it cannot name the op, and the op is the whole deliverable --
+@@ -11442,6 +11445,10 @@ static void ft_cow_report(void)
+ 		ft_cow_nometa, 100.0*ft_cow_nometa/t,
+ 		ft_cow_notheld, 100.0*ft_cow_notheld/t,
+ 		ft_cow_disabled, 100.0*ft_cow_disabled/t);
++	fprintf(stderr,
++		"  unchain take: holder-only ok=%lu miss=%lu | widened ok=%lu miss=%lu\n",
++		ft_cow_take1_ok, ft_cow_take1_miss,
++		ft_cow_take3_ok, ft_cow_take3_miss);
+ #if FT_COW_SITES
+ 	if (ft_cow_notheld) {
+ 		unsigned long named = 0;
+diff --git a/src/fractal-trie/ft-remove.h b/src/fractal-trie/ft-remove.h
+index 393a68b9..677d554b 100644
+--- a/src/fractal-trie/ft-remove.h
++++ b/src/fractal-trie/ft-remove.h
+@@ -6155,6 +6155,24 @@ end:
+  * the publication provides release semantics pairing with the reader's
+  * rcu_dereference of child->prev.
+  */
++/*
++ * Release the key-order neighbour anchors on a path that never handed them to
++ * ft_promote_head.  They are taken in ft_unchain_node's ONE lock-set plan and
++ * consumed by the promote, which registers them in its txn and lets the commit
++ * own the release -- so every OTHER exit between the two must call this.  A
++ * leaked FT lock is permanent: the first version of this widening missed these
++ * exits and wedged inv_concurrent_same_key_removes outright.
++ */
++static inline
++void ft_unchain_drop_neighbours(const struct ft_held_anchor *pred_held,
++		const struct ft_held_anchor *succ_held)
++{
++	if (pred_held)
++		ft_meta_lock_release(pred_held->lock);
++	if (succ_held)
++		ft_meta_lock_release(succ_held->lock);
++}
++
+ /*
+  * Head promotion: @node, the head of a duplicate chain, leaves the trie and
+  * @next_node (its next duplicate, non-NULL) takes its place at the same key.
+@@ -6186,7 +6204,9 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth,
+ 		struct cds_ft_node **head_slot, struct cds_ft_node *node,
+ 		struct cds_ft_node *next_node,
+-		struct cds_ft_metadata *held_holder, uintptr_t held_snap)
++		struct cds_ft_metadata *held_holder, uintptr_t held_snap,
++		const struct ft_held_anchor *pred_held,
++		const struct ft_held_anchor *succ_held)
+ {
+ 	struct ft_ord_cell *old_cell = ft->ordered_list ?
+ 		ft_ord_cell_ptr(node->prev) : NULL;
+@@ -6223,6 +6243,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 		if (!new_cell_flag) {
+ 			if (held_holder)
+ 				ft_meta_lock_release(held_holder);
++			ft_unchain_drop_neighbours(pred_held, succ_held);
+ 			return -ENOMEM;
+ 		}
+ 		txn = ft_flip_txn_create_bounded(ft,
+@@ -6234,8 +6255,21 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 				ft_ord_cell_ptr(new_cell_flag));
+ 			if (held_holder)
+ 				ft_meta_lock_release(held_holder);
++			ft_unchain_drop_neighbours(pred_held, succ_held);
+ 			return -ENOMEM;
+ 		}
++		/*
++		 * ☞ REGISTER HERE AND NOWHERE LATER.  ft_cell_edge_owner asks
++		 * ft_flip_txn_owns(), which reads THIS txn's locks[] registry
++		 * and nothing else -- an anchor acquired but not registered
++		 * converts nothing.  Registering also hands the release to the
++		 * txn (commit consumes the hold, destroy/abort releases it), so
++		 * no bail BELOW this point may drop them again.
++		 */
++		if (pred_held)
++			ft_flip_txn_lock_register_held(txn, pred_held);
++		if (succ_held)
++			ft_flip_txn_lock_register_held(txn, succ_held);
+ #ifdef FT_HLIST_CLAIM_PROMOTE
+ 		/*
+ 		 * §4 STEP B4's DRY RUN, the a3c75659 tool aimed at the
+@@ -6617,6 +6651,60 @@ unsigned long ft_dbg_unchain_rehomed;
+ unsigned long ft_dbg_unchain_rerouted;
+ #endif
+ 
++/*
++ * Is @meta already a member of the first @n entries of @set?
++ *
++ * ☠ THE SET MUST NOT NAME ONE ANCHOR TWICE.  Adjacent keys routinely share a
++ * holder, so a cell's pred or succ can resolve to the very node this op is
++ * already locking.  ft_dlm_acquire_set_at does dedupe within a set it is
++ * given -- but only there, which is precisely why the neighbours belong in the
++ * SAME take as the holder rather than a second one: a separate call gets a
++ * fresh (empty) taken[] and cannot see the first call's holds at all.
++ */
++static inline
++bool ft_dlm_set_has_node(const struct ft_dlm_member *set, unsigned int n,
++		const struct cds_ft_metadata *meta)
++{
++	unsigned int i;
++
++	for (i = 0; i < n; i++)
++		if (set[i].node == meta)
++			return true;
++	return false;
++}
++
++/*
++ * Sort a lock-set plan ASCENDING BY ANCHOR ADDRESS, in place.
++ *
++ * ☞ THE ORDER IS THE DEADLOCK ARGUMENT, and it is not optional just because
++ * the take is try-and-unwind: two ops that want {A,B} in opposite orders do not
++ * deadlock there, they LIVELOCK -- each takes one, misses the other, unwinds
++ * and respins, forever.  That is exactly what the unsorted version of this
++ * widening produced (four workers at ~62% CPU in state R, spinning in
++ * cds_ft_remove's retry).  FEATURE_FT_LOCK_TAKE_ORDERED sorts inside the
++ * acquire, but it is opt-in and the shipping build compiles it out, so the plan
++ * is sorted HERE and every build gets the total order.
++ *
++ * At per-node -- the only spacing this widening applies to, because
++ * ft_cell_lock_member refuses the others -- ft_anchor_meta returns the node
++ * itself, so @node IS the anchor and sorting by it is sorting by the anchor.
++ * Insertion sort: @n is at most 3.
++ */
++static inline
++void ft_dlm_set_sort_by_anchor(struct ft_dlm_member *set, unsigned int n)
++{
++	unsigned int i, j;
++
++	for (i = 1; i < n; i++) {
++		struct ft_dlm_member key = set[i];
++
++		for (j = i; j > 0 && (uintptr_t) set[j - 1].node >
++				(uintptr_t) key.node; j--)
++			set[j] = set[j - 1];
++		set[j] = key;
++	}
++}
++
+ /*
+  * The ROUTING DECISION _cds_ft_remove_locked took for @node, derived from
+  * node->prev / node->next with NOTHING held, and re-validated by
+@@ -6644,6 +6732,13 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 	struct cds_ft_metadata *hmeta = NULL;	/* MW LOCK_FINE holder lock */
+ 	uintptr_t hsnap = 0;
+ 	struct cds_ft_node *next_node;
++	/*
++	 * The head cell's key-order neighbour anchors, taken in the SAME plan as
++	 * the holder below and consumed by ft_promote_head.  NULL-able pointers
++	 * rather than flags so every exit reads the same way.
++	 */
++	struct ft_held_anchor pred_held = { 0 }, succ_held = { 0 };
++	struct ft_held_anchor *predp = NULL, *succp = NULL;
+ 
+ 	/*
+ 	 * MW LOCK_FINE (Step A, holder lock): serialise concurrent same-key chain
+@@ -6695,8 +6790,12 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 		if (caa_unlikely(!lock_nf))
+ 			return -EAGAIN;
+ 		{
+-			struct ft_held_anchor h;
++			struct ft_held_anchor h = { 0 };
+ 			unsigned int lock_depth = parent_depth;
++			struct ft_dlm_member set[3] = { 0 };
++			unsigned int nr_set = 0, k;
++			struct cds_ft_metadata *hold_meta, *pred_meta = NULL,
++				*succ_meta = NULL;
+ 
+ 			/*
+ 			 * A DERIVED holder (interior detach, @parent_nf NULL)
+@@ -6709,10 +6808,77 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 					!ft_lock_ctx_depth_of(ft, ctx, lock_nf,
+ 						&lock_depth))
+ 				return -EAGAIN;
+-			if (ft_acquire_member(ft, ctx, lock_nf,
+-					ft_flag_to_metadata(ft, lock_nf),
+-					lock_depth, &h))
+-				return -EAGAIN;
++			/*
++			 * ☞ ONE PLAN: THE HOLDER AND THE CELL'S KEY-ORDER
++			 * NEIGHBOURS, DEDUPED, SORTED, TAKEN TOGETHER.
++			 *
++			 * A head promote swaps the head's cell, and
++			 * ft_ord_cell_swap_edges writes THREE cell words:
++			 * &pred->lnode.next (owner pred), &succ->lnode.prev
++			 * (owner succ) and &old_cell->lnode.next (owner
++			 * old_cell).  Only the last is owned by the holder this
++			 * op already takes, which is why this site was the
++			 * largest NOT-HELD population in the cell census
++			 * (14,642 edges).
++			 *
++			 * All three go in ONE ft_dlm_acquire_set: a second call
++			 * gets a fresh taken[] and cannot dedupe against this
++			 * one's holds, and a set taken after another is held has
++			 * no total order with it.
++			 */
++			hold_meta = ft_flag_to_metadata(ft, lock_nf);
++			set[nr_set++] = (struct ft_dlm_member){ .nf = lock_nf,
++				.node = hold_meta, .depth = lock_depth };
++			if (ft->ordered_list && node->prev &&
++			    !ft_node_external((struct cds_ft_inode_flag *)
++						node->prev)) {
++				struct ft_ord_cell *hc =
++					ft_ord_cell_ptr(node->prev);
++
++				if (ft_cell_lock_member(ft,
++						ft_ord_cell_resolve_ord(
++							&hc->lnode.prev),
++						&set[nr_set]) &&
++				    !ft_dlm_set_has_node(set, nr_set,
++						set[nr_set].node))
++					pred_meta = set[nr_set++].node;
++				if (ft_cell_lock_member(ft,
++						ft_ord_cell_resolve_ord(
++							&hc->lnode.next),
++						&set[nr_set]) &&
++				    !ft_dlm_set_has_node(set, nr_set,
++						set[nr_set].node))
++					succ_meta = set[nr_set++].node;
++				ft_dlm_set_sort_by_anchor(set, nr_set);
++			}
++			{
++				int tk__ = ft_dlm_acquire_set(ft, ctx, set,
++						nr_set);
++#ifdef FT_DEBUG_CELL_OWNER
++				if (nr_set > 1)
++					uatomic_inc(tk__ ? &ft_cow_take3_miss
++							 : &ft_cow_take3_ok);
++				else
++					uatomic_inc(tk__ ? &ft_cow_take1_miss
++							 : &ft_cow_take1_ok);
++#endif
++				if (tk__)
++					return -EAGAIN;
++			}
++			/*
++			 * The plan was sorted, so a member is found by its
++			 * anchor, never by the slot it was built in.
++			 */
++			for (k = 0; k < nr_set; k++) {
++				if (set[k].node == hold_meta)
++					h = set[k].held;
++				else if (pred_meta && set[k].node == pred_meta &&
++						!set[k].held.shared)
++					pred_held = set[k].held, predp = &pred_held;
++				else if (succ_meta && set[k].node == succ_meta &&
++						!set[k].held.shared)
++					succ_held = set[k].held, succp = &succ_held;
++			}
+ 			/*
+ 			 * A holder the op ALREADY held is protected without a
+ 			 * second mark, and its release belongs to the acquire
+@@ -6760,6 +6926,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ #endif
+ 				if (!h.txn_owned)
+ 					ft_meta_lock_release_if_held(h.lock);
++				ft_unchain_drop_neighbours(predp, succp);
+ 				return -EAGAIN;
+ 			}
+ 			/*
+@@ -6807,6 +6974,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 				if (ft_node_is_removed(node)) {
+ 					if (!h.shared && !h.txn_owned)
+ 						ft_meta_lock_release_if_held(h.lock);
++					ft_unchain_drop_neighbours(predp, succp);
+ 					return -ENOENT;
+ 				}
+ 				if ((kind == FT_UNCHAIN_INTERIOR) != member ||
+@@ -6817,6 +6985,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ #endif
+ 					if (!h.shared && !h.txn_owned)
+ 						ft_meta_lock_release_if_held(h.lock);
++					ft_unchain_drop_neighbours(predp, succp);
+ 					return -EAGAIN;
+ 				}
+ 			}
+@@ -6852,6 +7021,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 	if (ft_chain_head_is_removed(node)) {
+ 		if (hmeta)
+ 			ft_meta_lock_release(hmeta);
++		ft_unchain_drop_neighbours(predp, succp);
+ 		return -ESTALE;
+ 	}
+ 
+@@ -6880,6 +7050,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 		if (!txn) {
+ 			if (hmeta)
+ 				ft_meta_lock_release(hmeta);
++			ft_unchain_drop_neighbours(predp, succp);
+ 			return -ENOMEM;
+ 		}
+ 		ft_ch_audit(ft, txn, node);
+@@ -6893,6 +7064,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 			ft_flip_txn_destroy(txn);
+ 			if (hmeta)
+ 				ft_meta_lock_release(hmeta);
++			ft_unchain_drop_neighbours(predp, succp);
+ 			return -EAGAIN;
+ 		}
+ 		st = ft_flip_txn_commit(ft, txn);
+@@ -6903,6 +7075,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 		 */
+ 		if (hmeta)
+ 			ft_meta_lock_release(hmeta);
++		ft_unchain_drop_neighbours(predp, succp);
+ 		if (st < 0)
+ 			return -ENOMEM;
+ 		/* ABORT: peer won, nothing installed, @node fully chained. */
+@@ -6925,9 +7098,19 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+ 		 * and every early-fail path clears it directly.  No post-commit
+ 		 * clear here.
+ 		 */
+-		return ft_promote_head(ft, ctx, parent_nf, parent_depth,
+-			head_slot, node,
+-				next_node, hmeta, hsnap);
++		/*
++		 * The one exit that does NOT drop the neighbours: it hands them
++		 * over.  ft_promote_head registers both in its txn, after which
++		 * the commit owns the release.
++		 */
++		{
++			int pret__ = ft_promote_head(ft, ctx, parent_nf,
++				parent_depth, head_slot, node,
++				next_node, hmeta, hsnap, NULL, NULL);
++
++			ft_unchain_drop_neighbours(predp, succp);
++			return pret__;
++		}
+ 	} else {
+ 		/*
+ 		 * Head with no successor: the key disappears (only reached for a
+@@ -8678,6 +8861,23 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
+ 		if (caa_unlikely(ft_remove_attempts > FT_REMOVE_RETRY_CAP)) {
+ 			fprintf(stderr, "FT REMOVE LIVELOCK: %u attempts on "
+ 				"one remove\n", ft_remove_attempts);
++#ifdef FT_DEBUG_CELL_OWNER
++			/*
++			 * The census report is a DESTRUCTOR and abort() does not
++			 * run it, so the one number that aims this has to be
++			 * printed HERE.
++			 */
++			fprintf(stderr, "  unchain take: holder-only ok=%lu "
++				"miss=%lu | widened ok=%lu miss=%lu\n",
++				ft_cow_take1_ok, ft_cow_take1_miss,
++				ft_cow_take3_ok, ft_cow_take3_miss);
++#endif
++#ifdef FT_DEBUG_OP_RETRY_CAP
++			fprintf(stderr, "  acquire bailed at ft-mutation-helpers.h:%u "
++				"(x%lu), previous site :%u\n",
++				ft_dbg_acq_line, ft_dbg_acq_line_nr,
++				ft_dbg_acq_line_other);
++#endif
+ 			abort();
+ 		}
+ #endif
