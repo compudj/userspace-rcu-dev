@@ -7657,6 +7657,22 @@ detach_bail:
 				ret = iret;
 				goto sweep;
 			}
+			/*
+			 * ☞ The interleave's edge set is built dynamically and
+			 * names an arbitrary number of cells, so the generic
+			 * take is the only form that fits: lock what the edges
+			 * name.  No re-derive here -- the builder consumed the
+			 * plan it was given, so there is nothing to derive
+			 * again; a peer that moved a cell in between is caught
+			 * by the edges' own expected-old at the commit.
+			 */
+			if (ft_cell_lockset_take_edges(ft, NULL, txn, iedges,
+					in)) {
+				free(iedges);
+				ft_flip_txn_destroy(txn);
+				ret = -EAGAIN;
+				goto sweep;
+			}
 			ft_ord_cell_record_into_ft(ft, txn, iedges, in);
 			free(iedges);
 			goto cells_done;

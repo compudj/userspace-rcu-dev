@@ -11674,6 +11674,9 @@ struct ft_remove_pub {
 
 static enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft, struct ft_flip_txn *t,
 		struct ft_ord_cell_edge *edges, unsigned int n);
+static int ft_cell_lockset_take_edges(struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx, struct ft_flip_txn *txn,
+		const struct ft_ord_cell_edge *edges, unsigned int n_edges);
 static void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 		const struct ft_ord_cell_edge *edges, unsigned int n);
 
@@ -12046,6 +12049,24 @@ void ft_root_list_swap_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	n++;
 	n = ft_ord_sentinel_edges(ft, head_old, head_new, tail_old, tail_new,
 			relink_dest, relink_incoming, edges, n);
+	/*
+	 * ☞ THE SENTINEL EDGES NAME CELLS TOO -- the list's new head and tail,
+	 * and the begin/end words themselves.  The generic take locks whatever
+	 * they name; no re-derive, because ft_ord_sentinel_edges is built from
+	 * the head/tail the CALLER resolved and passed in, so there is no
+	 * second derivation to disagree with.
+	 */
+	/*
+	 * ☠ THIS PUBLISH CANNOT FAIL -- it is the un-abortable post-drain root
+	 * swap, committed infallibly into a pre-reserved txn -- so the take's
+	 * status is deliberately ignored rather than turned into a bail it has
+	 * no way to express.  That is sound only because the op holds the
+	 * FT-wide bulk gate here, so no peer can be inside these cells and the
+	 * CAS cannot lose.  If that assumption is ever wrong the records go MW
+	 * and the stage-4 guard aborts, which is the loud version of finding
+	 * out -- not a silent partial conversion.
+	 */
+	(void) ft_cell_lockset_take_edges(ft, NULL, txn, edges, n);
 	/*
 	 * @txn is the caller-PRE-RESERVED bounded txn (every Class-G root swap
 	 * reserves in its fallible prefix), committed infallibly here -- the
@@ -12680,6 +12701,94 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 }
 
 /*
+ * THE GENERIC FORM: LOCK WHAT THE EDGES NAME, THEN PROVE THEY STILL SAY IT.
+ *
+ * ft_cell_plan carries a SHAPE -- single cell, insert pair, run splice,
+ * detach-and-resplice -- and every new producer wanted another one.  Three
+ * shapes in, two had already been got subtly wrong (a destination pair
+ * validated as if it were a source; a cell lock read off a holder's anchor),
+ * and ft_ord_cell_run_replace wants a fourth: it writes SIX cells including the
+ * SOURCE run's own neighbours, which do not satisfy the adjacency invariant a
+ * destination pair does.
+ *
+ * So stop describing the shape.  The EDGE ARRAY already names every word the op
+ * will write and the cell that owns each, so lock exactly those; the caller
+ * then RE-DERIVES the array under the locks and compares.  If the two
+ * derivations agree the written set IS the locked set -- the whole of (e) --
+ * and no shape had to be stated.  If they disagree, a peer moved something
+ * between them: a retry, not a defect.
+ *
+ * Same ownership rule as ft_cell_lockset_take: taken by CAS outside the engine,
+ * registered with a terminal so the txn owns the release, never released by
+ * hand, and on failure the caller must reach a terminal.
+ */
+static inline
+int ft_cell_lockset_take_edges(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+		struct ft_flip_txn *txn, const struct ft_ord_cell_edge *edges,
+		unsigned int n_edges)
+{
+	struct ft_dlm_member set[FT_LOCK_ORDER_MAX] = { 0 };
+	unsigned int n = 0, i, j;
+	int ret;
+
+	if (!ft->ordered_list || !txn)
+		return 0;
+	for (i = 0; i < n_edges; i++) {
+		struct cds_ft_metadata *lock;
+
+		if (ft_edge_tag(&edges[i]) != URCU_TXN_TAG)
+			continue;	/* not a cell word */
+		lock = ft_cell_word_lock(ft, &edges[i]);
+		if (!lock)
+			continue;	/* no owner: stays MW, the guard says so */
+		for (j = 0; j < n; j++)
+			if (set[j].anchor == lock)
+				break;
+		if (j < n)
+			continue;	/* two edges, one owning cell */
+		if (n == CAA_ARRAY_SIZE(set))
+			return -EAGAIN;	/* more cells than the order can hold */
+		set[n].anchor = lock;
+		set[n].lock_only = true;
+		n++;
+	}
+	if (!n)
+		return 0;
+	ret = ft_dlm_acquire_set(ft, ctx, set, n);
+	if (ret)
+		return ret;		/* all-or-none: @txn untouched */
+	for (i = 0; i < n; i++) {
+		if (set[i].held.shared)
+			continue;
+		ft_flip_txn_lock_register_held(txn, &set[i].held);
+		ft_flip_txn_record_release_lock(txn, set[i].held.lock,
+			set[i].held.lock_snap);
+	}
+	return 0;
+}
+
+/*
+ * Do two derivations of one edge set agree?  Field by field rather than
+ * memcmp: ft_ord_cell_edge carries padding and debug members (@ctx,
+ * @owner_held) that can differ without meaning anything.
+ */
+static inline
+bool ft_cell_edges_same(const struct ft_ord_cell_edge *a,
+		const struct ft_ord_cell_edge *b, unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		if (a[i].slot != b[i].slot ||
+		    a[i].owner_cell != b[i].owner_cell ||
+		    a[i].old_target != b[i].old_target ||
+		    a[i].new_target != b[i].new_target ||
+		    a[i].tag != b[i].tag)
+			return false;
+	return true;
+}
+
+/*
  * TAKE THE PLAN'S CELL LOCKS AND HAND THEM TO @txn.  The ONLY place a cell
  * lock is taken.
  *
@@ -12726,6 +12835,16 @@ int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 
 	if (!ft->ordered_list)
 		return 0;		/* no list, no cell words */
+#ifdef FT_RED_DROP_CELL_TAKE
+	/*
+	 * ☠ THE RED CONTROL, and it is not a shipping configuration.  Take
+	 * nothing and claim success: every cell record then goes unheld and the
+	 * stage-4 guard MUST abort.  A guard that stays silent here is not
+	 * guarding -- which is the only way to tell "no unheld records exist"
+	 * from "the check never looks".
+	 */
+	return 0;
+#endif
 	if (p->cell && !p->cell_lock_held &&
 			ft_cell_lock_member(ft, p->cell, NULL, &set[n]))
 		n++;
@@ -14301,6 +14420,14 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 	 * ordered list off -- it can never reduce to a lone store.
 	 */
 	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
+	/*
+	 * The dual names cells in BOTH tries; the generic take locks whatever
+	 * the edges name, so it needs no cross-trie shape of its own.
+	 */
+	if (ft_cell_lockset_take_edges(a->ft, NULL, txn, edges, n)) {
+		ft_flip_txn_destroy(txn);
+		return;
+	}
 	(void) ft_ord_cell_flip_into(a->ft, txn, edges, n);
 }
 
@@ -16812,8 +16939,30 @@ enum urcu_txn_status ft_ord_cell_flip_rec_replace(struct cds_ft *ft,
 		edges[n].ctx = rec->ctx;
 		n++;
 	}
-	n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
-		run->s_first, run->s_last, edges, n);
+	{
+		struct ft_ord_cell_edge again[FT_GLUE_PUBLISH_REPLACE_MAX_EDGES]
+			= { 0 };
+		unsigned int base = n, n2;
+
+		n = ft_ord_cell_run_replace_edges(ft, run->d_first,
+			run->d_last, run->s_first, run->s_last, edges, n);
+		if (ft_cell_lockset_take_edges(ft, rec->ctx, txn, edges, n)) {
+			ft_flip_txn_destroy(txn);
+			return URCU_TXN_STATUS_ABORT;
+		}
+		/*
+		 * Re-derive the CELL edges under the locks and compare: the
+		 * written set is the locked set.  Only the run's own edges are
+		 * re-derived -- the @rec prefix is the caller's, copied above.
+		 */
+		n2 = ft_ord_cell_run_replace_edges(ft, run->d_first,
+			run->d_last, run->s_first, run->s_last, again, 0);
+		if (n2 != n - base ||
+		    !ft_cell_edges_same(&edges[base], again, n2)) {
+			ft_flip_txn_destroy(txn);
+			return URCU_TXN_STATUS_ABORT;
+		}
+	}
 	/*
 	 * ★ ABORT IS REACHABLE HERE TOO -- see ft_glue_publish.  The "exclusion"
 	 * the old comment relied on does not exist on a SHARED destination, which
@@ -21944,9 +22093,28 @@ enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
 	unsigned int n = 0;
 	enum urcu_txn_status cst;
 
-	if (run)
-		n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
-			run->s_first, run->s_last, cedges, 0);
+	if (run) {
+		struct ft_ord_cell_edge again[FT_ORD_CELL_RUN_REPLACE_MAX_EDGES]
+			= { 0 };
+		unsigned int n2;
+
+		n = ft_ord_cell_run_replace_edges(ft, run->d_first,
+			run->d_last, run->s_first, run->s_last, cedges, 0);
+		if (g->txn && ft_cell_lockset_take_edges(ft, NULL, g->txn,
+				cedges, n))
+			return URCU_TXN_STATUS_ABORT;
+		/*
+		 * Re-derive under the locks: if the two derivations agree, the
+		 * written set IS the locked set.  A replace names six cells --
+		 * the destination pair, the source run's ends and the SOURCE
+		 * run's own neighbours -- and no shape had to be stated for any
+		 * of them.
+		 */
+		n2 = ft_ord_cell_run_replace_edges(ft, run->d_first,
+			run->d_last, run->s_first, run->s_last, again, 0);
+		if (n2 != n || !ft_cell_edges_same(cedges, again, n))
+			return URCU_TXN_STATUS_ABORT;
+	}
 	/*
 	 * Return the commit status: under the FT-wide lock the replace is
 	 * failure-free (caller ignores it), but with the lock dropped
