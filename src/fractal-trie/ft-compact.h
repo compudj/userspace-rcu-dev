@@ -612,10 +612,31 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 		 * @head->prev at a cell that is not in the list.
 		 */
 		/* Two cell words, recorded without asking who owns them. */
-		FT_COW_ENGINE_LANE();
-		FT_COW_ENGINE_LANE();
-		sret = urcu_txn_list_replace_prepare(t->mtxn,
-			ft_ord_cell_lnode(old), ft_ord_cell_lnode(new_cell));
+		/*
+		 * ☞ STAGE 2: the FT's recorder, so the two neighbour edges get
+		 * an owner (see ft_ord_cell_swap).  @old's own cell lock is
+		 * already registered just above -- this take adds its pred and
+		 * succ, whose words the same edges write.
+		 */
+		{
+			struct ft_cell_plan plan = {
+				.cell = old,
+				.cell_lock_held = !h.shared,
+				.pred = ft_ord_cell_resolve_ord(
+					&old->lnode.prev),
+				.succ = ft_ord_cell_resolve_ord(
+					&old->lnode.next),
+			};
+			struct ft_ord_cell_edge edges[4] = { 0 };
+			unsigned int n;
+
+			sret = ft_cell_lockset_take(ft, ctx, t, &plan);
+			if (!sret) {
+				n = ft_ord_cell_swap_edges(ft, old, new_cell,
+					edges, 0);
+				ft_ord_cell_record_into_ft(ft, t, edges, n);
+			}
+		}
 		if (sret) {
 			ft_flip_txn_destroy(t);	/* releases the registered lock */
 			if (ft_debug_counters())

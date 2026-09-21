@@ -456,7 +456,7 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 * commit ABORT ages it.
 		 */
 		if (pred2 == pred &&
-		    ft_txn_list_insert_between_prepare(ft_flip_txn_handle(ic->txn),
+		    ft_txn_list_insert_between_prepare(ft, ic->txn,
 				ft_ord_cell_lnode(cell), pred_lnode,
 				ft_ord_cell_lnode(succ0)) >= 0)
 			goto spliced;

@@ -10862,55 +10862,6 @@ __attribute__((weak)) unsigned long ft_cow_engine_lane;
 # define FT_COW_ENGINE_LANE()	do { } while (0)
 #endif
 
-/*
- * FT-local order-pinned insert-between (was the engine's
- * urcu_txn_list_insert_between_prepare, dropped when the transaction engine was
- * adopted wholesale -- it only calls class-A primitives, so it lives here now).
- * insert_after_prepare derives the successor FRESH from @pos->next, so a peer
- * insert-after(@pos) that committed since the caller decided "@newp belongs
- * between @pos and @succ_expected" (by key order) would silently land @newp
- * BEFORE the peer's node.  This variant refuses (-EAGAIN) unless @pos->next
- * still equals @succ_expected, and records @succ_expected as the &pos->next
- * expected old -- so a later interposition fails the commit's value CAS instead
- * of being adopted.  -ENOENT when @pos itself was deleted.  Mirrors the new
- * insert_after_prepare edge recording, including its succ == pos self-loop guard
- * skip; compose on a DEFAULT (read-your-own-writes) handle.
- */
-static inline
-int ft_txn_list_insert_between_prepare(struct urcu_txn *txn,
-		struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_node *pos,
-		struct urcu_txn_list_node *succ_expected)
-{
-	void *pn = urcu_txn_load(txn, (void **) &pos->next, URCU_TXN_TAG);
-
-	if (urcu_txn_list_is_marked(pn))
-		return -ENOENT;				/* @pos was deleted */
-	if ((struct urcu_txn_list_node *) pn != succ_expected)
-		return -EAGAIN;				/* order intent stale: re-derive */
-	/*
-	 * Guard succ_expected->next (the slot del(succ) marks) so the &succ->prev
-	 * store serializes against del(succ) exactly as &pos->next does; skip it
-	 * when succ == pos (self-looping sentinel), whose next IS &pos->next, the
-	 * forward store's own slot.
-	 */
-	if (succ_expected != pos && urcu_txn_list_is_marked(urcu_txn_load_validate(
-			txn, (void **) &succ_expected->next, URCU_TXN_TAG)))
-		return -EAGAIN;				/* succ (a neighbour) deleted: retry */
-
-	/* Build the fresh node invisibly, then record the two forward edges. */
-	newp->next = succ_expected;
-	newp->prev = pos;
-	FT_TK_COUNT_CELL_MW();		/* a cell edge: see ft_hlist_store_mw */
-	FT_COW_ENGINE_LANE();
-	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
-	urcu_txn_store_mw(txn, (void **) &pos->next, succ_expected, newp, URCU_TXN_TAG);
-	FT_TK_COUNT_CELL_MW();
-	FT_COW_ENGINE_LANE();
-	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
-	urcu_txn_store_mw(txn, (void **) &succ_expected->prev, pos, newp, URCU_TXN_TAG);
-	return 0;
-}
 
 /*
  * Resolve @src (a live child slot of the node under recompaction) to the
@@ -11632,6 +11583,89 @@ struct ft_remove_pub {
 
 static enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft, struct ft_flip_txn *t,
 		struct ft_ord_cell_edge *edges, unsigned int n);
+static void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
+		const struct ft_ord_cell_edge *edges, unsigned int n);
+
+/*
+ * FT-local order-pinned insert-between (was the engine's
+ * urcu_txn_list_insert_between_prepare, dropped when the transaction engine was
+ * adopted wholesale -- it only calls class-A primitives, so it lives here now).
+ * insert_after_prepare derives the successor FRESH from @pos->next, so a peer
+ * insert-after(@pos) that committed since the caller decided "@newp belongs
+ * between @pos and @succ_expected" (by key order) would silently land @newp
+ * BEFORE the peer's node.  This variant refuses (-EAGAIN) unless @pos->next
+ * still equals @succ_expected, and records @succ_expected as the &pos->next
+ * expected old -- so a later interposition fails the commit's value CAS instead
+ * of being adopted.  -ENOENT when @pos itself was deleted.  Mirrors the new
+ * insert_after_prepare edge recording, including its succ == pos self-loop guard
+ * skip; compose on a DEFAULT (read-your-own-writes) handle.
+ */
+static inline
+int ft_txn_list_insert_between_prepare(struct cds_ft *ft,
+		struct ft_flip_txn *t,
+		struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *pos,
+		struct urcu_txn_list_node *succ_expected)
+{
+	struct urcu_txn *txn = ft_flip_txn_handle(t);
+	void *pn = urcu_txn_load(txn, (void **) &pos->next, URCU_TXN_TAG);
+
+	if (urcu_txn_list_is_marked(pn))
+		return -ENOENT;				/* @pos was deleted */
+	if ((struct urcu_txn_list_node *) pn != succ_expected)
+		return -EAGAIN;				/* order intent stale: re-derive */
+	/*
+	 * Guard succ_expected->next (the slot del(succ) marks) so the &succ->prev
+	 * store serializes against del(succ) exactly as &pos->next does; skip it
+	 * when succ == pos (self-looping sentinel), whose next IS &pos->next, the
+	 * forward store's own slot.
+	 */
+	if (succ_expected != pos && urcu_txn_list_is_marked(urcu_txn_load_validate(
+			txn, (void **) &succ_expected->next, URCU_TXN_TAG)))
+		return -EAGAIN;				/* succ (a neighbour) deleted: retry */
+
+	/* Build the fresh node invisibly, then record the two forward edges. */
+	newp->next = succ_expected;
+	newp->prev = pos;
+	/*
+	 * ☞ STAGE 2: RECORD THROUGH THE OWNER-AWARE RECORDER.
+	 *
+	 * These two words -- &pos->next (owner pos) and &succ_expected->prev
+	 * (owner succ) -- are ordinary cell edges, but they were stored with a
+	 * bare urcu_txn_store_mw that never asked who owns them.  That made
+	 * them invisible to the FT_CELL_OWNER census (its buckets are counted
+	 * INSIDE the predicate this lane skipped) and unreachable by the
+	 * conversion: ~20,000 records per run with no owner.
+	 *
+	 * Routing them through ft_ord_cell_flip_into puts them on the same
+	 * footing as every other cell edge -- the owner is derived, the census
+	 * sees them, and at the flip they park with the rest.
+	 *
+	 * ☠ THE KIND IS UNCHANGED HERE.  ft_ord_cell_flip_into still records
+	 * MW while the park is off, so the expected-old on &pos->next is still
+	 * the value CAS, which is this function's INTERPOSITION DETECTOR (see
+	 * its header): a peer that landed a node between @pos and
+	 * @succ_expected loses the commit instead of being adopted.  Dropping
+	 * that CAS is only sound once the lock makes interposition impossible,
+	 * which is stage 4's business, not this stage's.
+	 */
+	{
+		struct ft_ord_cell_edge edges[2] = { 0 };
+
+		edges[0].tag = URCU_TXN_TAG;
+		edges[0].slot = (struct ft_ord_cell **) &pos->next;
+		edges[0].owner_cell = ft_ord_cell_of(pos);
+		edges[0].old_target = ft_ord_cell_of(succ_expected);
+		edges[0].new_target = ft_ord_cell_of(newp);
+		edges[1].tag = URCU_TXN_TAG;
+		edges[1].slot = (struct ft_ord_cell **) &succ_expected->prev;
+		edges[1].owner_cell = ft_ord_cell_of(succ_expected);
+		edges[1].old_target = ft_ord_cell_of(pos);
+		edges[1].new_target = ft_ord_cell_of(newp);
+		ft_ord_cell_record_into_ft(ft, t, edges, 2);
+	}
+	return 0;
+}
 
 /*
  * Commit a single edge as a lone publish.  A lone edge is ONE release store: it
@@ -12466,6 +12500,21 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
 struct ft_cell_plan {
 	struct ft_ord_cell *cell;
 	struct ft_ord_cell *pred, *succ;
+	/*
+	 * ☠ @cell ANSWERS TWO DIFFERENT QUESTIONS, and a caller can need
+	 * them split.  It says which cell the VALIDATION is anchored on
+	 * (@cell's own links name pred and succ) and, normally, which cell's
+	 * lock to take.  A producer that already holds @cell's lock from an
+	 * earlier take -- compaction takes it before it has a plan -- must
+	 * still validate AROUND @cell but must not take it twice, which the
+	 * lock CAS refuses.
+	 *
+	 * Leaving @cell NULL is NOT the way to say that: NULL selects the
+	 * INSERT-shaped validation (pred->next == succ), and a relocate has
+	 * pred->next == cell, so it fails every time -- measured as compaction
+	 * never terminating ("status 3 after 1000 resumes").
+	 */
+	bool cell_lock_held;
 };
 
 /*
@@ -12553,7 +12602,8 @@ int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 
 	if (!ft->ordered_list)
 		return 0;		/* no list, no cell words */
-	if (p->cell && ft_cell_lock_member(ft, p->cell, NULL, &set[n]))
+	if (p->cell && !p->cell_lock_held &&
+			ft_cell_lock_member(ft, p->cell, NULL, &set[n]))
 		n++;
 	if (p->pred && ft_cell_lock_member(ft, p->pred,
 			&p->pred->lnode.next, &set[n]))
@@ -14984,7 +15034,12 @@ enum urcu_txn_status ft_ord_cell_unsplice(struct cds_ft *ft,
  * a swallowed commit into a caller-visible "success" and free a still-linked
  * cell (UAF).
  */
-#define FT_ORD_CELL_SWAP_REC_MAX_EDGES	4
+#define FT_ORD_CELL_SWAP_REC_MAX_EDGES	(4 + FT_CELL_LOCKSET_MAX_RECORDS)
+/* Defined below; ft_ord_cell_swap uses it to build the same edges the engine's
+ * replace_prepare used to store without an owner. */
+static unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
+		struct ft_ord_cell *old_cell, struct ft_ord_cell *new_cell,
+		struct ft_ord_cell_edge *edges, unsigned int n);
 static
 int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		struct ft_ord_cell *new_cell)
@@ -15017,16 +15072,31 @@ int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	 */
 	{
 		/* Two cell words, recorded without asking who owns them. */
-		FT_COW_ENGINE_LANE();
-		FT_COW_ENGINE_LANE();
-		int pret = urcu_txn_list_replace_prepare(t->mtxn,
-			ft_ord_cell_lnode(old_cell), ft_ord_cell_lnode(new_cell));
+		/*
+		 * ☞ STAGE 2: THE FT'S OWN RECORDER, NOT THE ENGINE'S.
+		 * urcu_txn_list_replace_prepare stores the two neighbour edges
+		 * with urcu_txn_store_mw and no owner, so they were invisible
+		 * to the cell census and unreachable by the conversion.
+		 * ft_ord_cell_swap_edges builds the SAME edges -- the comment
+		 * above says so -- and ft_ord_cell_flip_into derives an owner
+		 * for each.
+		 */
+		struct ft_ord_cell_edge edges[FT_ORD_CELL_SWAP_REC_MAX_EDGES] =
+			{ 0 };
+		struct ft_cell_plan plan = {
+			.cell = old_cell,
+			.pred = ft_ord_cell_resolve_ord(&old_cell->lnode.prev),
+			.succ = ft_ord_cell_resolve_ord(&old_cell->lnode.next),
+		};
 		enum urcu_txn_status st;
+		unsigned int n;
 
-		if (pret) {
+		if (ft_cell_lockset_take(ft, NULL, t, &plan)) {
 			ft_flip_txn_destroy(t);
 			return -EAGAIN;
 		}
+		n = ft_ord_cell_swap_edges(ft, old_cell, new_cell, edges, 0);
+		ft_ord_cell_record_into_ft(ft, t, edges, n);
 		st = ft_flip_txn_commit(ft, t);
 		if (st == URCU_TXN_STATUS_OK)
 			return 0;
