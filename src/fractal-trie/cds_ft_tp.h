@@ -1466,6 +1466,63 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, remove_anchor_starved,
 	)
 )
 
+/*
+ * -DFT_DEBUG_LOCK_LEAK: one transition of a node/cell LOCK WORD (see enum
+ * ft_ll_kind in ft-mutation-helpers.h for @kind and what @a / @b carry).
+ * Emitted live at each transition (@replay 0) and again from the per-lock
+ * history ring when the leak detector fires (@replay 1), because the take that
+ * leaked is long out of a flight-recorder window by the time the refusals
+ * that reveal it have piled up.  @ts_ns is CLOCK_MONOTONIC at the transition,
+ * the clock LTTng itself stamps with, so replayed and live events interleave.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, lock_ev,
+	LTTNG_UST_TP_ARGS(
+		int, replay,
+		int, kind,
+		const void *, lock,
+		unsigned long, a,
+		unsigned long, b,
+		const void *, txn,
+		const void *, pc,
+		unsigned int, tid,
+		uint64_t, ts_ns
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(int, replay, replay)
+		lttng_ust_field_integer(int, kind, kind)
+		lttng_ust_field_integer_hex(uintptr_t, lock, (uintptr_t) lock)
+		lttng_ust_field_integer_hex(unsigned long, a, a)
+		lttng_ust_field_integer_hex(unsigned long, b, b)
+		lttng_ust_field_integer_hex(uintptr_t, txn, (uintptr_t) txn)
+		lttng_ust_field_integer_hex(uintptr_t, pc, (uintptr_t) pc)
+		lttng_ust_field_integer(unsigned int, tid, tid)
+		lttng_ust_field_integer(uint64_t, ts_ns, ts_ns)
+	)
+)
+
+/*
+ * -DFT_DEBUG_LOCK_LEAK: a writer has been refused the SAME lock word in the
+ * SAME state for @refusals takes over @stuck_us -- the word is held by nobody
+ * who will release it.  Emitted after the word's history replay, right before
+ * the snapshot and abort.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, lock_leak_violation,
+	LTTNG_UST_TP_ARGS(
+		const void *, lock,
+		unsigned long, state,
+		unsigned long, refusals,
+		unsigned long, stuck_us,
+		const void *, pc
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, lock, (uintptr_t) lock)
+		lttng_ust_field_integer_hex(unsigned long, state, state)
+		lttng_ust_field_integer(unsigned long, refusals, refusals)
+		lttng_ust_field_integer(unsigned long, stuck_us, stuck_us)
+		lttng_ust_field_integer_hex(uintptr_t, pc, (uintptr_t) pc)
+	)
+)
+
 #endif /* _FT_TP_H */
 
 #include <lttng/tracepoint-event.h>

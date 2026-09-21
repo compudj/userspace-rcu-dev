@@ -1430,6 +1430,236 @@ extern unsigned long ft_acq_heap_taken;
 # define FT_ACQ_EMBED_LOCKS	FT_FLIP_TXN_MAX_LOCKS
 #endif
 
+/*
+ * ☞ -DFT_DEBUG_LOCK_LEAK: WHO LEFT THIS LOCK WORD SET?  (diagnosis only)
+ *
+ * The symptom it exists for: a writer refused the same LOCKed word in the same
+ * state forever, while every thread that could hold it keeps releasing all it
+ * took between attempts -- a lock held by nobody.  The leak happened long before
+ * the refusals pile up, so a flight-recorder window taken at detection has
+ * already lost the take that leaked.  Hence a PER-LOCK HISTORY: every
+ * transition of a lock word -- the two take CASes, the two direct clears, a
+ * registration into a txn, a txn record on the word, and that txn's
+ * commit / destroy -- is appended to a small ring hashed by the word's
+ * address, and emitted live as cds_ft:lock_ev.  When the detector fires, the
+ * leaked word's ring is replayed into the trace, then the violation, then the
+ * snapshot, then abort().
+ *
+ * Racy by design (plain stores into a slot claimed by one atomic add; a
+ * collision mixes two words in one ring, and every event names its word).
+ */
+#ifdef FT_DEBUG_LOCK_LEAK
+/*
+ * With -DFT_ENABLE_TRACING the transitions also go out as tracepoints and the
+ * report snapshots the flight recorder.  Without it only the history ring and
+ * the stderr report remain -- cheaper, for a race the tracer's own overhead
+ * hides (ft_inv 136 passed traced and wedged untraced).
+ */
+# include <sys/syscall.h>
+# include <time.h>
+# include <dlfcn.h>
+
+enum ft_ll_kind {
+	FT_LL_TAKE	= 1,	/* CAS clean -> LOCK won; a = state before */
+	FT_LL_CLEAR	= 2,	/* ft_meta_lock_release; a = state before */
+	FT_LL_CLEAR_IF	= 3,	/* release_if_held cleared; a = state before */
+	FT_LL_SKIP_IF	= 4,	/* release_if_held found no LOCK; a = state */
+	FT_LL_REG	= 5,	/* registered into @txn; a = snap */
+	FT_LL_REC_SW	= 6,	/* record on the word into @txn, SW; a = old, b = new */
+	FT_LL_REC_MW	= 7,	/* record on the word into @txn, MW; a = old, b = new */
+	FT_LL_COMMIT	= 8,	/* @txn committed; a = status, b = state now */
+	FT_LL_DESTROY	= 9,	/* @txn destroyed uncommitted; b = state now */
+	FT_LL_REFUSED	= 10,	/* first refusal of a streak; a = state */
+};
+
+struct ft_ll_ev {
+	const struct cds_ft_metadata *lock;
+	const void *txn;
+	const void *pc;
+	uintptr_t a, b;
+	uint64_t ts_ns;
+	uint32_t tid;
+	uint8_t kind;
+};
+
+# define FT_LL_NSLOT	4096
+# define FT_LL_HIST	32
+struct ft_ll_slot {
+	unsigned long head;
+	const struct cds_ft_metadata *last_lock;	/* last word TAKEN here */
+	struct ft_ll_ev ev[FT_LL_HIST];
+};
+static struct ft_ll_slot ft_ll_map[FT_LL_NSLOT];
+static __thread uint32_t ft_ll_tid;
+
+/* A refused take's streak: same word, same state, since @t0. */
+static __thread const struct cds_ft_metadata *ft_ll_ref_lock;
+static __thread uintptr_t ft_ll_ref_state;
+static __thread unsigned long ft_ll_ref_n;
+static __thread uint64_t ft_ll_ref_t0;
+static int ft_ll_fired;
+# ifndef FT_LL_REFUSALS_MIN
+#  define FT_LL_REFUSALS_MIN	1000
+# endif
+# ifndef FT_LL_STUCK_NS
+#  define FT_LL_STUCK_NS	(200ULL * 1000 * 1000)	/* 200 ms */
+# endif
+
+/* Lock words this txn recorded a transition on, for its commit / destroy. */
+# define FT_LL_TXN_REC	16
+
+static inline uint64_t ft_ll_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+static inline struct ft_ll_slot *ft_ll_slot_of(const struct cds_ft_metadata *lock)
+{
+	return &ft_ll_map[((uintptr_t) lock >> 6) & (FT_LL_NSLOT - 1)];
+}
+
+static inline
+void ft_ll_log(int kind, const struct cds_ft_metadata *lock, const void *txn,
+		uintptr_t a, uintptr_t b, const void *pc)
+{
+	struct ft_ll_slot *sl = ft_ll_slot_of(lock);
+	unsigned long i = uatomic_add_return(&sl->head, 1) - 1;
+	struct ft_ll_ev *e = &sl->ev[i % FT_LL_HIST];
+
+	if (caa_unlikely(!ft_ll_tid))
+		ft_ll_tid = (uint32_t) syscall(SYS_gettid);
+	if (kind == FT_LL_TAKE)
+		sl->last_lock = lock;
+	e->lock = lock;
+	e->txn = txn;
+	e->pc = pc;
+	e->a = a;
+	e->b = b;
+	e->ts_ns = ft_ll_now_ns();
+	e->tid = ft_ll_tid;
+	e->kind = (uint8_t) kind;
+	FT_TP(lock_ev, 0, kind, (const void *) lock, (unsigned long) a,
+		(unsigned long) b, txn, pc, ft_ll_tid, e->ts_ns);
+}
+
+/* Has @lock ever been TAKEN?  Gates the record hook to lock words only. */
+static inline bool ft_ll_known(const struct cds_ft_metadata *lock)
+{
+	return ft_ll_slot_of(lock)->last_lock == lock;
+}
+
+/*
+ * A take refused on LOCK.  Fires once per process: the same word in the same
+ * state for FT_LL_REFUSALS_MIN refusals AND FT_LL_STUCK_NS.  A live holder
+ * changes nothing in the word while it holds, so this can misfire on a holder
+ * preempted that long -- the replay says which (a live holder's take is the
+ * last event, with no clear and no destroy after it).
+ */
+static __attribute__((noinline))
+void ft_ll_refused(const struct cds_ft_metadata *lock, uintptr_t s,
+		const void *pc)
+{
+	uint64_t now;
+	struct ft_ll_slot *sl;
+	unsigned long h, i;
+
+	if (lock != ft_ll_ref_lock || s != ft_ll_ref_state) {
+		ft_ll_ref_lock = lock;
+		ft_ll_ref_state = s;
+		ft_ll_ref_n = 1;
+		ft_ll_ref_t0 = ft_ll_now_ns();
+		ft_ll_log(FT_LL_REFUSED, lock, NULL, s, 0, pc);
+		return;
+	}
+	if (++ft_ll_ref_n < FT_LL_REFUSALS_MIN)
+		return;
+	now = ft_ll_now_ns();
+	if (now - ft_ll_ref_t0 < FT_LL_STUCK_NS)
+		return;
+	if (CMM_LOAD_SHARED(lock->state) != s)
+		return;			/* moved after all: not stuck */
+	sl = ft_ll_slot_of(lock);
+	h = uatomic_read(&sl->head);
+	/*
+	 * ☠ AN UNCHANGED STATE IS NOT AN UNTOUCHED WORD.  A hot lock is taken and
+	 * released from the same clean value every time, so a starved writer
+	 * reads the same LOCK|s across a thousand refusals while the word turns
+	 * over under it (the first run of this detector fired on exactly that).
+	 * Stuck means the word's own history is FROZEN: no transition by anyone
+	 * since this streak began.
+	 */
+	for (i = h > FT_LL_HIST ? h - FT_LL_HIST : 0; i < h; i++) {
+		const struct ft_ll_ev *e = &sl->ev[i % FT_LL_HIST];
+
+		if (e->lock == lock && e->kind != FT_LL_REFUSED &&
+				e->ts_ns >= ft_ll_ref_t0) {
+			ft_ll_ref_n = 1;	/* it moved: restart the streak */
+			ft_ll_ref_t0 = now;
+			return;
+		}
+	}
+	if (uatomic_xchg(&ft_ll_fired, 1))
+		return;			/* one reporter per process */
+	for (i = h > FT_LL_HIST ? h - FT_LL_HIST : 0; i < h; i++) {
+		const struct ft_ll_ev *e = &sl->ev[i % FT_LL_HIST];
+
+		if (e->lock != lock)
+			continue;
+		FT_TP(lock_ev, 1, e->kind, (const void *) e->lock,
+			(unsigned long) e->a, (unsigned long) e->b, e->txn,
+			e->pc, e->tid, e->ts_ns);
+		/*
+		 * And on stderr: a snapshot has been seen to miss the reporting
+		 * thread's last sub-buffer, and this history is the whole point.
+		 */
+		fprintf(stderr, "FT LOCK LEAK HIST kind %d ts %llu tid %u a %#lx "
+			"b %#lx txn %p pc %p\n", (int) e->kind,
+			(unsigned long long) e->ts_ns, e->tid,
+			(unsigned long) e->a, (unsigned long) e->b,
+			e->txn, e->pc);
+	}
+	FT_TP(lock_leak_violation, (const void *) lock, (unsigned long) s,
+		ft_ll_ref_n, (unsigned long) ((now - ft_ll_ref_t0) / 1000), pc);
+	fprintf(stderr, "FT LOCK LEAK: lock %p state %#lx refused %lu times "
+		"over %lu us -- snapshotting\n", (void *) lock,
+		(unsigned long) s, ft_ll_ref_n,
+		(unsigned long) ((now - ft_ll_ref_t0) / 1000));
+	{
+		Dl_info di;
+
+		/* The pcs above are absolute: this is what resolves them. */
+		if (dladdr((void *) ft_ll_refused, &di))
+			fprintf(stderr, "FT LOCK LEAK BASE %s %p\n",
+				di.dli_fname, di.dli_fbase);
+	}
+	fflush(stderr);
+# ifdef FT_ENABLE_TRACING
+	(void) poll(NULL, 0, 20);	/* let the reporter's sub-buffer settle */
+	(void) system("lttng snapshot record 1>&2");
+# endif
+	abort();
+}
+
+# define FT_LL_LOG(k, lock, txn, a, b)					\
+	ft_ll_log((k), (lock), (txn), (uintptr_t) (a), (uintptr_t) (b),	\
+		__builtin_return_address(0))
+# define FT_LL_REFUSED(lock, s)						\
+	ft_ll_refused((lock), (s), __builtin_return_address(0))
+/*
+ * Out of line under the flag, so __builtin_return_address(0) is the CALL SITE;
+ * plain static (not "inline noinline", which GCC warns on), and unused-tolerant
+ * for a unit that includes these without calling them.
+ */
+# define FT_LL_INLINE	__attribute__((noinline, unused))
+#else
+# define FT_LL_LOG(k, lock, txn, a, b)	do { } while (0)
+# define FT_LL_REFUSED(lock, s)		do { } while (0)
+# define FT_LL_INLINE	inline
+#endif
+
 struct ft_flip_txn {
 	struct urcu_txn *mtxn;	/* the concurrent commit engine handle:
 					 * &own (standalone txn), or the op's
@@ -1528,6 +1758,11 @@ struct ft_flip_txn {
 	} *locks;			/* @locks_floor, or a heap growth */
 	unsigned int nr_locks;
 	unsigned int cap_locks;
+#ifdef FT_DEBUG_LOCK_LEAK
+	/* Lock words this txn recorded a transition on (see ft_ll_log). */
+	unsigned int ll_nrec;
+	const struct cds_ft_metadata *ll_rec[FT_LL_TXN_REC];
+#endif
 	/*
 	 * The inline floor @locks points at until a wide op outgrows it.  Last
 	 * of the big members: everything above stays in the first cache lines.
@@ -1827,6 +2062,61 @@ struct ft_flip_txn {
 	unsigned int sa_ntpend;
 #endif
 };
+
+#ifdef FT_DEBUG_LOCK_LEAK
+/*
+ * A txn record on a LOCK WORD's state slot.  @slot is only ever hashed and
+ * compared here, so the container_of on a slot that is not a state word yields
+ * an address that is looked up and never dereferenced.
+ */
+static inline
+void ft_ll_rec(struct ft_flip_txn *t, void **slot, void *old_ptr,
+		void *new_ptr, bool sw, const void *pc)
+{
+	const struct cds_ft_metadata *meta = caa_container_of(
+		(uintptr_t *) slot, struct cds_ft_metadata, state);
+	unsigned int i;
+
+	if (!ft_ll_known(meta))
+		return;
+	ft_ll_log(sw ? FT_LL_REC_SW : FT_LL_REC_MW, meta, t,
+		(uintptr_t) old_ptr, (uintptr_t) new_ptr, pc);
+	for (i = 0; i < t->ll_nrec; i++)
+		if (t->ll_rec[i] == meta)
+			return;
+	if (t->ll_nrec < FT_LL_TXN_REC)
+		t->ll_rec[t->ll_nrec++] = meta;
+}
+
+/* @t's terminal, for every lock word it registered or recorded on. */
+static inline
+void ft_ll_terminal(struct ft_flip_txn *t, int kind, int status)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < t->nr_locks; i++)
+		ft_ll_log(kind, t->locks[i].meta, t, (uintptr_t) status,
+			CMM_LOAD_SHARED(t->locks[i].meta->state),
+			__builtin_return_address(0));
+	for (i = 0; i < t->ll_nrec; i++) {
+		for (j = 0; j < t->nr_locks; j++)
+			if (t->locks[j].meta == t->ll_rec[i])
+				break;
+		if (j < t->nr_locks)
+			continue;
+		ft_ll_log(kind, t->ll_rec[i], t, (uintptr_t) status,
+			CMM_LOAD_SHARED(t->ll_rec[i]->state),
+			__builtin_return_address(0));
+	}
+}
+# define FT_LL_REC(t, slot, o, n, sw)					\
+	ft_ll_rec((t), (void **) (slot), (void *) (o), (void *) (n), (sw),	\
+		__builtin_return_address(0))
+# define FT_LL_TERMINAL(t, kind, st)	ft_ll_terminal((t), (kind), (st))
+#else
+# define FT_LL_REC(t, slot, o, n, sw)	do { } while (0)
+# define FT_LL_TERMINAL(t, kind, st)	do { } while (0)
+#endif
 
 /*
  * The engine handle behind @t -- pass to the urcu_txn_* / *_prepare primitives
@@ -2197,6 +2487,9 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->nr_locks = 0;
+#ifdef FT_DEBUG_LOCK_LEAK
+	t->ll_nrec = 0;
+#endif
 	t->locks = t->locks_floor;
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
@@ -2463,6 +2756,9 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->nr_locks = 0;
+#ifdef FT_DEBUG_LOCK_LEAK
+	t->ll_nrec = 0;
+#endif
 	t->locks = t->locks_floor;
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
@@ -2562,6 +2858,9 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	}
 	t->reserved = true;
 	t->nr_locks = 0;
+#ifdef FT_DEBUG_LOCK_LEAK
+	t->ll_nrec = 0;
+#endif
 	t->locks = t->locks_floor;
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
@@ -4778,7 +5077,7 @@ static void ft_ch_audit_report(void)
  * install ("F2 3/3") was DROPPED as unnecessary under that contract
  * (2026-07-06 decision, CORE_682870_FORENSICS.md).
  */
-static inline
+static FT_LL_INLINE
 int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 		uintptr_t *state_snapshot)
 {
@@ -4815,12 +5114,16 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 	}
 #endif
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
-			FT_STATE_LOCK)))
+			FT_STATE_LOCK))) {
+		if (s & FT_STATE_LOCK)
+			FT_LL_REFUSED(meta, s);
 		return -EAGAIN;
+	}
 	if (caa_unlikely(uatomic_cmpxchg(&meta->state, s,
 			s | FT_STATE_LOCK) != s))
 		return -EAGAIN;
 	*state_snapshot = s;
+	FT_LL_LOG(FT_LL_TAKE, meta, NULL, s, 0);
 	ft_hold_trace_note(meta, meta, false, "ft_meta_lock_acquire", 0);
 	return 0;
 }
@@ -4841,7 +5144,7 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
  * The CAS loop (not a blind AND) is what keeps a parked proxy POINTER from
  * being corrupted by a bit-clear.
  */
-static inline
+static FT_LL_INLINE
 void ft_meta_lock_release(struct cds_ft_metadata *meta)
 {
 	ft_hold_trace_drop(meta);
@@ -4872,8 +5175,10 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 			ft_hold_trace_bad_release(meta, s);
 		assert(s & FT_STATE_LOCK);
 		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
-				s & ~FT_STATE_LOCK) == s))
+				s & ~FT_STATE_LOCK) == s)) {
+			FT_LL_LOG(FT_LL_CLEAR, meta, NULL, s, 0);
 			return;
+		}
 	}
 }
 
@@ -4894,7 +5199,7 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
  * unconditional post-op sweep instead of registering them or tracking per-commit
  * which ones a success consumed.
  */
-static inline
+static FT_LL_INLINE
 void ft_meta_lock_release_if_held(struct cds_ft_metadata *meta)
 {
 	ft_hold_trace_drop(meta);
@@ -4905,11 +5210,15 @@ void ft_meta_lock_release_if_held(struct cds_ft_metadata *meta)
 			caa_cpu_relax();
 			continue;
 		}
-		if (!(s & FT_STATE_LOCK))
+		if (!(s & FT_STATE_LOCK)) {
+			FT_LL_LOG(FT_LL_SKIP_IF, meta, NULL, s, 0);
 			return;	/* our commit already consumed it (TOMBSTONE) */
+		}
 		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
-				s & ~FT_STATE_LOCK) == s))
+				s & ~FT_STATE_LOCK) == s)) {
+			FT_LL_LOG(FT_LL_CLEAR_IF, meta, NULL, s, 0);
 			return;
+		}
 	}
 }
 
@@ -5045,6 +5354,7 @@ void ft_flip_txn_lock_register_member(struct ft_flip_txn *t,
 	t->locks[t->nr_locks].src_shared = NULL;
 	t->locks[t->nr_locks].tombstone_terminal = false;
 	t->nr_locks++;
+	FT_LL_LOG(FT_LL_REG, meta, t, snap, 0);
 #ifdef FT_RED_OWNER_CLAIM_ON_LOCK
 	/*
 	 * RED CONTROL for the record-time owner check, never a shipped
@@ -6159,6 +6469,7 @@ static void ft_sa_pend_bailed(const struct ft_flip_txn *t);
 static inline
 void ft_flip_txn_destroy(struct ft_flip_txn *t)
 {
+	FT_LL_TERMINAL(t, FT_LL_DESTROY, 0);
 	FT_TK_COUNT_END(t, FT_TK_BAILED);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	ft_sa_pend_bailed(t);
@@ -7216,6 +7527,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	}
 #endif
 	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
+	FT_LL_TERMINAL(t, FT_LL_COMMIT, (int) st);
 	FT_TK_COUNT_END(t, st == URCU_TXN_STATUS_OK ? FT_TK_OK :
 			(st == URCU_TXN_STATUS_MEMORY_ERROR ? FT_TK_MEMERR :
 				FT_TK_ABORT));
@@ -7579,6 +7891,7 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 				uatomic_inc(&ft_tk_d13_none);
 		}
 #endif
+		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
 		/*
@@ -7622,6 +7935,7 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 				ft_flip_txn_owns(t, owner) ? FT_AB_OWN_HELD :
 				(ft_hold_trace_holds(owner) ? FT_AB_OWN_LEDGER :
 					FT_AB_OWN_MISS));
+		FT_LL_REC(t, slot, old_ptr, new_ptr, false);
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	}
 	assert(!ret);
@@ -7853,11 +8167,13 @@ void __ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 	if (!pinned && old_ptr != new_ptr && t->trie_wide_sw
 			&& !(t->ft && slot == (void **) &t->ft->root)) {
 		FT_MWA_DOOR1_CONV();
+		FT_LL_REC(t, slot, old_ptr, new_ptr, true);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
 		if (!pinned && old_ptr != new_ptr && t->trie_wide_sw)
 			FT_MWA_DOOR1_ROOT_SLOT();
 		FT_MWA_DOOR1_KEPT(t, old_ptr == new_ptr);
+		FT_LL_REC(t, slot, old_ptr, new_ptr, false);
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	}
 	assert(!ret);
@@ -9107,18 +9423,22 @@ void ft_flip_txn_record_state_kind(struct ft_flip_txn *t,
  * all-or-none").  Here every success is IMMEDIATELY visible, so the failure
  * path must ft_meta_lock_release() what it already took.
  */
-static inline
+static FT_LL_INLINE
 int ft_dlm_lock_now(struct cds_ft_metadata *meta, uintptr_t *snap)
 {
 	uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_SA_DEAD_REFUSE |
-			FT_STATE_LOCK)))
+			FT_STATE_LOCK))) {
+		if (s & FT_STATE_LOCK)
+			FT_LL_REFUSED(meta, s);
 		return -EAGAIN;
+	}
 	if (caa_unlikely(uatomic_cmpxchg(&meta->state, s,
 			s | FT_STATE_LOCK) != s))
 		return -EAGAIN;		/* a peer won it between load and CAS */
 	*snap = s;
+	FT_LL_LOG(FT_LL_TAKE, meta, NULL, s, 0);
 	return 0;
 }
 
