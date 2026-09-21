@@ -13221,6 +13221,16 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 		if (p->pred2 &&
 		    ft_ord_cell_resolve_ord(&p->pred2->lnode.next) != p->succ2)
 			return false;	/* destination pair no longer adjacent */
+		/*
+		 * ...and still ALIVE.  A deleted cell keeps its next pointer, so
+		 * adjacency alone passes for a @pred2 that was unlinked after the
+		 * plan was read: the run would be spliced after a dead cell and
+		 * its keys lost.  Same test the splice arm below and the run's
+		 * own tail above make (the 09-21 skeptic's missing pred2 check).
+		 */
+		if (p->pred2 && urcu_txn_list_is_marked(
+				rcu_dereference(p->pred2->lnode.next)))
+			return false;
 	} else {
 		/* insert / splice: the DESTINATION pair must still be adjacent */
 		if (!p->pred)
