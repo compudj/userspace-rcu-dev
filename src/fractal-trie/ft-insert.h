@@ -937,6 +937,18 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * by @structural_sw -- so this hands the arm a true answer rather than
 	 * forcing anything.
 	 */
+	/*
+	 * &ft->root is the slot P would own if the root had a parent, so its lock
+	 * is taken where P's is -- but AFTER the arm, not beside P above.  An
+	 * insert into an empty trie holds no node lock; registering the root's
+	 * first would arm a txn whose other records own nothing.  Taken last, it
+	 * still precedes the one record it protects, and parks it SW only where
+	 * the node locks already armed the txn (held MW otherwise: correct, the
+	 * lock is what excludes).
+	 */
+	if (slot == &ft->root)
+		ft_flip_txn_lock_root(ic->txn, ctx, (void **) slot,
+			expected_old);
 	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec,
 		dual_gp_held);
 	ft_flip_txn_record_pub_rec(ic->txn, &rec);
@@ -1195,7 +1207,9 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * + 1 for the SKIP_X dual's GP release terminal (§9.3's GP member: a publish
 	 * under a COMPRESSED parent re-encodes a dual slot living in GP's body, so
 	 * the op acquires GP -- ft_insert_lock_skip_dual_gp -- and its release rides
-	 * this commit).
+	 * this commit);
+	 * + FT_ROOT_LOCK_MAX_RECORDS for @root_lock's release terminal when the
+	 * publish lands in &ft->root (ft_flip_txn_lock_root).
 	 */
 	unsigned int anchored = ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE ?
 			0 : 1;
@@ -1208,7 +1222,8 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * still carries @ic->op for enrolment; what it must not do is commit
 	 * through it.
 	 */
-	ic->txn = ft_flip_txn_create_bounded(ft, 15 + anchored + count_edges);
+	ic->txn = ft_flip_txn_create_bounded(ft, 15 + anchored + count_edges
+			+ FT_ROOT_LOCK_MAX_RECORDS);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;

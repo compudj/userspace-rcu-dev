@@ -1644,16 +1644,29 @@ int ft_node_recompact(enum ft_recompact mode,
 	 */
 	if (ft->lock_fine && retire_txn && !cluster_leaf && metadata && old_node) {
 		struct cds_ft_inode_flag *pf_p = NULL, *pf_gp = NULL;
+		struct cds_ft_inode_flag **p_slot;
 		struct cds_ft_metadata *p_meta = NULL, *gp_meta = NULL;
 		struct ft_dlm_member set[3];
 		unsigned int p_depth = 0, gp_depth = 0;
+		bool p_root;
 		int dret;
 
 		/* PLAN (read-only, racy): resolve P (+GP iff P compressed). */
-		if (inh_hint)
+		if (inh_hint) {
 			pf_p = ft_parent_node(inh_hint->parent);
-		else
-			(void) ft_resolve_parent_slot(metadata, ft, &pf_p);
+			p_slot = inh_hint->slot;
+		} else {
+			p_slot = ft_resolve_parent_slot(metadata, ft, &pf_p);
+		}
+		/*
+		 * ☞ NO P, BECAUSE C IS THE ROOT: the slot P would own is &ft->root,
+		 * and @root_lock is ITS lock -- so it is P's member of this sorted
+		 * set, taken exactly as P's node lock would be (MATHIEU: a lock
+		 * like any node lock, no class).  Keyed on the resolved SLOT being
+		 * THIS trie's root, so a cross-trie hint naming another trie's
+		 * root is not given this trie's lock.
+		 */
+		p_root = !pf_p && p_slot == &ft->root;
 		if (pf_p) {
 			p_meta = ft_flag_to_metadata(ft, pf_p);
 			if (ft_node_compressed(pf_p) ||
@@ -1736,9 +1749,13 @@ int ft_node_recompact(enum ft_recompact mode,
 			.guard_child = (p_meta && (p_held || !inh_hint ||
 				inh_hint->parent_guard)) ? metadata : NULL,
 			.guard_pf = pf_p };
-		set[1] = (struct ft_dlm_member){
-			.nf = (p_meta && !p_held) ? pf_p : NULL,
-			.node = p_meta, .depth = p_depth };
+		if (p_root)
+			set[1] = (struct ft_dlm_member){
+				.anchor = &ft->root_lock, .lock_only = true };
+		else
+			set[1] = (struct ft_dlm_member){
+				.nf = (p_meta && !p_held) ? pf_p : NULL,
+				.node = p_meta, .depth = p_depth };
 		set[2] = (struct ft_dlm_member){
 			.nf = (gp_meta && !p_held) ? pf_gp : NULL,
 			.node = gp_meta, .depth = gp_depth,
@@ -1777,6 +1794,27 @@ int ft_node_recompact(enum ft_recompact mode,
 		}
 		if (set[2].nf)
 			rel_held[nr_rel++] = set[2].held;
+		if (p_root) {
+			/*
+			 * Released through @rel_held like P's node lock: every bail
+			 * below unlocks it, the commit registers it with its
+			 * terminal.
+			 *
+			 * ☠ THEN RE-VALIDATE THE PLAN'S ROOT UNDER THE LOCK.  C's
+			 * back-edge guard is what validates P for a node parent,
+			 * and a root C has none (@guard_pf is NULL).  The publish
+			 * this lock licenses parks SW -- a BLIND store -- so a
+			 * root that moved between the racy plan read and the
+			 * acquire must re-plan here, not be overwritten.
+			 */
+			rel_held[nr_rel++] = set[1].held;
+			if (rcu_dereference(ft->root) != set[0].nf) {
+				ft_unlock_held(rel_held, nr_rel);
+				if (!c_held.shared)
+					ft_meta_lock_release(c_held.lock);
+				return -EAGAIN;
+			}
+		}
 	} else
 	if (retire_txn && !cluster_leaf && metadata && old_node) {
 		ret = ft_acquire_member(ft, ctx, *old_node_flag_ptr, metadata,

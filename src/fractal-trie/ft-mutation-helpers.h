@@ -8221,9 +8221,11 @@ void ft_flip_txn_record_tag_mw_pinned(struct ft_flip_txn *t, void **slot,
  * for the RED CONTROL -- drop one take, confirm the guard fires, put it back.
  */
 /*
- * Stage 5 rides the same flip: one flag to turn the whole conversion on.
- * -DNO_FEATURE_FT_ROOT_SW keeps the root pinned while the cells park, which is
- * the ablation for "is the root's own lock what regressed this".
+ * Stage 5's PARK rides the same flip: one flag turns the record kinds over.  The
+ * root's LOCK does not -- like the cell locks, @root_lock is taken in every build
+ * (locks first; MW after the take is correct, only a spare CAS), so the default
+ * build exercises the locking half before any root parks SW.
+ * -DNO_FEATURE_FT_ROOT_SW keeps the root's record MW while the cells park.
  */
 #if defined(FEATURE_FT_CELL_SW) && !defined(NO_FEATURE_FT_ROOT_SW)
 # define FT_ROOT_SW_ENABLED	1
@@ -8238,15 +8240,38 @@ void ft_flip_txn_record_tag_mw_pinned(struct ft_flip_txn *t, void **slot,
 #endif
 
 /*
+ * The same guard for the ROOT, and for the same reason: with the root parking SW
+ * where @root_lock is held, an unheld root record left MW is one word under two
+ * writer disciplines.  Stage 5 shipped without it and was exactly that under the
+ * flip -- 82 records parked SW, 4,273 CASed, nothing said so.
+ * -DNO_FT_ROOT_OWNED_STRICT is its red control.
+ */
+/* What one root take costs a reserved txn: its release terminal. */
+#define FT_ROOT_LOCK_MAX_RECORDS	1
+
+#if FT_ROOT_SW_ENABLED && !defined(NO_FT_ROOT_OWNED_STRICT)
+# define FT_ROOT_OWNED_STRICT	1
+#else
+# define FT_ROOT_OWNED_STRICT	0
+#endif
+
+/*
  * The root's own two census counters, declared here because the recorder that
  * bumps them is below and the main FT_CELL_OWNER block is above nothing.
  */
 #ifdef FT_DEBUG_CELL_OWNER
-__attribute__((weak)) unsigned long ft_cow_root_held_e, ft_cow_root_notheld_e;
+__attribute__((weak)) unsigned long ft_cow_root_held_e, ft_cow_root_notheld_e,
+	ft_cow_root_exempt_e;
 # define FT_COW_ROOT_NPC	12
 __attribute__((weak)) void *ft_cow_root_pc[FT_COW_ROOT_NPC];
 __attribute__((weak)) unsigned long ft_cow_root_pc_n[FT_COW_ROOT_NPC];
+/* ft_flip_txn_lock_root's exits: calls = held + took + miss + shared. */
+__attribute__((weak)) unsigned long ft_cow_rtake[6];
+enum { FT_RTAKE_CALL, FT_RTAKE_HELD, FT_RTAKE_TOOK, FT_RTAKE_MISS,
+	FT_RTAKE_SHARED, FT_RTAKE_MOVED };
+# define FT_COW_RTAKE(k)	uatomic_inc(&ft_cow_rtake[FT_RTAKE_##k])
 # define FT_COW_ROOT_HELD()	uatomic_inc(&ft_cow_root_held_e)
+# define FT_COW_ROOT_EXEMPT()	uatomic_inc(&ft_cow_root_exempt_e)
 # define FT_COW_ROOT_NOTHELD()	do {					\
 		void *pc__ = __builtin_return_address(0);		\
 		int k__;						\
@@ -8266,7 +8291,9 @@ __attribute__((weak)) unsigned long ft_cow_root_pc_n[FT_COW_ROOT_NPC];
 		}							\
 	} while (0)
 #else
+# define FT_COW_RTAKE(k)	do { } while (0)
 # define FT_COW_ROOT_HELD()	do { } while (0)
+# define FT_COW_ROOT_EXEMPT()	do { } while (0)
 # define FT_COW_ROOT_NOTHELD()	do { } while (0)
 #endif
 
@@ -8342,15 +8369,48 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 				(struct cds_ft_inode_flag **) slot,
 				struct cds_ft, root);
 
-		if (FT_ROOT_SW_ENABLED &&
-				ft_flip_txn_holds(t, &owner_ft->root_lock)) {
+		if (ft_flip_txn_holds(t, &owner_ft->root_lock)) {
 			FT_COW_ROOT_HELD();
-			ft_flip_txn_record_tag(t, &owner_ft->root_lock,
-				slot, old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
-			return;
+			if (FT_ROOT_SW_ENABLED) {
+				ft_flip_txn_record_tag(t, &owner_ft->root_lock,
+					slot, old_ptr, new_ptr,
+					FT_FLIP_PROXY_TAG);
+				return;
+			}
+			/* Park off: held, recorded MW -- a spare CAS, no mix. */
+			goto pinned;
+		}
+		if (!owner_ft->lock_fine || owner_ft->exclusive) {
+			FT_COW_ROOT_EXEMPT();	/* one lock for the whole trie */
+			goto pinned;
+		}
+		FT_COW_ROOT_NOTHELD();
+		/*
+		 * ☠ THE ROOT'S STAGE-4 GUARD.  Recording this MW while another
+		 * writer of the same root parks SW under @root_lock is the partial
+		 * conversion itself; name the producer and stop.
+		 *
+		 * FINE, SHARED tries only.  Every other writer strategy is fixed
+		 * at creation and excludes EVERY writer of the trie with one lock
+		 * (the FT-wide one, or the application's), so the root's lock
+		 * there is that one -- still a function of the word, through
+		 * its trie -- and no peer can be inside it.  An EXCLUSIVE trie
+		 * has no peer at all: a graft/graft_swap SOURCE is refused BUSY
+		 * unless exclusive, and stays so until the inherit -- the same
+		 * reason door 1 gives for parking it wholesale.  The DST of those
+		 * ops is shared, is NOT exempt, and must hold its root's lock.
+		 */
+		if (FT_ROOT_OWNED_STRICT) {
+			fprintf(stderr, "FT ROOT UNHELD: slot %p lock %p "
+				"producer %p -- a root recorded without its lock "
+				"while the root park is on\n",
+				(void *) slot, (void *) &owner_ft->root_lock,
+				__builtin_return_address(0));
+			fflush(stderr);
+			abort();
 		}
 	}
-	FT_COW_ROOT_NOTHELD();
+pinned:
 	ft_flip_txn_record_tag_mw_pinned(t, slot, old_ptr, new_ptr,
 		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_ROOT));
 }
@@ -11747,13 +11807,20 @@ static void ft_cow_report(void)
 		"  ENGINE LANE (never asked)   %12lu   [not in the total]\n"
 		"  --- &ft->root (stage 5) ---\n"
 		"  root HELD                   %12lu\n"
-		"  root NOT HELD (pinned MW)   %12lu\n",
+		"  root NOT HELD, exempt       %12lu  (non-FINE or exclusive trie)\n"
+		"  root NOT HELD, OWED         %12lu\n",
 		t,
 		ft_cow_ok, 100.0*ft_cow_ok/t,
 		ft_cow_nocell, 100.0*ft_cow_nocell/t,
 		ft_cow_notheld, 100.0*ft_cow_notheld/t,
 		ft_cow_disabled, ft_cow_engine_lane,
-		ft_cow_root_held_e, ft_cow_root_notheld_e);
+		ft_cow_root_held_e, ft_cow_root_exempt_e,
+		ft_cow_root_notheld_e);
+	fprintf(stderr, "  root TAKES: calls %lu = held %lu + took %lu + "
+		"miss %lu + shared %lu | of took, moved %lu\n",
+		ft_cow_rtake[FT_RTAKE_CALL], ft_cow_rtake[FT_RTAKE_HELD],
+		ft_cow_rtake[FT_RTAKE_TOOK], ft_cow_rtake[FT_RTAKE_MISS],
+		ft_cow_rtake[FT_RTAKE_SHARED], ft_cow_rtake[FT_RTAKE_MOVED]);
 	if (ft_cow_root_notheld_e) {
 		int k;
 
@@ -12492,15 +12559,18 @@ void ft_root_list_swap_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 	/*
 	 * ☠ THIS PUBLISH CANNOT FAIL -- it is the un-abortable post-drain root
-	 * swap, committed infallibly into a pre-reserved txn -- so the take's
-	 * status is deliberately ignored rather than turned into a bail it has
-	 * no way to express.  That is sound only because the op holds the
-	 * FT-wide bulk gate here, so no peer can be inside these cells and the
-	 * CAS cannot lose.  If that assumption is ever wrong the records go MW
-	 * and the stage-4 guard aborts, which is the loud version of finding
-	 * out -- not a silent partial conversion.
+	 * swap, committed infallibly into a pre-reserved txn -- so a failed take
+	 * has no bail to become.  It cannot fail while the op holds the bulk
+	 * gate (no peer can be inside these words) -- and if it does, that
+	 * premise is false, so stop HERE rather than let the records fall to
+	 * MW (or the root validation's -EAGAIN be dropped) a few lines on.
 	 */
-	(void) ft_cell_lockset_take_edges(ft, NULL, txn, edges, n);
+	if (ft_cell_lockset_take_edges(ft, NULL, txn, edges, n)) {
+		fprintf(stderr, "FT ROOT LIST SWAP: lock take failed on an "
+			"unfailable publish (ft %p)\n", (void *) ft);
+		fflush(stderr);
+		abort();
+	}
 	/*
 	 * @txn is the caller-PRE-RESERVED bounded txn (every Class-G root swap
 	 * reserves in its fallible prefix), committed infallibly here -- the
@@ -13137,8 +13207,9 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 /*
  * Take @ft->root_lock and hand it to @txn, same ownership rule as the cell
  * locks: CAS outside the engine, registered with a terminal so the txn owns the
- * release, never released by hand.  A miss leaves the root recording MW, which
- * is exactly today's behaviour.
+ * release, never released by hand.  A miss leaves the root unheld: recorded MW
+ * with the park off (sound -- the CAS arbitrates), the root guard's abort with
+ * it on.
  */
 static inline
 int ft_root_lock_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
@@ -13147,7 +13218,7 @@ int ft_root_lock_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	struct ft_dlm_member set[1] = { 0 };
 	int ret;
 
-	if (!FT_ROOT_SW_ENABLED || !txn)
+	if (!txn)
 		return 0;
 	set[0].anchor = &ft->root_lock;
 	set[0].lock_only = true;
@@ -13160,6 +13231,118 @@ int ft_root_lock_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			set[0].held.lock_snap);
 	}
 	return 0;
+}
+
+/*
+ * TAKE THE ROOT'S LOCK FOR AN OP ABOUT TO PUBLISH INTO &ft->root -- where the op
+ * would take the publish parent P's lock, because &ft->root is the slot P would
+ * own if the root had a parent.  MATHIEU: @root_lock is a lock like any node
+ * lock -- a plain member of an address-ordered take, no lock CLASS -- so it is
+ * taken the way the parent is, and at the same point: before the publish is
+ * RECORDED, because a record's kind is decided when it is made.
+ *
+ * Same exits as ft_flip_txn_lock_or_guard_parent: taken -> registered with its
+ * terminal, so the txn owns the release; missed -> @acquire_miss, the commit
+ * discards the attempt unpublished.  Never a carry-on: that lane's removed
+ * degrade-to-guard is the lost update this would re-create.
+ *
+ * ☠ THEN RE-VALIDATE @expected_old UNDER THE LOCK.  The op read the root before
+ * it held it, and the park this lock licenses is a BLIND release store
+ * (urcu_txn_desc_commit's SW arm) -- it no longer rejects a root that moved.  A
+ * peer that took the lock, changed the root and released inside that window
+ * would be overwritten.  Once held, no other writer can move it, so this one
+ * check stands in for the CAS the park gives up.  Only on the take that
+ * ACQUIRED it: a later root record in the same txn chains on this txn's own
+ * pending value, which the live word does not carry yet.
+ *
+ * RESERVATION: +1 record (the release terminal), FT_ROOT_LOCK_MAX_RECORDS.
+ * Past a reservation the descriptor still grows, so an unsized site does not
+ * drop the release -- it breaks the caller's promise that the commit cannot
+ * fail for want of memory (a sticky -ENOMEM, raised at the commit).
+ * -DURCU_TXN_DEBUG_RESERVE names such a store.
+ *
+ * Taken in every build; only the root's RECORD KIND depends on the park.
+ */
+/*
+ * RETURNS 0 when @t holds the root's lock (taken here or already), -EAGAIN when
+ * it does not and @acquire_miss is set (missed, or the root moved), 1 when an
+ * outer frame holds it.  A failable caller may ignore it -- the commit
+ * discards; an UNFAILABLE one must not (ft_flip_txn_lock_root_unfailable).
+ */
+static inline
+int ft_flip_txn_lock_root(struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx, void **slot, void *expected_old)
+{
+	struct ft_dlm_member set[1] = { 0 };
+	struct cds_ft *rft;
+
+	if (!t)
+		return 0;
+	/* The owner comes from the SLOT (a cross-trie txn writes a peer's root). */
+	rft = caa_container_of((struct cds_ft_inode_flag **) slot,
+			struct cds_ft, root);
+	/* An EXCLUSIVE trie has no peer: no lock (the guard's same predicate). */
+	if (rft->exclusive)
+		return 0;
+	FT_COW_RTAKE(CALL);
+	if (ft_flip_txn_holds(t, &rft->root_lock)) {
+		FT_COW_RTAKE(HELD);
+		return 0;
+	}
+	{
+		/* Carry the op and the outer frames, as the parent lane does. */
+		struct ft_lock_ctx lctx = {
+			.d = ft_lock_ctx_descent(ctx),
+			.op = ctx ? ctx->op : NULL,
+			.held = { .txn = t,
+				.extra = ctx ? ctx->held.extra : NULL,
+				.nr_extra = ctx ? ctx->held.nr_extra : 0,
+				.glue = ctx ? ctx->held.glue : NULL,
+				.outer = ctx ? ctx->held.outer : NULL },
+		};
+
+		set[0].anchor = &rft->root_lock;
+		set[0].lock_only = true;
+		if (ft_dlm_acquire_set(rft, &lctx, set, 1)) {
+			FT_COW_RTAKE(MISS);
+			t->acquire_miss = true;
+			return -EAGAIN;
+		}
+	}
+	if (set[0].held.shared) {
+		FT_COW_RTAKE(SHARED);
+		return 1;	/* an outer frame holds it: the guard will say so */
+	}
+	FT_COW_RTAKE(TOOK);
+	ft_flip_txn_lock_register_held(t, &set[0].held);
+	ft_flip_txn_record_release_lock(t, set[0].held.lock,
+		set[0].held.lock_snap);
+	if (rcu_dereference(*slot) != expected_old) {
+		FT_COW_RTAKE(MOVED);
+		t->acquire_miss = true;	/* moved before we held it: re-plan */
+		return -EAGAIN;
+	}
+	return 0;
+}
+
+/*
+ * The same take for a commit with NO WAY LEFT TO FAIL SAFELY -- a bulk op's
+ * publish past its point of no return.  There the take cannot miss and the root
+ * cannot move: every point writer is excluded by the bulk gate and every bulk
+ * writer by @bulk_lock.  If either happens anyway, the premise is wrong, and a
+ * discarded "unfailable" commit is a silent corruption -- so say it and stop.
+ */
+static inline
+void ft_flip_txn_lock_root_unfailable(struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx, void **slot, void *expected_old)
+{
+	if (ft_flip_txn_lock_root(t, ctx, slot, expected_old) < 0) {
+		fprintf(stderr, "FT ROOT LOCK MISS ON AN UNFAILABLE COMMIT: slot "
+			"%p producer %p -- the bulk-gate premise is false\n",
+			(void *) slot, __builtin_return_address(0));
+		fflush(stderr);
+		abort();
+	}
 }
 
 /*
@@ -13193,7 +13376,11 @@ int ft_cell_lockset_take_edges(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	unsigned int n = 0, i, j;
 	int ret;
 
-	if (!ft->ordered_list || !txn)
+	/*
+	 * NOT gated on @ft->ordered_list: a list-off group has no cell edges,
+	 * but its ROOT still rides this take.
+	 */
+	if (!txn)
 		return 0;
 	for (i = 0; i < n_edges; i++) {
 		struct cds_ft_metadata *lock;
@@ -13211,7 +13398,14 @@ int ft_cell_lockset_take_edges(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				(struct cds_ft_inode_flag **) edges[i].slot,
 				struct cds_ft, root);
 
-			lock = FT_ROOT_SW_ENABLED ? &rft->root_lock : NULL;
+			/*
+			 * An EXCLUSIVE trie's root needs no lock: it has no peer
+			 * (a graft / graft_swap / merge SOURCE is refused BUSY
+			 * unless exclusive).  Keyed on the TRIE, not on the op's
+			 * src/dst role -- a same-trie rekey's one trie is shared,
+			 * so both of its ends are locked.
+			 */
+			lock = !rft->exclusive ? &rft->root_lock : NULL;
 			goto have_lock;
 		}
 		if (ft_edge_tag(&edges[i]) != URCU_TXN_TAG)
@@ -13220,6 +13414,13 @@ int ft_cell_lockset_take_edges(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 have_lock:
 		if (!lock)
 			continue;	/* no owner: stays MW, the guard says so */
+		/*
+		 * Already this txn's: re-taking it would MISS against the op's
+		 * own LOCK bit (with @ctx NULL nothing dedupes it) and turn a
+		 * held word into a refusal.
+		 */
+		if (ft_flip_txn_holds(txn, lock))
+			continue;
 		for (j = 0; j < n; j++)
 			if (set[j].anchor == lock)
 				break;
@@ -13242,6 +13443,30 @@ have_lock:
 		ft_flip_txn_lock_register_held(txn, &set[i].held);
 		ft_flip_txn_record_release_lock(txn, set[i].held.lock,
 			set[i].held.lock_snap);
+	}
+	/*
+	 * ☠ A ROOT'S EXPECTED OLD, RE-VALIDATED UNDER THE LOCK JUST TAKEN.  The
+	 * caller read it unlocked, and the park this lock licenses is a blind
+	 * store.  Cell edges get this from the caller's re-derive-and-compare;
+	 * the root has no re-derive, so it is checked here.  Only roots whose
+	 * lock THIS call took (a later root record chains on the txn's own
+	 * pending value, which the live word does not carry yet).
+	 */
+	for (i = 0; i < n_edges; i++) {
+		struct cds_ft *rft;
+
+		if (!edges[i].root)
+			continue;
+		rft = caa_container_of(
+			(struct cds_ft_inode_flag **) edges[i].slot,
+			struct cds_ft, root);
+		for (j = 0; j < n; j++)
+			if (set[j].anchor == &rft->root_lock &&
+					!set[j].held.shared)
+				break;
+		if (j < n && rcu_dereference(*(void **) edges[i].slot) !=
+				(void *) edges[i].old_target)
+			return -EAGAIN;	/* held, owned by @txn: see above */
 	}
 	return 0;
 }
@@ -14903,9 +15128,19 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 	 * The dual names cells in BOTH tries; the generic take locks whatever
 	 * the edges name, so it needs no cross-trie shape of its own.
 	 */
+	/*
+	 * ☠ NOT A QUIET RETURN.  This publish is UNFAILABLE -- void, and both
+	 * callers carry on to the drain, the finalize and the exclusive-flag
+	 * inherit as if the swap happened -- so a destroyed txn here is a swap
+	 * that silently did not.  Every writer of these words is excluded (point
+	 * ops by the bulk gate, bulk ops by @bulk_lock), so a miss means that
+	 * premise is false: say so.
+	 */
 	if (ft_cell_lockset_take_edges(a->ft, NULL, txn, edges, n)) {
-		ft_flip_txn_destroy(txn);
-		return;
+		fprintf(stderr, "FT DUAL ROOT SWAP: lock take failed on an "
+			"unfailable publish (dst %p)\n", (void *) a->ft);
+		fflush(stderr);
+		abort();
 	}
 	(void) ft_ord_cell_flip_into(a->ft, txn, edges, n);
 }
@@ -22174,6 +22409,15 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 				g->publish_parent, FT_DEPTH_FROM_DESCENT,
 				g->publish_parent_holder,
 				g->publish_parent_snap);
+		/*
+		 * No publish parent: the slot is &ft->root, whose own lock is
+		 * P's.  A miss sets @acquire_miss -- this commit is abortable
+		 * (see ft_glue_publish: a shared destination is contracted).
+		 */
+		if (!g->publish_parent && g->publish_slot == &ft->root)
+			(void) ft_flip_txn_lock_root(g->txn, &gctx,
+				(void **) g->publish_slot,
+				ft_glue_publish_expected_old(g));
 	}
 	if (g->publish_parent_holder) {
 		/*

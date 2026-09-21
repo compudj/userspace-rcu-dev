@@ -541,10 +541,9 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 		goto sweep;
 	}
 
-	/* Forward publish ft->root: root -> root' (MW by construction -- the
-	 * root slot is arbitrated by its own CAS, and an SW park is neither a
-	 * CAS nor visible to one; see ft_flip_txn_record_root). */
-	if (!ft_flip_txn_reserve_extra(txn, 1)) {
+	/* Forward publish ft->root: root -> root', under @root_lock like every
+	 * other root writer (+1 reserved for the lock's release terminal). */
+	if (!ft_flip_txn_reserve_extra(txn, 1 + FT_ROOT_LOCK_MAX_RECORDS)) {
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(root_prime));
 		ft_flip_txn_destroy(txn);
 		ret = -ENOMEM;
@@ -556,6 +555,7 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 	 */
 	cds_ft_item_to_metadata(ft_node_ptr(root_prime))->parent_word =
 		ft_trie_parent(ft);
+	(void) ft_flip_txn_lock_root(txn, NULL, (void **) &ft->root, root);
 	ft_flip_txn_record_root(txn, (void **) &ft->root, root, root_prime);
 
 	st = ft_flip_txn_commit(ft, txn);		/* consumes txn */

@@ -2332,6 +2332,13 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				pub_parent, FT_DEPTH_FROM_DESCENT,
 				gd.publish_parent_holder,
 				gd.publish_parent_snap);
+			/*
+			 * No @pub_parent: the slot is &dst_ft->root, and the
+			 * root's own lock is P's -- taken where P's is.
+			 */
+			if (pub_slot == &dst_ft->root)
+				ft_flip_txn_lock_root_unfailable(txn, &mctx,
+					(void **) pub_slot, D_old);
 		}
 		/*
 		 * OWNERSHIP TRANSFER (mirrors the graft): @txn's registry now owns
