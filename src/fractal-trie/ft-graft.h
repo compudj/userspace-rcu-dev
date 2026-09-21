@@ -1255,7 +1255,17 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 				(const void *) st->attached);
 	} else {
 		struct cds_ft_inode_flag **slot = NULL;
-		struct ft_ord_cell_edge redges[FT_ORD_CELL_RUN_SPLICE_MAX_EDGES];
+		/*
+		 * ☠ ZERO-INITIALISED, like every other edge array in the tree.
+		 * These are filled FIELD BY FIELD by the run producers, so any
+		 * field a producer does not set reads STACK GARBAGE -- and
+		 * @owner_cell is exactly such a field on the paths that build a
+		 * non-cell edge.  This was the ONE declaration missing `= { 0 }`,
+		 * and it SEGV'd deterministically at ft_inv test 46 the moment a
+		 * consumer started reading that field.
+		 */
+		struct ft_ord_cell_edge redges[FT_ORD_CELL_RUN_SPLICE_MAX_EDGES] =
+			{ 0 };
 		struct cds_ft_inode_flag *count_base = NULL;
 		unsigned int rn = 0;
 

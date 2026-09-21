@@ -7552,8 +7552,9 @@ detach_bail:
 	 * conflicting splice aborts this commit clean and the caller re-descends.
 	 */
 	if (ft->ordered_list) {
+		/* Zero-initialised: see the note on ms_edges in ft-merge.h. */
 		struct ft_ord_cell_edge cedges[FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
-			FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES];
+			FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES] = { 0 };
 		struct ft_ord_cell *rfc, *rlc, *src_pred, *src_succ;
 		unsigned int cn;
 

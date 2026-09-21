@@ -1839,7 +1839,15 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * non-atomic per-edge fallback.  Each survivor run costs at most
 		 * two visible edges, so @ms_cap (2*merged_keys+2) bounds @ms_edges.
 		 */
-		ms_edges = malloc((size_t) ms_cap * sizeof(*ms_edges));
+		/*
+		 * ☠ CALLOC, not malloc: these edges are filled FIELD BY FIELD
+		 * by the producers, so a field no producer sets is read as heap
+		 * garbage by anything that consumes it.  Harmless while the
+		 * optional fields (@ctx, @owner_cell) were only read under a
+		 * debug assert; a SEGV the moment the recorder began deriving a
+		 * cell's nearest-ancestor owner from them.
+		 */
+		ms_edges = calloc((size_t) ms_cap, sizeof(*ms_edges));
 		if (!ms_edges) {
 			ft_flip_txn_destroy(txn);
 			if (fresh_root)
