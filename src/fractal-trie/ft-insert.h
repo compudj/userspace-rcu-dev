@@ -455,6 +455,34 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 * ABORT path re-descend; age the handle first, exactly as a real
 		 * commit ABORT ages it.
 		 */
+		/*
+		 * ☞ TAKE THE TWO CELL WORDS THE SPLICE WILL WRITE.
+		 *
+		 * &pred->lnode.next (owner pred) and &succ0->lnode.prev (owner
+		 * succ0).  Where a neighbour is the SENTINEL the owner is a list
+		 * END lock -- ord_begin_lock for the .next side, ord_end_lock
+		 * for the .prev side -- which is why the plan carries the
+		 * pseudo-cell rather than NULL.  The new cell needs no lock: it
+		 * is unpublished.
+		 *
+		 * The insert-shaped validation re-checks pred->next == succ0
+		 * UNDER the locks -- the same question @pred2 answers unlocked,
+		 * and once it passes under the lock it cannot change before the
+		 * commit, because every writer of those words needs one of them.
+		 *
+		 * splice_conflict: already ends in ft_flip_txn_destroy(ic->txn),
+		 * which is the terminal that releases whatever was registered.
+		 */
+		{
+			struct ft_cell_plan plan = {
+				.cell = NULL,		/* insert shape */
+				.pred = ft_ord_cell_of(pred_lnode),
+				.succ = succ0,
+			};
+
+			if (ft_cell_lockset_take(ft, NULL, ic->txn, &plan))
+				goto splice_conflict;
+		}
 		if (pred2 == pred &&
 		    ft_txn_list_insert_between_prepare(ft, ic->txn,
 				ft_ord_cell_lnode(cell), pred_lnode,

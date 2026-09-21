@@ -12488,7 +12488,7 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
  * FT_STATE_PROXY and urcu_txn_desc_set_late_tag defers every such record to the
  * late pass.)
  */
-#define FT_CELL_LOCKSET_MAX_RECORDS	3
+#define FT_CELL_LOCKSET_MAX_RECORDS	4
 
 /*
  * THE CELL-LIST LOCK PLAN: the cells whose list words an op is about to write.
@@ -12515,6 +12515,15 @@ struct ft_cell_plan {
 	 * never terminating ("status 3 after 1000 resumes").
 	 */
 	bool cell_lock_held;
+	/*
+	 * ☞ A RUN IS THE SAME SHAPE WITH TWO ENDS.  A bulk op unsplices a
+	 * CONTIGUOUS RUN of cells at once: @cell is its first, @last its last,
+	 * and the words written are the run's two OUTER neighbours -- exactly
+	 * the single-cell pair when @last is NULL or equal to @cell.  So the
+	 * validation generalises rather than forking: prev-of-first == pred and
+	 * next-of-LAST == succ.  Four locks per run, not one per cell.
+	 */
+	struct ft_ord_cell *last;
 };
 
 /*
@@ -12536,13 +12545,14 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 {
 	(void) ft;
 	if (p->cell) {
+		const struct ft_ord_cell *last = p->last ? p->last : p->cell;
+
 		if (ft_ord_cell_resolve_ord(&p->cell->lnode.prev) != p->pred)
 			return false;
-		if (ft_ord_cell_resolve_ord(&p->cell->lnode.next) != p->succ)
+		if (ft_ord_cell_resolve_ord(&last->lnode.next) != p->succ)
 			return false;
-		if (urcu_txn_list_is_marked(
-				rcu_dereference(p->cell->lnode.next)))
-			return false;	/* @cell already being deleted */
+		if (urcu_txn_list_is_marked(rcu_dereference(last->lnode.next)))
+			return false;	/* the run's tail already deleted */
 	} else {
 		if (!p->pred)
 			return false;
@@ -12596,7 +12606,7 @@ static inline
 int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct ft_flip_txn *txn, const struct ft_cell_plan *p)
 {
-	struct ft_dlm_member set[3] = { 0 };
+	struct ft_dlm_member set[4] = { 0 };
 	unsigned int n = 0, i;
 	int ret;
 
@@ -12604,6 +12614,9 @@ int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		return 0;		/* no list, no cell words */
 	if (p->cell && !p->cell_lock_held &&
 			ft_cell_lock_member(ft, p->cell, NULL, &set[n]))
+		n++;
+	if (p->last && p->last != p->cell &&
+			ft_cell_lock_member(ft, p->last, NULL, &set[n]))
 		n++;
 	if (p->pred && ft_cell_lock_member(ft, p->pred,
 			&p->pred->lnode.next, &set[n]))
@@ -15387,9 +15400,44 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	 */
 	edges[n].owner_held = (slot_owner != NULL);
 	n++;
-	if (run)
-		n = ft_ord_cell_run_detach_edges(ft, run->rfirst, run->rlast,
-			&run->first, &run->last, edges, n);
+		if (run) {
+			/*
+			 * ☞ STAGE 3: THE RUN'S FOUR CELL LOCKS.
+			 *
+			 * ft_ord_cell_run_detach_edges writes the run's two
+			 * OUTER neighbours -- &pred->lnode.next (owner pred)
+			 * and &succ->lnode.prev (owner succ) -- where pred is
+			 * prev-of-first and succ is next-of-last.  The plan
+			 * carries both ends so the validation checks the pair
+			 * that is actually written, and the take covers the run
+			 * with FOUR locks rather than one per cell.
+			 *
+			 * Bulk ops already run under the FT-wide bulk gate, so
+			 * this is not what makes them exclusive; it is what
+			 * makes every cell-word record OWNED, which is what the
+			 * flip needs.  Four uncontended CAS per run is cheaper
+			 * to pay than the bulk/point mode-flip completeness
+			 * argument is to prove.
+			 */
+			if (txn) {
+				struct ft_ord_cell *rf = ft_ord_cell_ptr(
+					rcu_dereference(run->rfirst->prev));
+				struct ft_ord_cell *rl = ft_ord_cell_ptr(
+					rcu_dereference(run->rlast->prev));
+				struct ft_cell_plan plan = {
+					.cell = rf, .last = rl,
+					.pred = ft_ord_cell_resolve_ord(
+						&rf->lnode.prev),
+					.succ = ft_ord_cell_resolve_ord(
+						&rl->lnode.next),
+				};
+
+				if (ft_cell_lockset_take(ft, NULL, txn, &plan))
+					return -EAGAIN;
+			}
+			n = ft_ord_cell_run_detach_edges(ft, run->rfirst,
+				run->rlast, &run->first, &run->last, edges, n);
+		}
 		else if (dead_cell) {
 			/*
 			 * \u261e STAGE 1: TAKE THE CELL WORDS THE UNSPLICE WILL
@@ -15827,9 +15875,44 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		edges[n].ctx = rec->ctx;
 		n++;
 	}
-	if (run)
-		n = ft_ord_cell_run_detach_edges(ft, run->rfirst, run->rlast,
-			&run->first, &run->last, edges, n);
+		if (run) {
+			/*
+			 * ☞ STAGE 3: THE RUN'S FOUR CELL LOCKS.
+			 *
+			 * ft_ord_cell_run_detach_edges writes the run's two
+			 * OUTER neighbours -- &pred->lnode.next (owner pred)
+			 * and &succ->lnode.prev (owner succ) -- where pred is
+			 * prev-of-first and succ is next-of-last.  The plan
+			 * carries both ends so the validation checks the pair
+			 * that is actually written, and the take covers the run
+			 * with FOUR locks rather than one per cell.
+			 *
+			 * Bulk ops already run under the FT-wide bulk gate, so
+			 * this is not what makes them exclusive; it is what
+			 * makes every cell-word record OWNED, which is what the
+			 * flip needs.  Four uncontended CAS per run is cheaper
+			 * to pay than the bulk/point mode-flip completeness
+			 * argument is to prove.
+			 */
+			if (txn) {
+				struct ft_ord_cell *rf = ft_ord_cell_ptr(
+					rcu_dereference(run->rfirst->prev));
+				struct ft_ord_cell *rl = ft_ord_cell_ptr(
+					rcu_dereference(run->rlast->prev));
+				struct ft_cell_plan plan = {
+					.cell = rf, .last = rl,
+					.pred = ft_ord_cell_resolve_ord(
+						&rf->lnode.prev),
+					.succ = ft_ord_cell_resolve_ord(
+						&rl->lnode.next),
+				};
+
+				if (ft_cell_lockset_take(ft, rec->ctx, txn, &plan))
+					return URCU_TXN_STATUS_ABORT;
+			}
+			n = ft_ord_cell_run_detach_edges(ft, run->rfirst,
+				run->rlast, &run->first, &run->last, edges, n);
+		}
 		else if (dead_cell) {
 			/*
 			 * \u261e STAGE 1: TAKE THE CELL WORDS THE UNSPLICE WILL
