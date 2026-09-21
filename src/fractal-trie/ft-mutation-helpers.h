@@ -15215,6 +15215,31 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 	struct ft_ord_cell_edge edges[FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES] = { 0 };
 	unsigned int n = 0, i;
 
+	/*
+	 * ☞ THE SWAP'S CELL LOCKS, TAKEN ONCE FOR EVERY CALLER.
+	 *
+	 * ft_ord_cell_swap_edges below writes &pred->lnode.next (owner pred),
+	 * &succ->lnode.prev (owner succ) and the mark on &old_cell->lnode.next
+	 * (owner old_cell).  Every producer that reaches this helper writes the
+	 * same three words, so the take belongs HERE rather than repeated at
+	 * the head promote, the two insert-replace arms and the prefix-head
+	 * swap -- four sites that would otherwise each have to remember it, and
+	 * one of which already forgot (ft-insert.h:6300, 521,562 unheld records).
+	 *
+	 * The take is the LAST one before the edges are built, which is the
+	 * class-1 rule; and it is only made with a @txn, because the lock is
+	 * taken by CAS outside the engine and released through the txn.
+	 */
+	if (txn && new_cell) {
+		struct ft_cell_plan plan = {
+			.cell = old_cell,
+			.pred = ft_ord_cell_resolve_ord(&old_cell->lnode.prev),
+			.succ = ft_ord_cell_resolve_ord(&old_cell->lnode.next),
+		};
+
+		if (ft_cell_lockset_take(ft, NULL, txn, &plan))
+			return -EAGAIN;
+	}
 	for (i = 0; i < n_sedge; i++)
 		edges[n++] = sedges[i];
 	if (new_cell)

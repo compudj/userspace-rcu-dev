@@ -6431,56 +6431,10 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * carries the extra edge.
 		 */
 		/*
-		 * ☞ STAGE 1: TAKE THE CELL WORDS THIS SWAP WILL WRITE.
-		 *
-		 * ft_ord_cell_swap_edges writes three: &pred->lnode.next (owner
-		 * pred), &succ->lnode.prev (owner succ) and &old_cell->lnode.next
-		 * (owner old_cell).  Only the last is covered by the holder this
-		 * op already took; pred and succ are NEIGHBOURING KEYS, off this
-		 * descent -- the largest NOT-HELD population in the cell census.
-		 *
-		 * ☠ PLACED HERE, AFTER ft_lock_skip_dual_gp, BECAUSE IT IS THE
-		 * LAST TAKE.  Cell locks are class 1 and an op must never go back
-		 * for a class-0 word while holding one; the dual-GP acquire above
-		 * is the final class-0 take on this path.
-		 *
-		 * The records are still MW -- this stage only takes the locks.
-		 * "MW after the take is correct, just a wasted CAS."  A miss is
-		 * not fatal to correctness, only to the conversion, so it bails
-		 * the attempt rather than the op.
+		 * The swap's three cell words are taken inside
+		 * ft_ord_cell_swap_publish_multi, which every producer of this
+		 * shape reaches -- see its header.
 		 */
-		{
-			struct ft_cell_plan plan = {
-				.cell = old_cell,
-				.pred = ft_ord_cell_resolve_ord(
-					&old_cell->lnode.prev),
-				.succ = ft_ord_cell_resolve_ord(
-					&old_cell->lnode.next),
-			};
-			int cret = ft_cell_lockset_take(ft, ctx, txn, &plan);
-
-			if (cret) {
-				/*
-				 * ☠ @held_holder IS NOT RELEASED HERE.
-				 * ft_flip_txn_hold_or_lock_parent above already
-				 * REGISTERED it on @txn, so the destroy drops it
-				 * -- exactly as the acquire_miss bail a few lines
-				 * up does, and for the same reason this file
-				 * states: every bail that releases it explicitly
-				 * stays ABOVE that call.  Releasing it again here
-				 * cleared a LOCK bit another thread owned, and
-				 * the assert then fired in that thread's own
-				 * release (ft_unchain_node's -ESTALE path), which
-				 * is the confusing way to find this out.
-				 *
-				 * The destroy also drops any cell lock the take
-				 * registered before failing.
-				 */
-				ft_flip_txn_destroy(txn);
-				ft_ord_cell_free_unpublished(ft, new_cell);
-				return -EAGAIN;
-			}
-		}
 		ft_ch_audit(ft, txn, node);
 		ft_hlist_freeze_prepare(ft, ft_flip_txn_handle(txn), node);
 		if (ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
