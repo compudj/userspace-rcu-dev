@@ -12439,6 +12439,138 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
 }
 
 /*
+ * THE CELL-LIST LOCK PLAN: the cells whose list words an op is about to write.
+ *
+ * @cell is the cell the op retires or replaces (NULL for an insert, whose new
+ * cell is unpublished and needs no lock); @pred and @succ are its key-order
+ * neighbours, either real cells or the sentinel pseudo-cell.
+ */
+struct ft_cell_plan {
+	struct ft_ord_cell *cell;
+	struct ft_ord_cell *pred, *succ;
+};
+
+/*
+ * \u2620 THE PLAN MUST STILL DESCRIBE THE LIST, CHECKED UNDER THE LOCKS.
+ *
+ * pred/succ were resolved with no exclusion held, so a peer may have spliced
+ * between that read and the take.  Re-read them now: every writer of these
+ * words needs one of the locks this op now holds, so a plan that validates
+ * here CANNOT change before the commit -- which is what lets the edge builders
+ * be handed the plan instead of re-resolving (the written set is then the
+ * locked set by construction).
+ *
+ * This is ft_unchain_node's own "\u2605 RE-DERIVE AFTER THE ACQUIRE" idiom, which
+ * the tree already carries for the holder; it is established, not invented.
+ */
+static inline
+bool ft_cell_plan_still_valid(const struct cds_ft *ft,
+		const struct ft_cell_plan *p)
+{
+	(void) ft;
+	if (p->cell) {
+		if (ft_ord_cell_resolve_ord(&p->cell->lnode.prev) != p->pred)
+			return false;
+		if (ft_ord_cell_resolve_ord(&p->cell->lnode.next) != p->succ)
+			return false;
+		if (urcu_txn_list_is_marked(
+				rcu_dereference(p->cell->lnode.next)))
+			return false;	/* @cell already being deleted */
+	} else {
+		if (!p->pred)
+			return false;
+		if (ft_ord_cell_resolve_ord(&p->pred->lnode.next) != p->succ)
+			return false;
+		if (urcu_txn_list_is_marked(
+				rcu_dereference(p->pred->lnode.next)))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * TAKE THE PLAN'S CELL LOCKS AND HAND THEM TO @txn.  The ONLY place a cell
+ * lock is taken.
+ *
+ * \u2620 THE RULE THIS FUNCTION EXISTS TO MAKE UNBREAKABLE: a cell lock has
+ * exactly ONE owner from the instant it is taken -- the txn.  The hold is
+ * registered AND given its terminal record in the same breath, and no caller
+ * releases one by hand on any path.  A registration WITHOUT a terminal is the
+ * defect that made the first widening attempt livelock: the commit's OK path
+ * does not drain the registry (by design), so such a word stays LOCKED for
+ * ever -- measured as "widened ok=1 miss=50001", every later miss at
+ * ft_dlm_lock.  The pair is what ft-compact.h:603-604 already does.
+ *
+ * @txn MUST already exist: that is what makes "a bail before the txn" -- the
+ * only shape with nothing to release the locks -- unconstructible.
+ *
+ * On success every lock is the txn's.  ON FAILURE @txn IS DESTROYED and nothing
+ * is held -- the set take is all-or-none, and the destroy releases everything
+ * already registered.  The caller must treat @txn as gone and must not destroy
+ * it again.
+ *
+ * ☠ THEREFORE NOT FOR A CALLER-OWNED SHARED TXN.  A producer that FOLDS into
+ * a txn belonging to its caller (the record_only / shared_txn paths) must not
+ * use this form: it would destroy a txn the caller still means to commit.
+ * Those sites need a variant that reports the failure and leaves the txn
+ * alone.
+ */
+static inline
+int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+		struct ft_flip_txn *txn, const struct ft_cell_plan *p)
+{
+	struct ft_dlm_member set[3] = { 0 };
+	unsigned int n = 0, i;
+	int ret;
+
+	if (!ft->ordered_list)
+		return 0;		/* no list, no cell words */
+	if (p->cell && ft_cell_lock_member(ft, p->cell, NULL, &set[n]))
+		n++;
+	if (p->pred && ft_cell_lock_member(ft, p->pred,
+			&p->pred->lnode.next, &set[n]))
+		n++;
+	if (p->succ && ft_cell_lock_member(ft, p->succ,
+			&p->succ->lnode.prev, &set[n]))
+		n++;
+	if (!n)
+		return 0;
+	ret = ft_dlm_acquire_set(ft, ctx, set, n);
+	if (ret) {
+		/*
+		 * ☠ DESTROY ON EVERY FAILURE, NOT JUST THE VALIDATION ONE.
+		 * Two exits that differ in whether the caller still owns @txn is
+		 * an invitation to leak it at one of five call sites; one rule
+		 * -- "on failure @txn is gone" -- cannot be got wrong.  The set
+		 * take is all-or-none so no cell lock is held here; the destroy
+		 * is for the txn and for anything the caller recorded into it
+		 * before the take.
+		 */
+		ft_flip_txn_destroy(txn);
+		return ret;
+	}
+	for (i = 0; i < n; i++) {
+		/*
+		 * A SHARED hold deduped onto a word this op already had (a
+		 * two-cell list has pred == succ): its release belongs to the
+		 * take that got it, and registering it twice would have the
+		 * commit clear one word twice.
+		 */
+		if (set[i].held.shared)
+			continue;
+		ft_flip_txn_lock_register_held(txn, &set[i].held);
+		ft_flip_txn_record_release_lock(txn, set[i].held.lock,
+			set[i].held.lock_snap);
+	}
+	if (!ft_cell_plan_still_valid(ft, p)) {
+		ft_flip_txn_destroy(txn);	/* releases every registration */
+		return -EAGAIN;
+	}
+	return 0;
+}
+
+
+/*
  * Drop LOCK from a word the op HOLDS, chaining onto whatever THIS txn has
  * already written to it -- the release twin of
  * ft_flip_txn_record_retire_anchored's fused arm, and for the same reason.

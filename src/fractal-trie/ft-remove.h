@@ -6427,6 +6427,47 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * while @node is still unmarked (doc §4.B).  The reservation above
 		 * carries the extra edge.
 		 */
+		/*
+		 * ☞ STAGE 1: TAKE THE CELL WORDS THIS SWAP WILL WRITE.
+		 *
+		 * ft_ord_cell_swap_edges writes three: &pred->lnode.next (owner
+		 * pred), &succ->lnode.prev (owner succ) and &old_cell->lnode.next
+		 * (owner old_cell).  Only the last is covered by the holder this
+		 * op already took; pred and succ are NEIGHBOURING KEYS, off this
+		 * descent -- the largest NOT-HELD population in the cell census.
+		 *
+		 * ☠ PLACED HERE, AFTER ft_lock_skip_dual_gp, BECAUSE IT IS THE
+		 * LAST TAKE.  Cell locks are class 1 and an op must never go back
+		 * for a class-0 word while holding one; the dual-GP acquire above
+		 * is the final class-0 take on this path.
+		 *
+		 * The records are still MW -- this stage only takes the locks.
+		 * "MW after the take is correct, just a wasted CAS."  A miss is
+		 * not fatal to correctness, only to the conversion, so it bails
+		 * the attempt rather than the op.
+		 */
+		{
+			struct ft_cell_plan plan = {
+				.cell = old_cell,
+				.pred = ft_ord_cell_resolve_ord(
+					&old_cell->lnode.prev),
+				.succ = ft_ord_cell_resolve_ord(
+					&old_cell->lnode.next),
+			};
+			int cret = ft_cell_lockset_take(ft, ctx, txn, &plan);
+
+			if (cret) {
+				/*
+				 * Nothing is held and, on the validation path,
+				 * @txn is already destroyed -- so this bail owes
+				 * only what the pre-txn bails above owe.
+				 */
+				ft_ord_cell_free_unpublished(ft, new_cell);
+				if (held_holder)
+					ft_meta_lock_release(held_holder);
+				return -EAGAIN;
+			}
+		}
 		ft_ch_audit(ft, txn, node);
 		ft_hlist_freeze_prepare(ft, ft_flip_txn_handle(txn), node);
 		if (ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
