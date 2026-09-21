@@ -12524,6 +12524,15 @@ struct ft_cell_plan {
 	 * next-of-LAST == succ.  Four locks per run, not one per cell.
 	 */
 	struct ft_ord_cell *last;
+	/*
+	 * ☞ A SPLICE MOVES THE RUN TO A NEW PAIR, so @pred and @succ are the
+	 * DESTINATION neighbours, not @cell's current ones.  The run's own ends
+	 * still have to be LOCKED -- their prev/next are written -- but
+	 * validating "prev-of-first == pred" would ask about a link the splice
+	 * is about to replace, and it is false by construction.  What must hold
+	 * at the destination is the INSERT invariant, pred->next == succ.
+	 */
+	bool splice;
 };
 
 /*
@@ -12544,7 +12553,7 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 		const struct ft_cell_plan *p)
 {
 	(void) ft;
-	if (p->cell) {
+	if (p->cell && !p->splice) {
 		const struct ft_ord_cell *last = p->last ? p->last : p->cell;
 
 		if (ft_ord_cell_resolve_ord(&p->cell->lnode.prev) != p->pred)
@@ -12554,6 +12563,7 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 		if (urcu_txn_list_is_marked(rcu_dereference(last->lnode.next)))
 			return false;	/* the run's tail already deleted */
 	} else {
+		/* insert / splice: the DESTINATION pair must still be adjacent */
 		if (!p->pred)
 			return false;
 		if (ft_ord_cell_resolve_ord(&p->pred->lnode.next) != p->succ)

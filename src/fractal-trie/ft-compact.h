@@ -621,7 +621,17 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 		{
 			struct ft_cell_plan plan = {
 				.cell = old,
-				.cell_lock_held = !h.shared,
+				/*
+				 * ☠ @h IS THE HOLDER'S ANCHOR, NOT @old'S CELL
+				 * LOCK.  The acquire above takes @holder_nf's
+				 * metadata -- a trie node -- so @old's own cell
+				 * word is NOT held by it and this plan must take
+				 * it.  Reading @h as if it covered the cell left
+				 * exactly one of the swap's three records unheld,
+				 * measured as 310,164 against 620,328 held: the
+				 * 2:1 that named which record it was.
+				 */
+				.cell_lock_held = false,
 				.pred = ft_ord_cell_resolve_ord(
 					&old->lnode.prev),
 				.succ = ft_ord_cell_resolve_ord(

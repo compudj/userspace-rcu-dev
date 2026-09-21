@@ -1595,6 +1595,25 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 				/*owner=*/ ft_flag_to_metadata(ft, st->dest),
 				(void **) slot, NULL, (void *) st->slot_value);
 		if (run) {
+			/*
+			 * ☞ THE RUN SPLICE'S FOUR CELL LOCKS.
+			 * ft_ord_cell_run_splice_edges writes exactly four
+			 * words: &run_first->lnode.prev, &run_last->lnode.next,
+			 * and the destination pair's &pred->lnode.next and
+			 * &succ->lnode.prev.  @splice selects the DESTINATION
+			 * validation (pred->next == succ), because the run's
+			 * current links are the ones this op replaces.
+			 */
+			struct ft_cell_plan plan = {
+				.cell = run->run_first,
+				.last = run->run_last,
+				.splice = true,
+				.pred = ft_ord_or_sentinel(ft, run->pred),
+				.succ = ft_ord_or_sentinel(ft, run->succ),
+			};
+
+			if (ft_cell_lockset_take(ft, NULL, st->glue->txn, &plan))
+				return URCU_TXN_STATUS_ABORT;
 			rn = ft_ord_cell_run_splice_edges(ft, run->run_first,
 				run->run_last, run->pred, run->succ, redges, 0);
 			/*
