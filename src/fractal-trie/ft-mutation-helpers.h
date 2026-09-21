@@ -12554,6 +12554,52 @@ int ft_root_attach_fence_empty(struct cds_ft *dst_ft,
  * (a later run-splice / interleave, or the source is exclusive).
  */
 #define FT_ROOT_LIST_SWAP_MAX_EDGES	5	/* root + 2 sentinel + 2 relink */
+
+/*
+ * ☠ AN UNFAILABLE PUBLISH'S CONSTRUCTED OLD VALUES, PROVED UNDER ITS LOCKS.
+ *
+ * The root / list swap publishes BUILD their list edges' expected-old from what
+ * the caller resolved -- @head_old, @tail_old, "the moved run's ends point at the
+ * sentinel" -- and never re-read the words (the 09-21 skeptic's "constructed
+ * expected-old").  Recorded MW that was still a check: the commit's CAS compared
+ * it.  Parked SW under the flip it is not -- an SW park is a blind store -- so a
+ * wrong constructed value would be overwritten silently instead of failing the
+ * commit.  The take has just locked every one of these words, so their live
+ * values cannot move under us: compare them now.
+ *
+ * The root is proved by the take itself; a slot this txn already recorded
+ * chains on its own pending value, which the engine checks.  These publishes
+ * cannot fail, so a mismatch is a broken premise to report, not a retry.
+ */
+static inline
+void ft_cell_edges_prove_unfailable(const char *who, struct ft_flip_txn *txn,
+		const struct ft_ord_cell_edge *edges, unsigned int n)
+{
+	struct urcu_txn_desc *d = txn->mtxn->desc;
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		const struct ft_ord_cell_edge *e = &edges[i];
+		struct ft_ord_cell *live;
+
+		if (e->root || ft_edge_tag(e) != URCU_TXN_TAG)
+			continue;
+		if (d && d != URCU_TXN_ENOMEM &&
+				urcu_txn_find(d, (void **) e->slot))
+			continue;
+		live = ft_ord_cell_resolve_ord(
+			(struct urcu_txn_list_node *const *) e->slot);
+		if (caa_likely(live == e->old_target))
+			continue;
+		fprintf(stderr, "FT %s: constructed old %p != live %p at slot "
+			"%p (edge %u) -- an unfailable publish's premise is "
+			"false\n", who, (void *) e->old_target, (void *) live,
+			(void *) e->slot, i);
+		fflush(stderr);
+		abort();
+	}
+}
+
 static
 void ft_root_list_swap_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag **struct_slot,
@@ -12601,6 +12647,7 @@ void ft_root_list_swap_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 		fflush(stderr);
 		abort();
 	}
+	ft_cell_edges_prove_unfailable("ROOT LIST SWAP", txn, edges, n);
 	/*
 	 * @txn is the caller-PRE-RESERVED bounded txn (every Class-G root swap
 	 * reserves in its fallible prefix), committed infallibly here -- the
@@ -15182,6 +15229,7 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 		fflush(stderr);
 		abort();
 	}
+	ft_cell_edges_prove_unfailable("DUAL ROOT SWAP", txn, edges, n);
 	(void) ft_ord_cell_flip_into(a->ft, txn, edges, n);
 }
 
