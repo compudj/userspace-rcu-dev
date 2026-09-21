@@ -11208,6 +11208,18 @@ struct ft_ord_cell_edge {
 	 * forward edge the op holds and a SKIP_X dual it may not.
 	 */
 	bool owner_held;
+	/*
+	 * THE CELL WHOSE LINK @slot IS, for an ordered-cell edge.  Recorded by
+	 * the producer because only it knows: @slot is &cell->lnode.next or
+	 * &cell->lnode.prev and the two are INDISTINGUISHABLE from the pointer
+	 * alone (lnode is the first member, so one of them IS the cell address).
+	 *
+	 * It exists so the recorder can derive the edge's nearest-ancestor
+	 * owner -- holder (@cell->parent) -> ft_lock_ctx_depth_of_climb ->
+	 * ft_anchor_meta -- which is the lock that SHOULD protect this word.
+	 * NULL for a sentinel endpoint, which no holder owns.
+	 */
+	struct ft_ord_cell *owner_cell;
 };
 
 /* Resolve an edge's engine proxy tag: unset (0) => the structural 0xF tag. */
@@ -11216,6 +11228,180 @@ uintptr_t ft_edge_tag(const struct ft_ord_cell_edge *edge)
 {
 	return edge->tag ? edge->tag : FT_FLIP_PROXY_TAG;
 }
+
+/*
+ * ☞ THE NEAREST-ANCESTOR LOCK THAT OWNS AN ORDERED-CELL EDGE.
+ *
+ * The cell sibling list was the last always-MW population of any size: 99.6% of
+ * MW_ALWAYS on the same-key contention shape, against 0.4% for the trie root
+ * (which never converts -- no node owns &ft->root).  And it was the whole of
+ * the per-node livelock, measured by ablation: the same workload with the
+ * ordered list OFF is 0/8 legs killed where list-ON is 8/8, because every cell
+ * edge arbitrated by CAS and lost.
+ *
+ * MATHIEU's rule for it is the duplicate chain's, and it is the same rule:
+ * A CELL IS PROTECTED BY ITS NEAREST ANCESTOR LOCK.  For a cell that ancestor
+ * is its HOLDER's anchor -- @cell->parent names the holder, and the anchor
+ * follows from the holder's byte DEPTH.
+ *
+ * ☠ THE DEPTH LOOKS UNAVAILABLE AND IS NOT.  A splice rewrites the cells of
+ * NEIGHBOURING KEYS, whose holders are OFF this op's descent, so the descent
+ * cannot date them directly.  ft_lock_ctx_depth_of_climb exists for exactly
+ * this: it climbs the live parent chain to the first ancestor the descent DOES
+ * date and sums the node-local spans, yielding an ABSOLUTE byte depth.  Its own
+ * header argues why that is not the RELATIVE up-walk §5.3 forbids -- the anchor
+ * still comes from the fixed schedule, so two ops that reach the node still
+ * agree (§1), which is the whole requirement.  It short-circuits at per-node
+ * and root-only, so only exponential climbs; and for CELL SIBLINGS that climb
+ * is short, because adjacent keys share a long prefix and their holders sit
+ * near each other and near the descent (Mathieu).
+ *
+ * ☠ HELD, NOT MERELY NAMED.  This answers with the anchor ONLY when the op
+ * actually holds it.  A named-but-unheld owner must keep recording MW: the SW
+ * park cannot fail, so parking one on a word this op does not exclude silently
+ * erases whatever a peer left there.  The unheld remainder is the work that
+ * follows -- widening the splice's lock set to TAKE these anchors -- and until
+ * then it degrades to exactly today's behaviour.
+ */
+/*
+ * WHY a cell edge did not convert, per reason.  The conversion is gated on the
+ * op HOLDING the nearest-ancestor lock, and it currently fires for ~2% of the
+ * class -- so the question that aims the next step is which refusal dominates:
+ * a PLUMBING one (no @ctx threaded to this producer) is cheap to close, a
+ * NOT-HELD one means the splice's lock set has to be widened to take it.
+ */
+#ifdef FT_DEBUG_CELL_OWNER
+__attribute__((weak)) unsigned long ft_cow_ok, ft_cow_noctx, ft_cow_nocell,
+	ft_cow_sentinel, ft_cow_nodepth, ft_cow_nometa, ft_cow_notheld,
+	ft_cow_reported;
+static void ft_cow_report(void) __attribute__((destructor));
+static void ft_cow_report(void)
+{
+	unsigned long t = ft_cow_ok + ft_cow_noctx + ft_cow_nocell +
+		ft_cow_sentinel + ft_cow_nodepth + ft_cow_nometa +
+		ft_cow_notheld;
+
+	if (!t || __atomic_fetch_add(&ft_cow_reported, 1, __ATOMIC_RELAXED))
+		return;
+	fprintf(stderr, "\n=== FT_CELL_OWNER: why a cell edge did or did not "
+		"park SW (total %lu) ===\n"
+		"  CONVERTED (anchor held)     %12lu  %5.1f%%\n"
+		"  no ctx threaded (PLUMBING)  %12lu  %5.1f%%\n"
+		"  no owner_cell recorded      %12lu  %5.1f%%\n"
+		"  neighbour is the sentinel   %12lu  %5.1f%%\n"
+		"  climb could not date holder %12lu  %5.1f%%\n"
+		"  holder has no metadata      %12lu  %5.1f%%\n"
+		"  anchor NOT HELD (ACQUIRE)   %12lu  %5.1f%%\n",
+		t,
+		ft_cow_ok, 100.0*ft_cow_ok/t, ft_cow_noctx, 100.0*ft_cow_noctx/t,
+		ft_cow_nocell, 100.0*ft_cow_nocell/t,
+		ft_cow_sentinel, 100.0*ft_cow_sentinel/t,
+		ft_cow_nodepth, 100.0*ft_cow_nodepth/t,
+		ft_cow_nometa, 100.0*ft_cow_nometa/t,
+		ft_cow_notheld, 100.0*ft_cow_notheld/t);
+}
+# define FT_COW(c)	uatomic_inc(&ft_cow_##c)
+#else
+# define FT_COW(c)	do { } while (0)
+#endif
+
+static inline
+struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
+		const struct ft_flip_txn *t, const struct ft_ord_cell_edge *e)
+{
+	struct cds_ft_inode_flag *holder;
+	struct cds_ft_metadata *hmeta, *anchor;
+	unsigned int depth;
+	uintptr_t snap;
+	bool ratified;
+
+	/*
+	 * ☠ @ctx IS OPTIONAL ON AN EDGE: only the producers that route through
+	 * ft_pub_rec thread one, and both the climb and holds() need it.  No
+	 * context is not "not held" -- it is "this producer cannot answer" --
+	 * but the conservative action is the same, so it falls through to MW.
+	 */
+	/*
+	 * ☞ @ctx IS NOT THE ONLY WITNESS, AND IT IS THE ONE THAT IS USUALLY
+	 * ABSENT.  Measured: 79,476 of 79,476 cell edges refused here on "no
+	 * ctx" alone -- not a single one reached the held/not-held question --
+	 * because @ctx is threaded only by the producers that route through
+	 * ft_pub_rec, and no cell producer does.
+	 *
+	 * The TXN is available at every one of those sites, and its lock
+	 * registry answers the same question NARROWLY: ft_flip_txn_owns is a
+	 * positive proof of holding when it HITS, and its own header warns that
+	 * a miss means only "the registry cannot see this hold".  That
+	 * asymmetry is exactly what gating an unfailable park needs -- hit,
+	 * park; miss, stay MW, which is conservative and always sound.
+	 *
+	 * ☠ THE DEPTH STILL NEEDS A DESCENT AT COARSE SPACINGS, and only @ctx
+	 * carries one.  At PER-NODE it does not: ft_anchor_meta returns the
+	 * node itself there, so the anchor IS the holder and no climb runs --
+	 * which is the spacing the livelock lives in.  So this converts
+	 * per-node from the txn alone, and exponential waits on the @ctx
+	 * plumbing rather than blocking on it.
+	 */
+	if (!e->ctx && !t) {
+		FT_COW(noctx);
+		return NULL;
+	}
+	if (!e->ctx && ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
+		FT_COW(noctx);		/* no descent to date the holder */
+		return NULL;
+	}
+	if (!e->owner_cell) {
+		FT_COW(nocell);
+		return NULL;
+	}
+	/*
+	 * ☠ THE SENTINEL IS NOT A CELL.  @ft->ord_sentinel.node is a bare
+	 * urcu_txn_list_node, and ft_ord_cell_of() is a 0-offset cast, so a
+	 * neighbour resolved off the end ALIASES it as a "cell" whose ->parent
+	 * reads past the sentinel into whatever follows it in struct cds_ft.
+	 * ft_ord_is_end is the trie's own test for exactly this.  A splice at
+	 * the head or tail of the key order takes that branch every time, which
+	 * is why it SEGVs deterministically -- ft_inv at test 46 and ft_unit at
+	 * test 24, all four legs, the first time this ran.
+	 *
+	 * No holder means no nearest ancestor, so the edge stays MW.
+	 */
+	if (ft_ord_is_end(ft, e->owner_cell)) {
+		FT_COW(sentinel);
+		return NULL;
+	}
+	holder = e->owner_cell->parent;
+	if (!holder || ft_node_flip_proxy(holder) || ft_node_external(holder)) {
+		FT_COW(nocell);
+		return NULL;
+	}
+	if (e->ctx) {
+		if (!ft_lock_ctx_depth_of_climb(ft, e->ctx, holder, &depth))
+			{ FT_COW(nodepth); return NULL; }	/* undatable */
+	} else {
+		depth = 0;		/* per-node: the anchor is the node */
+	}
+	hmeta = ft_flag_to_metadata((struct cds_ft *) ft, holder);
+	if (!hmeta) {
+		FT_COW(nometa);
+		return NULL;
+	}
+	anchor = ft_anchor_meta(ft, e->ctx ? ft_lock_ctx_descent(e->ctx) : NULL,
+			holder, hmeta, depth);
+	if (!anchor) {
+		FT_COW(nometa);
+		return NULL;
+	}
+	if (e->ctx ? !ft_lock_ctx_holds(e->ctx, anchor, &snap, &ratified)
+		   : !ft_flip_txn_owns(t, anchor)) {
+		FT_COW(notheld);
+		return NULL;
+	}
+	FT_COW(ok);
+	return anchor;
+}
+
+
 
 /*
  * Deferred in-place leaf-delete publish (the remove dual of
@@ -11372,6 +11558,7 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
 	if (hn_old != hn_new) {
 		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &ft->ord_sentinel.node.next;
+		edges[n].owner_cell = NULL;	/* not a cell link */
 		edges[n].old_target = hn_old;
 		edges[n].new_target = hn_new;
 		n++;
@@ -11379,6 +11566,7 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
 	if (tp_old != tp_new) {
 		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &ft->ord_sentinel.node.prev;
+		edges[n].owner_cell = NULL;	/* not a cell link */
 		edges[n].old_target = tp_old;
 		edges[n].new_target = tp_new;
 		n++;
@@ -11395,6 +11583,7 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
 		if (head_new) {
 			edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 			edges[n].slot = (struct ft_ord_cell **) &head_new->lnode.prev;
+			edges[n].owner_cell = head_new;
 			edges[n].old_target = dest;
 			edges[n].new_target = self;
 			n++;
@@ -11402,6 +11591,7 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
 		if (tail_new) {
 			edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 			edges[n].slot = (struct ft_ord_cell **) &tail_new->lnode.next;
+			edges[n].owner_cell = tail_new;
 			edges[n].old_target = dest;
 			edges[n].new_target = self;
 			n++;
@@ -11555,6 +11745,7 @@ void ft_root_list_swap_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 	assert(struct_slot == &ft->root);
 	edges[n].slot = (struct ft_ord_cell **) struct_slot;
+	edges[n].owner_cell = NULL;	/* not a cell link */
 	edges[n].old_target = (struct ft_ord_cell *) struct_old;
 	edges[n].new_target = (struct ft_ord_cell *) struct_new;
 	edges[n].root = true;		/* a root records MW: no node owns it */
@@ -13561,6 +13752,7 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 				->parent_word = ft_trie_parent(r->ft);
 		assert(r->slot == &r->ft->root);
 		edges[n].slot = (struct ft_ord_cell **) r->slot;
+		edges[n].owner_cell = NULL;	/* not a cell link */
 		edges[n].old_target = (struct ft_ord_cell *) r->old_root;
 		edges[n].new_target = (struct ft_ord_cell *) r->new_root;
 		/*
@@ -13590,12 +13782,14 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 			edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 			edges[n].slot = (struct ft_ord_cell **)
 				&r->head_old->lnode.prev;
+			edges[n].owner_cell = r->head_old;
 			edges[n].old_target = self;
 			edges[n].new_target = NULL;
 			n++;
 			edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 			edges[n].slot = (struct ft_ord_cell **)
 				&r->tail_old->lnode.next;
+			edges[n].owner_cell = r->tail_old;
 			edges[n].old_target = self;
 			edges[n].new_target = NULL;
 			n++;
@@ -13710,11 +13904,13 @@ unsigned int ft_ord_cell_run_detach_edges(struct cds_ft *ft,
 	 */
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].owner_cell = pred;
 	edges[n].old_target = first;
 	edges[n].new_target = succ;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].owner_cell = succ;
 	edges[n].old_target = last;
 	edges[n].new_target = pred;
 	n++;
@@ -13871,6 +14067,7 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 
 	for (i = 0; i < n; i++) {
 		uintptr_t tag = ft_edge_tag(&edges[i]);
+		struct cds_ft_metadata *cell_owner;
 
 		/*
 		 * PER-EDGE KIND, exactly as in the record-only sibling
@@ -13886,6 +14083,13 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 		 * Unlike the sibling this path plants no §4.B installed-child
 		 * guard; that difference is pre-existing and untouched here.
 		 */
+		/*
+		 * The cell's nearest-ancestor owner, when the op holds it.
+		 * Derived once here rather than inside the else arm, which is
+		 * brace-less and cannot carry a declaration.
+		 */
+		cell_owner = tag != FT_FLIP_PROXY_TAG ?
+			ft_cell_edge_owner(ft, t, &edges[i]) : NULL;
 		if (edges[i].root)
 			ft_flip_txn_record_root(t, (void **) edges[i].slot,
 				(void *) edges[i].old_target,
@@ -13928,6 +14132,17 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 			 * branch: the class argument does not exist outside the
 			 * instrumented build, so this costs that build nothing.
 			 */
+			if (cell_owner)
+				/*
+				 * The cell's NEAREST ANCESTOR LOCK, and the op
+				 * holds it: this edge is excluded and may park.
+				 * See ft_cell_edge_owner.
+				 */
+				ft_flip_txn_record_tag(t, cell_owner,
+					(void **) edges[i].slot,
+					(void *) edges[i].old_target,
+					(void *) edges[i].new_target, tag);
+			else
 			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
 				(void *) edges[i].old_target,
 				(void *) edges[i].new_target, tag
@@ -14106,11 +14321,22 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target, tag);
-		} else
-			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
-				(void *) edges[i].old_target,
-				(void *) edges[i].new_target, tag
-				FT_TK_MWA(FT_TK_MWA_CELL));
+		} else {
+			struct cds_ft_metadata *cell_owner =
+				ft_cell_edge_owner(ft, t, &edges[i]);
+
+			if (cell_owner)
+				ft_flip_txn_record_tag(t, cell_owner,
+					(void **) edges[i].slot,
+					(void *) edges[i].old_target,
+					(void *) edges[i].new_target, tag);
+			else
+				ft_flip_txn_record_tag_mw(t,
+					(void **) edges[i].slot,
+					(void *) edges[i].old_target,
+					(void *) edges[i].new_target, tag
+					FT_TK_MWA(FT_TK_MWA_CELL));
+		}
 	}
 }
 
@@ -14366,16 +14592,19 @@ unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
 	(void) ft;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].owner_cell = pred;
 	edges[n].old_target = cell;
 	edges[n].new_target = succ;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].owner_cell = succ;
 	edges[n].old_target = cell;
 	edges[n].new_target = pred;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* deletion mark: see the comment above */
 	edges[n].slot = (struct ft_ord_cell **) &cell->lnode.next;
+	edges[n].owner_cell = cell;
 	edges[n].old_target = succ;
 	edges[n].new_target = (struct ft_ord_cell *)
 		urcu_txn_list_set_mark(ft_ord_cell_lnode(succ));
@@ -14516,11 +14745,13 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
 	 */
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].owner_cell = pred;
 	edges[n].old_target = old_cell;
 	edges[n].new_target = new_cell;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].owner_cell = succ;
 	edges[n].old_target = old_cell;
 	edges[n].new_target = new_cell;
 	n++;
@@ -14533,6 +14764,7 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
 	 */
 	edges[n].tag = URCU_TXN_TAG;
 	edges[n].slot = (struct ft_ord_cell **) &old_cell->lnode.next;
+	edges[n].owner_cell = old_cell;
 	edges[n].old_target = succ;
 	edges[n].new_target = (struct ft_ord_cell *)
 		urcu_txn_list_set_mark(ft_ord_cell_lnode(succ));
@@ -14724,6 +14956,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	unsigned int n = 0;
 
 	edges[n].slot = (struct ft_ord_cell **) struct_slot;
+	edges[n].owner_cell = NULL;	/* not a cell link */
 	edges[n].old_target = (struct ft_ord_cell *) struct_old;
 	edges[n].new_target = (struct ft_ord_cell *) struct_new;
 	edges[n].owner = slot_owner;
@@ -14793,6 +15026,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		 * instead.  See ft_hlist_freeze_sole_prepare.
 		 */
 		edges[n].slot = (struct ft_ord_cell **) &freeze_leaf->next;
+		edges[n].owner_cell = NULL;	/* not a cell link */
 		edges[n].old_target = NULL;
 		edges[n].new_target = (struct ft_ord_cell *)
 			ft_hlist_set_mark(NULL);
@@ -15162,6 +15396,7 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 
 	for (i = 0; i < rec->n; i++) {
 		edges[n].slot = (struct ft_ord_cell **) rec->slot[i];
+		edges[n].owner_cell = NULL;	/* not a cell link */
 		edges[n].old_target = (struct ft_ord_cell *) rec->old_val[i];
 		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
 		edges[n].root = rec->root[i];
@@ -15585,21 +15820,25 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
 	/* The run's OUTER links: src neighbours -> dst neighbours. */
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &run_first->lnode.prev;
+	edges[n].owner_cell = run_first;
 	edges[n].old_target = src_pred;
 	edges[n].new_target = pred;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &run_last->lnode.next;
+	edges[n].owner_cell = run_last;
 	edges[n].old_target = src_succ;
 	edges[n].new_target = succ;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].owner_cell = pred;
 	edges[n].old_target = succ;
 	edges[n].new_target = run_first;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].owner_cell = succ;
 	edges[n].old_target = pred;
 	edges[n].new_target = run_last;
 	n++;
@@ -15662,22 +15901,26 @@ unsigned int ft_ord_cell_run_resplice_edges(struct cds_ft *dst,
 	/* The run's OUTER links: src neighbours -> dst neighbours. */
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &run_first->lnode.prev;
+	edges[n].owner_cell = run_first;
 	edges[n].old_target = src_pred;
 	edges[n].new_target = pred;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &run_last->lnode.next;
+	edges[n].owner_cell = run_last;
 	edges[n].old_target = src_succ;
 	edges[n].new_target = succ;
 	n++;
 	/* The dst neighbours' back-edges, as in the cross-trie form. */
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].owner_cell = pred;
 	edges[n].old_target = succ;
 	edges[n].new_target = run_first;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].owner_cell = succ;
 	edges[n].old_target = pred;
 	edges[n].new_target = run_last;
 	n++;
@@ -15775,11 +16018,13 @@ unsigned int ft_ord_cell_run_replace_edges(struct cds_ft *dst,
 
 		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &s_first->lnode.prev;
+		edges[n].owner_cell = s_first;
 		edges[n].old_target = s_pred;
 		edges[n].new_target = pred;
 		n++;
 		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &s_last->lnode.next;
+		edges[n].owner_cell = s_last;
 		edges[n].old_target = s_succ;
 		edges[n].new_target = succ;
 		n++;
@@ -15792,11 +16037,13 @@ unsigned int ft_ord_cell_run_replace_edges(struct cds_ft *dst,
 	 */
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].owner_cell = pred;
 	edges[n].old_target = d_first;
 	edges[n].new_target = new_first;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].owner_cell = succ;
 	edges[n].old_target = d_last;
 	edges[n].new_target = new_last;
 	n++;
@@ -15874,6 +16121,7 @@ enum urcu_txn_status ft_ord_cell_flip_rec_replace(struct cds_ft *ft,
 
 	for (i = 0; i < rec->n; i++) {
 		edges[n].slot = (struct ft_ord_cell **) rec->slot[i];
+		edges[n].owner_cell = NULL;	/* not a cell link */
 		edges[n].old_target = (struct ft_ord_cell *) rec->old_val[i];
 		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
 		edges[n].root = rec->root[i];
@@ -15941,11 +16189,13 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].owner_cell = pred;
 	edges[n].old_target = first;
 	edges[n].new_target = succ;
 	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].owner_cell = succ;
 	edges[n].old_target = last;
 	edges[n].new_target = pred;
 	n++;
