@@ -8484,6 +8484,10 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
  *
  * Default 1 ms, i.e. byte-identical to what every existing user compiled.
  */
+# ifndef FT_REMOVE_BUSY_ATTEMPTS
+/* 0 disables; a remove retrying more than this reports its breakdown. */
+#  define FT_REMOVE_BUSY_ATTEMPTS	200
+# endif
 # ifndef FT_REMOVE_SLOW_NS
 #  define FT_REMOVE_SLOW_NS	1000000
 # endif
@@ -8695,6 +8699,24 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	{
 		uint64_t wall = ft_dbg_now_ns() - ft_remove_t0;
 
+		/*
+		 * ☞ BUSY IS NOT SLOW, and only one of them was reported.
+		 * This block fires on WALL TIME, so a remove that retried two
+		 * thousand times CHEAPLY never printed: the run that measured
+		 * max-retry 38,244 produced exactly ONE "SLOW" line, and it had
+		 * attempts=0 -- a grace-period wait, not a retry storm.  Fire on
+		 * the attempt count too, which is the axis the retry question is
+		 * actually asked on.
+		 */
+		if (FT_REMOVE_BUSY_ATTEMPTS &&
+				caa_unlikely(ft_remove_attempts >
+					FT_REMOVE_BUSY_ATTEMPTS))
+			fprintf(stderr, "FT REMOVE BUSY: attempts=%u "
+				"dirtyLOCK=%u dirtyOTHER=%u cabort=%u "
+				"wall_us=%llu\n",
+				ft_remove_attempts, ft_dbg_acq_dirty_lock,
+				ft_dbg_acq_dirty_other, ft_dbg_acq_cabort,
+				(unsigned long long) (wall / 1000));
 		if (FT_REMOVE_SLOW_NS && caa_unlikely(wall > FT_REMOVE_SLOW_NS))
 			fprintf(stderr, "FT REMOVE SLOW: wall_us=%llu "
 				"attempts=%u dirtyLOCK=%u dirtyOTHER=%u "

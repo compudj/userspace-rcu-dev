@@ -30,6 +30,10 @@
  *     CAS-install, abort) entirely and cannot contention-abort.
  */
 
+#ifdef URCU_TXN_RETRY_TRAP
+#include <execinfo.h>
+#include <stdio.h>
+#endif
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -815,6 +819,34 @@ void urcu_txn_begin(struct urcu_txn *txn)
 {
 	URCU_TXN_STAT_INC(urcu_txn_stat_begin);
 	URCU_TXN_STAT_MAX(urcu_txn_stat_maxretry, txn->retry);
+#ifdef URCU_TXN_RETRY_TRAP
+	/*
+	 * ☞ NAME THE STARVING TXN, ONCE.  @urcu_txn_stat_maxretry says SOME
+	 * txn retried N times and nothing says which -- and the FT's own op
+	 * retry counter is a DIFFERENT counter (ft_op_retry_tick's attempts),
+	 * so a cap on that one can sit unfired while this one is in the tens of
+	 * thousands.  One backtrace at the threshold answers what neither count
+	 * can.  Printed once per process: the second one tells you nothing the
+	 * first did not.
+	 */
+	if (caa_unlikely(txn->retry == URCU_TXN_RETRY_TRAP)) {
+		static unsigned long trapped;
+
+		if (!__atomic_fetch_add(&trapped, 1, __ATOMIC_RELAXED)) {
+			void *bt[24];
+			int n = backtrace(bt, 24);
+
+			fprintf(stderr, "\n=== URCU_TXN_RETRY_TRAP: a txn reached "
+				"%u retries (domain %p, in_fallback %d) ===\n",
+				(unsigned int) URCU_TXN_RETRY_TRAP,
+				(void *) txn->domain,
+				(int) uatomic_load(&txn->in_fallback,
+					CMM_RELAXED));
+			backtrace_symbols_fd(bt, n, 2);
+			fflush(stderr);
+		}
+	}
+#endif
 	if (!txn->domain)
 		URCU_TXN_STAT_INC(urcu_txn_stat_nodomain);
 	if (uatomic_load(&txn->in_fallback, CMM_RELAXED))

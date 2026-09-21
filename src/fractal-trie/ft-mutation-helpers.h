@@ -9227,6 +9227,70 @@ static __thread struct cds_fair_mutex_node ft_acq_lane_waiter;
 #define FT_ACQ_LANE_AGE		4
 #endif
 
+/*
+ * ☞ DOES THE LANE ACTUALLY ENGAGE?  §3.3 of the cell-list design rests on it:
+ * "starvation is handled by the lane ... this is the arbitration the engine
+ * acquire used to provide and the ordered take put back".  That is a PREMISE,
+ * and there are five gates in front of it.  Counting WHICH one fires is the
+ * difference between "ordered takes livelock" and "the arbitration the design
+ * assumed is not reachable from these sites".
+ */
+#ifdef FT_DEBUG_LANE
+__attribute__((weak)) unsigned long ft_lane_calls, ft_lane_no_ctx,
+	ft_lane_no_dom, ft_lane_too_young, ft_lane_in_fallback,
+	ft_lane_holds_something, ft_lane_engaged, ft_lane_reported;
+static void ft_lane_report(void) __attribute__((destructor));
+static void ft_lane_report(void)
+{
+	unsigned long c = ft_lane_calls;
+
+	if (!c || __atomic_fetch_add(&ft_lane_reported, 1, __ATOMIC_RELAXED))
+		return;
+	fprintf(stderr, "\n=== FT_ACQ_LANE: did the arbitration engage? "
+		"(calls %lu) ===\n"
+		"  ENGAGED (queued on the lane) %12lu  %5.1f%%\n"
+		"  refused: no ctx/op/ft        %12lu  %5.1f%%\n"
+		"  refused: no domain           %12lu  %5.1f%%\n"
+		"  refused: too young           %12lu  %5.1f%%\n"
+		"  refused: in fallback         %12lu  %5.1f%%\n"
+		"  refused: op HOLDS SOMETHING  %12lu  %5.1f%%\n",
+		c,
+		ft_lane_engaged, 100.0*ft_lane_engaged/c,
+		ft_lane_no_ctx, 100.0*ft_lane_no_ctx/c,
+		ft_lane_no_dom, 100.0*ft_lane_no_dom/c,
+		ft_lane_too_young, 100.0*ft_lane_too_young/c,
+		ft_lane_in_fallback, 100.0*ft_lane_in_fallback/c,
+		ft_lane_holds_something, 100.0*ft_lane_holds_something/c);
+#ifdef URCU_TXN_FALLBACK_STATS
+	/*
+	 * ☞ AND THE OTHER DOOR TO THE SAME LANE.  urcu_txn__enter_fallback
+	 * takes cds_fair_mutex_lock(&txn->domain->lock) -- the SAME fair mutex
+	 * ft_acq_lane_backoff queues on -- gated on the TXN's retry age, which
+	 * is what ft_txn_attempt_bail feeds when it drains @ft_acq_contended
+	 * into urcu_txn_conflict().  So the FT-side counter is CONVERTED, not
+	 * discarded, and "the lane never engages" is only true of THIS door.
+	 */
+	fprintf(stderr,
+		"  --- the engine's door to the same lane ---\n"
+		"  txn begin                    %12lu\n"
+		"  txn wanted fallback          %12lu  %5.1f%% of begins\n"
+		"  txn ESCALATED (took the lane)%12lu  %5.1f%% of begins\n"
+		"  max retry seen               %12lu\n",
+		urcu_txn_stat_begin,
+		urcu_txn_stat_wantfb,
+		urcu_txn_stat_begin ?
+			100.0*urcu_txn_stat_wantfb/urcu_txn_stat_begin : 0.0,
+		urcu_txn_stat_escalate,
+		urcu_txn_stat_begin ?
+			100.0*urcu_txn_stat_escalate/urcu_txn_stat_begin : 0.0,
+		urcu_txn_stat_maxretry);
+#endif
+}
+# define FT_LANE(c)	uatomic_inc(&ft_lane_##c)
+#else
+# define FT_LANE(c)	do { } while (0)
+#endif
+
 static inline
 void ft_acq_lane_backoff(const struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx)
@@ -9234,13 +9298,15 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 	const struct rcu_flavor_struct *flavor;
 	struct urcu_txn_domain *dom;
 
+	FT_LANE(calls);
+
 	if (!ctx || !ctx->op || !ft)
-		return;
+		{ FT_LANE(no_ctx); return; }
 	dom = ctx->op->domain;
 	if (!dom)
-		return;
+		{ FT_LANE(no_dom); return; }
 	if (ft_acq_contended < FT_ACQ_LANE_AGE)
-		return;
+		{ FT_LANE(too_young); return; }
 	/*
 	 * ☠ AND NOT IF THIS THREAD IS ALREADY IN THE LANE.  urcu_txn_begin
 	 * escalates into the SAME domain->lock (urcu_txn__enter_fallback), and
@@ -9258,9 +9324,10 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 	 * and urcu_txn_begin at once -- which is the cycle written out.
 	 */
 	if (urcu_txn_in_fallback())
-		return;
+		{ FT_LANE(in_fallback); return; }
 	if (!ft_lock_ctx_holds_nothing(ctx))
-		return;		/* see ft_lock_ctx_holds_nothing: lane cycle */
+		{ FT_LANE(holds_something); return; }		/* see ft_lock_ctx_holds_nothing: lane cycle */
+	FT_LANE(engaged);
 	flavor = ft->group->flavor;
 	flavor->thread_offline();
 	cds_fair_mutex_lock(&dom->lock, &ft_acq_lane_waiter);
