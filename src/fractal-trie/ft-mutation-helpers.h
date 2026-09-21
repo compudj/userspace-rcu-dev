@@ -9140,7 +9140,7 @@ int ft_dlm_lock_now(struct cds_ft_metadata *meta, uintptr_t *snap)
 static inline
 bool ft_lock_set_order_by_anchor(const struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx, const struct ft_dlm_member *set,
-		int nr, int *order)
+		int nr, int *order, struct cds_ft_metadata **anchors)
 {
 	struct cds_ft_metadata *key[FT_LOCK_ORDER_MAX];
 	int i, j;
@@ -9167,6 +9167,23 @@ bool ft_lock_set_order_by_anchor(const struct cds_ft *ft,
 		key[i] = set[i].nf ?
 			ft_anchor_meta(ft, ft_lock_ctx_descent(ctx),
 				set[i].nf, set[i].node, set[i].depth) : NULL;
+		/*
+		 * ☞ KEEP THE RESOLVED ANCHOR: the TAKE uses THIS value rather
+		 * than resolving ft_anchor_meta a second time.
+		 *
+		 * ☠ TWO RESOLUTIONS ARE TWO ANSWERS.  The sort runs up front and
+		 * the take ran per member, against a tree peers are mutating --
+		 * and a member's anchor MOVES when a coverer splits (§5's
+		 * stale-anchor case).  If it moved in between, the takes would
+		 * execute in an order that is not ascending in the addresses
+		 * ACTUALLY locked, which is the one precondition the plain-CAS
+		 * takes rest on: with a total order no cycle can form, without
+		 * one nothing stops a deadlock.  Resolving once makes "the word
+		 * we sorted" and "the word we lock" the same object by
+		 * construction, and costs one ft_anchor_meta per member instead
+		 * of two.
+		 */
+		anchors[i] = key[i];
 		order[i] = i;
 	}
 	for (i = 1; i < nr; i++) {
@@ -10129,6 +10146,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 #ifdef FEATURE_FT_LOCK_TAKE_ORDERED
 	bool ordered = false;
 	int lock_order[FT_LOCK_ORDER_MAX];
+	struct cds_ft_metadata *lock_anchor[FT_LOCK_ORDER_MAX];
 	struct ft_acq_guard guards[FT_ACQ_GUARD_MAX];
 	int nr_guards = 0;
 #endif
@@ -10299,7 +10317,8 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * so nothing is allocated, nothing is committed, and nothing is handed
 	 * to call_rcu.  @acq stays NULL and only the fallback builds one.
 	 */
-	ordered = ft_lock_set_order_by_anchor(ft, ctx, set, nr, lock_order);
+	ordered = ft_lock_set_order_by_anchor(ft, ctx, set, nr, lock_order,
+			lock_anchor);
 	acq = NULL;
 	if (!ordered)
 #endif
@@ -10364,8 +10383,20 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			do { FT_DBG_ACQ_SITE(); goto eagain; } while (0);
 		}
 #endif
+		/*
+		 * The anchor the SORT resolved, not a fresh one -- see the note
+		 * in ft_lock_set_order_by_anchor.  Only the unordered fallback
+		 * (a set wider than FT_LOCK_ORDER_MAX, which takes no CASes and
+		 * so needs no total order) resolves here.
+		 */
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+		lock = ordered ? lock_anchor[i] :
+			ft_anchor_meta(ft, ft_lock_ctx_descent(ctx), set[i].nf,
+				node, set[i].depth);
+#else
 		lock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx), set[i].nf,
 			node, set[i].depth);
+#endif
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 		ft_sa_check(fn, line, ft, ctx, set[i].nf, node, set[i].depth,
 			lock);
