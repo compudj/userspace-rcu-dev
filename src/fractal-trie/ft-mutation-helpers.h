@@ -9148,8 +9148,25 @@ bool ft_lock_set_order_by_anchor(const struct cds_ft *ft,
 	if (nr > FT_LOCK_ORDER_MAX)
 		return false;
 	for (i = 0; i < nr; i++) {
-		key[i] = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx),
-			set[i].nf, set[i].node, set[i].depth);
+		/*
+		 * ☠ A HOLE IN THE SET IS NOT A MEMBER.  Callers fill @set
+		 * POSITIONALLY ({C, P, GP}) and leave the absent ones with
+		 * @nf NULL -- the take loop below skips them with
+		 * `if (!set[i].nf) continue`, and this sort must skip them
+		 * too.  ft_anchor_meta dereferences @node in its own assert,
+		 * so handing it a NULL member SEGVs any build that keeps
+		 * asserts: measured as a crash in ft_inv test 1 at exponential
+		 * and root-only, invisible under -DNDEBUG (the deref is inside
+		 * the assert) and invisible at per-node (that arm returns
+		 * @node before reaching it).
+		 *
+		 * NULL sorts first and the take skips it, so the surviving
+		 * members keep their relative order -- which is all the
+		 * deadlock argument needs.
+		 */
+		key[i] = set[i].nf ?
+			ft_anchor_meta(ft, ft_lock_ctx_descent(ctx),
+				set[i].nf, set[i].node, set[i].depth) : NULL;
 		order[i] = i;
 	}
 	for (i = 1; i < nr; i++) {
