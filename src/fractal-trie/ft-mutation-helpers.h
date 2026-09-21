@@ -1133,8 +1133,15 @@ extern unsigned long cds_ft_probe_promote_guarded;
 		(t)->dbg_root_slot = (ft) ?				\
 			(void **) &(ft)->root : NULL;			\
 	} while (0)
+/*
+ * ☞ STAGE 5 RETIRED "no lock-set can own it": @root_lock owns it.  So the rule
+ * the detector enforces is now the ownership rule every other word has -- a
+ * root reaches the dispatching recorder only with its lock held, which is the
+ * one route ft_flip_txn_record_root's held arm takes.
+ */
 # define FT_ROOT_ASSERT_NOT_ROOT(t, slot)				\
-	urcu_assert_debug((void **) (slot) != (t)->dbg_root_slot)
+	urcu_assert_debug((void **) (slot) != (t)->dbg_root_slot ||	\
+		ft_flip_txn_holds((t), &(t)->ft->root_lock))
 #else
 # define FT_ROOT_ASSERT_TXN_FIELD
 # define FT_ROOT_ASSERT_INIT(t, ft)	do { (void) (ft); } while (0)
