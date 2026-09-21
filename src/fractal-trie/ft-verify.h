@@ -346,6 +346,45 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 			 */
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(node->prev);
 
+			/*
+			 * ☞ THE BACK CHANNEL IS CHECKED FOR A PARKED PROXY
+			 * BEFORE IT IS COMPARED, and that ordering is the whole
+			 * point of these two lines.
+			 *
+			 * ft_verify_no_proxy_at_rest() was applied only to the
+			 * FORWARD edges -- root, child slot, cn->child,
+			 * compressed skip_slot, external_nodes -- so the words
+			 * that name a node's PARENT were the one reachable class
+			 * it never looked at.  Those are exactly the words the
+			 * ordered-cell SW conversion moved onto the engine, and
+			 * a raw compare of an unresolved type-7 proxy against a
+			 * resolved owner cannot match, so the failure surfaced
+			 * as the generic mismatch below:
+			 *
+			 *   head ... cell ... {parent 0x..3bf, node N}
+			 *         != expected {owner 0x..c0b, node N}
+			 *
+			 * -- a line that names neither the class nor the cure,
+			 * and whose low three bits (7) were the only thing that
+			 * distinguished "an unsettled slot" from "a mis-wired
+			 * trie".  Every live reader of this word resolves first
+			 * (ft-iter.h, ft-lookup-helpers.h, ft-helpers.h: the
+			 * RESOLVE-FIRST contract in ft-helpers.h); the verifier
+			 * deliberately does NOT, because at rest -- and
+			 * cds_ft_verify runs with the writer between operations
+			 * -- a proxy here IS the defect rather than a value to
+			 * be resolved through.  So report it as itself.
+			 */
+			if (ft_verify_no_proxy_at_rest(out,
+					"external head prev (cell link)",
+					(struct cds_ft_inode_flag *) node->prev,
+					owner_flag, depth))
+				return -1;
+			if (!ft_node_external((struct cds_ft_inode_flag *) node->prev) &&
+			    ft_verify_no_proxy_at_rest(out,
+					"external head cell->parent",
+					cell->parent, owner_flag, depth))
+				return -1;
 			if (ft_node_external((struct cds_ft_inode_flag *) node->prev) ||
 			    (void *) ft_parent_prefix_strip(cell->parent) !=
 					(void *) owner_flag ||
@@ -363,6 +402,11 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 				return -1;
 		} else if (prev == NULL) {
 			/* List off: a head's prev is the owner (flagged parent) directly. */
+			/* Same class as the cell branch above: name the proxy. */
+			if (ft_verify_no_proxy_at_rest(out, "external head prev",
+					(struct cds_ft_inode_flag *) node->prev,
+					owner_flag, depth))
+				return -1;
 			if ((void *) ft_parent_prefix_strip(
 					(struct cds_ft_inode_flag *) node->prev) !=
 					(void *) owner_flag) {
@@ -375,11 +419,24 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 					(struct cds_ft_inode_flag *) node->prev,
 					depth) < 0)
 				return -1;
-		} else if (node->prev != expected_prev) {
-			if (out)
-				fprintf(out, "ft_verify: depth %u: external chain node %p prev %p != predecessor %p\n",
-					depth, node, node->prev, expected_prev);
-			return -1;
+		} else {
+			/*
+			 * Interior chain link.  Same reason as the two head
+			 * branches: an unresolved proxy here would be reported
+			 * as "prev != predecessor", which reads as a broken
+			 * chain rather than an unsettled slot.
+			 */
+			if (ft_verify_no_proxy_at_rest(out,
+					"external chain node prev",
+					(struct cds_ft_inode_flag *) node->prev,
+					(struct cds_ft_inode_flag *) node, depth))
+				return -1;
+			if (node->prev != expected_prev) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: external chain node %p prev %p != predecessor %p\n",
+						depth, node, node->prev, expected_prev);
+				return -1;
+			}
 		}
 		(void) check_path;
 		(void) group;
