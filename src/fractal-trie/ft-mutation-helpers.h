@@ -11597,6 +11597,57 @@ struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
 	return anchor;
 }
 
+/*
+ * THE ACQUIRE SIDE OF ft_cell_edge_owner'S QUESTION.
+ *
+ * That function answers "does this op HOLD the cell's nearest-ancestor lock?"
+ * and records MW when it does not.  This one builds the lock-set member that
+ * would make the answer yes, so a splice can TAKE the neighbour anchors it is
+ * about to write instead of falling back.
+ *
+ * ☠ THE TWO PREDICATES MUST AGREE, WORD FOR WORD.  A guard and the operation it
+ * guards that share a predicate and disagree on one term is a defect this trie
+ * has already paid for (@7692ad8f).  If this acquires an anchor
+ * ft_cell_edge_owner would not have named, the op holds a lock nothing uses; if
+ * it names a DIFFERENT anchor, the op holds the wrong word and the edge records
+ * MW anyway -- sound, but the widening silently buys nothing.  So the bail
+ * sequence below mirrors ft_cell_edge_owner's exactly: sentinel, then
+ * NULL/proxy/external holder, then metadata.
+ *
+ * ☞ PER-NODE ONLY, for the same reason.  ft_cell_edge_owner derives its depth
+ * from @e->ctx, and no cell producer threads one (measured 79,476 of 79,476),
+ * so it takes the `depth = 0` per-node arm -- where ft_anchor_meta returns the
+ * holder itself.  Climbing for a depth HERE would name a coarse-spacing anchor
+ * the checker never asks about.  At a coarse spacing it refuses every cell edge
+ * regardless, so there is nothing to acquire for.
+ *
+ * Returns false when no anchor is derivable; the edge then records MW, which is
+ * the sound default and exactly today's behaviour.
+ */
+static inline
+bool ft_cell_lock_member(const struct cds_ft *ft,
+		const struct ft_ord_cell *cell, struct ft_dlm_member *out)
+{
+	struct cds_ft_inode_flag *holder;
+	struct cds_ft_metadata *hmeta;
+
+	if (!FT_CELL_SW_ENABLED)
+		return false;		/* nothing parks; nothing to widen for */
+	if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE)
+		return false;
+	if (ft_ord_is_end(ft, cell))
+		return false;		/* the sentinel owns no anchor */
+	holder = cell->parent;
+	if (!holder || ft_node_flip_proxy(holder) || ft_node_external(holder))
+		return false;
+	hmeta = ft_flag_to_metadata((struct cds_ft *) ft, holder);
+	if (!hmeta)
+		return false;
+	*out = (struct ft_dlm_member){ .nf = holder, .node = hmeta,
+		.depth = 0 };
+	return true;
+}
+
 
 
 /*

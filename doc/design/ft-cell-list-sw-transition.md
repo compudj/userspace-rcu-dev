@@ -188,6 +188,56 @@ Two steps, not four -- the sentinel is not a blocker (see the table above).
    `ft-remove.h:4845` (`ft_detach_node`'s commit, 9,488) and `:1519` (75) take
    the same treatment.
 
+   ### ☠☠ ATTEMPTED 2026-09-21 AND IT LIVELOCKS — measured, not predicted
+
+   The widening above was implemented for `ft_promote_head` and **reverted**.
+   Patch kept at
+   `fractal-trie-review-2026-06/widen-remove-neighbour-anchors-LIVELOCKS-2026-09-21.patch`.
+
+   `inv_concurrent_same_key_removes`, filtered, per-node, list-off:
+
+   | build | result |
+   |---|---|
+   | widened | **rc=124 (hang), twice** |
+   | same tree, widening reverted | rc=0, census 55.6% / 14.3% / 30.1% |
+
+   Matched control: same tree, same flags, same command, one file reverted.
+
+   It is a **LIVELOCK, not a deadlock** — gdb on the hung process shows the four
+   workers at ~62% CPU each in state `R`, three inside `cds_ft_remove` (one at
+   `ft_txn_attempt_bail`) and one in `cds_ft_insert`. Nothing is blocked; they
+   are all spinning in their retry loops.
+
+   **Mechanism.** The remove now holds THREE anchors across its commit (head
+   holder + pred + succ) where it held one. `skr_writer` states its own shape:
+   *"Every writer walks the keys in the SAME order: the point is to have all T
+   removers on one chain at once."* Adjacent keys share or neighbour their
+   holders, so one remover's neighbour hold is the next remover's PRIMARY
+   acquire. Each then misses, returns `-EAGAIN`, re-derives and retries, and
+   none converges.
+
+   Two things that did **not** fix it, both tried:
+
+   * Making the neighbour take non-fatal (an all-or-none miss simply skips the
+     conversion, no `-EAGAIN`). The livelock is caused by the SUCCESSFUL takes,
+     not the failing ones.
+   * Moving the take from the holder's set down to its consumption point. That
+     fixed a real bug — the first version added the members to the holder's set,
+     leaving SEVEN exits in `ft_unchain_node` with nothing to release them, and
+     a leaked lock is permanent — but the hang survived it.
+
+   **So the widening is not "add the anchors".** It is a contention change, and
+   it needs the retry side handled — fairness or a bounded wait rather than an
+   abort-and-respin — or a granularity that does not make one key's remove
+   exclude its neighbours'. ⇒ that is an argument for doing step 3's dedicated
+   locks FIRST: those are per-FT words, touched only by the first and last key
+   in the trie, and they close 14.3% + 0.9% without going near the hot remove
+   acquire.
+
+   `ft_cell_lock_member()` — the acquire-side twin of `ft_cell_edge_owner`,
+   mirroring its bail sequence word for word — is KEPT: it is correct, it is
+   what any version of this step needs, and it is inert while the park is off.
+
 2. **Widen `ft-insert.h:459`'s acquire** to hold `pos` and `succ`'s anchors, then
    route `ft_txn_list_insert_between_prepare` through `ft_cell_edge_owner`. Order
    matters and is not stylistic: its MW is the interposition detector (below), so
