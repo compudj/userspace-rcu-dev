@@ -1612,8 +1612,10 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 				.succ = ft_ord_or_sentinel(ft, run->succ),
 			};
 
-			if (ft_cell_lockset_take(ft, NULL, st->glue->txn, &plan))
+			if (ft_cell_lockset_take(ft, NULL, st->glue->txn, &plan)) {
+				ft_glue_take_refused(st->glue);	/* see its header */
 				return URCU_TXN_STATUS_ABORT;
+			}
 			rn = ft_ord_cell_run_splice_edges(ft, run->run_first,
 				run->run_last, run->pred, run->succ, redges, 0);
 			/*

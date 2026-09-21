@@ -7669,9 +7669,7 @@ detach_bail:
 			if (ft_cell_lockset_take_edges(ft, NULL, txn, iedges,
 					in)) {
 				free(iedges);
-				ft_flip_txn_destroy(txn);
-				ret = -EAGAIN;
-				goto sweep;
+				goto cells_bail;
 			}
 			ft_ord_cell_record_into_ft(ft, txn, iedges, in);
 			free(iedges);
@@ -7737,10 +7735,8 @@ detach_bail:
 				.succ2 = ft_ord_or_sentinel(ft, run_dsucc),
 			};
 
-			if (ft_cell_lockset_take(ft, NULL, txn, &plan)) {
-				ret = -EAGAIN;
-				goto sweep;
-			}
+			if (ft_cell_lockset_take(ft, NULL, txn, &plan))
+				goto cells_bail;
 		}
 		cn = ft_ord_cell_run_resplice_edges(ft, rfc, rlc, run_dpred,
 				run_dsucc, cedges, cn);
@@ -8192,6 +8188,35 @@ cells_done:
 	ft_glue_fini(&glue);
 	if (src_glue_live)
 		ft_glue_fini(&src_glue);
+	goto sweep;
+
+cells_bail:
+	/*
+	 * ☠ A CELL TAKE REFUSED IN THE ORDERED-LIST STAGE OWES THE STAGE'S FULL
+	 * UNWIND, not a bare `goto sweep`.  Its neighbours there (the adjacency
+	 * refusal, the interleave collect's failure) each run this same block
+	 * inline; the two takes added beside them (cell-list stages 3d, 4b) did
+	 * not -- one skipped the txn destroy, both skipped the glue aborts -- so a
+	 * refusal left @txn open with the locks it registered, and the glue's
+	 * fences, LOCKed for good (the ft_inv 136 wedge's family: see
+	 * ft_remove_take_refused).  Same order as the inline copies: the txn's
+	 * registry sweep BEFORE @gst_st.dest is freed.
+	 */
+	pp_meta = NULL;		/* ft_glue_abort: single owner */
+	/* NULL on the merge path: no COW */
+	ft_rekey_free_stop_prime(ft, s_top_prime);
+	if (detach_rc.new_flag)
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(detach_rc.new_flag));
+	ft_rekey_collapse_free_unpublished(ft, &detach_rc.collapse);
+	ft_glue_abort(ft, &glue);
+	if (src_glue_live) {	/* merged cluster's src side */
+		ft_glue_abort(ft, &src_glue);
+		src_glue_live = false;
+	}
+	ft_flip_txn_destroy(txn);
+	if (gst_st.old_recompacted_node)
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
+	ret = -EAGAIN;
 	goto sweep;
 
 bail_build:

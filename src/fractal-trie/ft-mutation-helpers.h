@@ -15636,8 +15636,19 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 			.succ = ft_ord_cell_resolve_ord(&old_cell->lnode.next),
 		};
 
-		if (ft_cell_lockset_take(ft, NULL, txn, &plan))
+		if (ft_cell_lockset_take(ft, NULL, txn, &plan)) {
+			/*
+			 * ☠ PRE-COMMIT, SO THE TERMINAL IS OURS.  The flip below
+			 * consumes @txn on every outcome, and all four callers
+			 * read a failure as that -- none holds another handle on
+			 * it -- so returning with @txn open left the holder lock
+			 * it registered set for good (the ft_inv 136 wedge:
+			 * ft_promote_head's head swap).  Destroy it as an aborted
+			 * flip would: release the registry, discard the records.
+			 */
+			ft_flip_txn_destroy(txn);
 			return -EAGAIN;
+		}
 	}
 	for (i = 0; i < n_sedge; i++)
 		edges[n++] = sedges[i];
@@ -15765,6 +15776,31 @@ static void ft_dt_report(void)
 # define FT_DT_INC(c)		do { } while (0)
 #endif
 
+/*
+ * ☠ A CELL TAKE REFUSED BEFORE THE COMMIT STILL OWES THE COMMIT'S TERMINAL.
+ *
+ * Every caller of ft_remove_one_commit / ft_remove_commit_rec reads a failed
+ * return as "peer won: nothing installed, txn CONSUMED" -- which is what an
+ * aborted commit does: it releases the lock registry and frees @txn.  The cell
+ * takes these two run before their commit (cell-list stages 1b and 3) returned
+ * the same failure with @txn still open, so no one ever reached its terminal:
+ * every lock it had registered -- the holder the caller guarded, the detach
+ * parent -- stayed LOCKed with no owner left to clear it, and every later
+ * writer on that word refused forever.  Measured: ft_inv 136 / 150 wedged 4/4
+ * at per-node and exponential; -DFT_DEBUG_LOCK_LEAK's history of the stuck word
+ * reads TAKE, REG, release REC, and then neither COMMIT nor DESTROY.
+ *
+ * So give it the terminal the commit would have: destroy, which releases the
+ * registry and discards the unapplied records -- nothing was installed.  A
+ * record_only @txn is the CALLER's shared txn and its bail is the caller's.
+ */
+static inline
+void ft_remove_take_refused(struct ft_flip_txn *txn, bool record_only)
+{
+	if (!record_only)
+		ft_flip_txn_destroy(txn);
+}
+
 static
 int ft_remove_one_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag **struct_slot,
@@ -15856,8 +15892,10 @@ int ft_remove_one_commit(struct cds_ft *ft,
 						&rl->lnode.next),
 				};
 
-				if (ft_cell_lockset_take(ft, NULL, txn, &plan))
+				if (ft_cell_lockset_take(ft, NULL, txn, &plan)) {
+					ft_remove_take_refused(txn, record_only);
 					return -EAGAIN;
+				}
 			}
 			n = ft_ord_cell_run_detach_edges(ft, run->rfirst,
 				run->rlast, &run->first, &run->last, edges, n);
@@ -15891,8 +15929,10 @@ int ft_remove_one_commit(struct cds_ft *ft,
 						&dead_cell->lnode.next),
 				};
 
-				if (ft_cell_lockset_take(ft, NULL, txn, &plan))
+				if (ft_cell_lockset_take(ft, NULL, txn, &plan)) {
+					ft_remove_take_refused(txn, record_only);
 					return -EAGAIN;
+				}
 			}
 			n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
 		}
@@ -16331,8 +16371,10 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 						&rl->lnode.next),
 				};
 
-				if (ft_cell_lockset_take(ft, rec->ctx, txn, &plan))
+				if (ft_cell_lockset_take(ft, rec->ctx, txn, &plan)) {
+					ft_remove_take_refused(txn, record_only);
 					return URCU_TXN_STATUS_ABORT;
+				}
 			}
 			n = ft_ord_cell_run_detach_edges(ft, run->rfirst,
 				run->rlast, &run->first, &run->last, edges, n);
@@ -16366,8 +16408,10 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 						&dead_cell->lnode.next),
 				};
 
-				if (ft_cell_lockset_take(ft, rec->ctx, txn, &plan))
+				if (ft_cell_lockset_take(ft, rec->ctx, txn, &plan)) {
+					ft_remove_take_refused(txn, record_only);
 					return URCU_TXN_STATUS_ABORT;
+				}
 			}
 			n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
 		}
@@ -22183,6 +22227,27 @@ publish_done:
 }
 
 /*
+ * ☠ A GLUE CELL TAKE REFUSED BEFORE THE COMMIT: give @g->txn the terminal the
+ * commit would have.  ft_glue_txn_commit_edges commits it and NULLs @g->txn on
+ * every outcome, and the callers read ABORT as exactly that ("glue.txn
+ * consumed") -- ft_glue_abort then leaves every lock registered in it to that
+ * txn's release_all, by design, so nothing clears them twice.  Returning ABORT
+ * with @g->txn still open broke both halves: the re-parent marks and cell locks
+ * it had registered stayed LOCKed, and the retry re-initialised the glue over
+ * the handle (the ft_inv 136 family, see ft_remove_take_refused).  A
+ * record_only glue commits nothing -- its txn is the caller's, and so is the
+ * bail.
+ */
+static inline
+void ft_glue_take_refused(struct ft_glue *g)
+{
+	if (g->record_only || !g->txn)
+		return;
+	ft_flip_txn_destroy(g->txn);
+	g->txn = NULL;
+}
+
+/*
  * Splice wrapper (cds_ft_graft): fuse a run-splice into the attach flip-txn.
  * Computes the <=4 run-splice boundary edges (which also pre-set @run's outer
  * links), arms @run, and commits via the edge core.  @run NULL => list off.
@@ -22212,8 +22277,10 @@ enum urcu_txn_status ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
 			.succ = ft_ord_or_sentinel(ft, run->succ),
 		};
 
-		if (g->txn && ft_cell_lockset_take(ft, NULL, g->txn, &plan))
+		if (g->txn && ft_cell_lockset_take(ft, NULL, g->txn, &plan)) {
+			ft_glue_take_refused(g);
 			return URCU_TXN_STATUS_ABORT;
+		}
 		n = ft_ord_cell_run_splice_edges(ft, run->run_first,
 			run->run_last, run->pred, run->succ, cedges, 0);
 	}
@@ -22253,8 +22320,10 @@ enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
 		n = ft_ord_cell_run_replace_edges(ft, run->d_first,
 			run->d_last, run->s_first, run->s_last, cedges, 0);
 		if (g->txn && ft_cell_lockset_take_edges(ft, NULL, g->txn,
-				cedges, n))
+				cedges, n)) {
+			ft_glue_take_refused(g);
 			return URCU_TXN_STATUS_ABORT;
+		}
 		/*
 		 * Re-derive under the locks: if the two derivations agree, the
 		 * written set IS the locked set.  A replace names six cells --
@@ -22264,8 +22333,10 @@ enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
 		 */
 		n2 = ft_ord_cell_run_replace_edges(ft, run->d_first,
 			run->d_last, run->s_first, run->s_last, again, 0);
-		if (n2 != n || !ft_cell_edges_same(cedges, again, n))
+		if (n2 != n || !ft_cell_edges_same(cedges, again, n)) {
+			ft_glue_take_refused(g);	/* the take above holds */
 			return URCU_TXN_STATUS_ABORT;
+		}
 	}
 	/*
 	 * Return the commit status: under the FT-wide lock the replace is
