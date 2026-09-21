@@ -7703,6 +7703,29 @@ detach_bail:
 		 * run's outer links rather than storing them, so the whole move is atomic and
 		 * abort-clean; all six slots are distinct per the check above.
 		 */
+		{
+			/*
+			 * ☞ THE SIX CELL WORDS THIS MOVE WRITES: the SOURCE
+			 * pair (the detach above), the run's two ends, and the
+			 * DESTINATION pair (the resplice below) -- the same six
+			 * the comment calls distinct.  One take, because two
+			 * class-1 takes in sequence are not one ordered set.
+			 */
+			struct ft_cell_plan plan = {
+				.cell = rfc, .last = rlc,
+				.pred = ft_ord_cell_resolve_ord(
+					&rfc->lnode.prev),
+				.succ = ft_ord_cell_resolve_ord(
+					&rlc->lnode.next),
+				.pred2 = ft_ord_or_sentinel(ft, run_dpred),
+				.succ2 = ft_ord_or_sentinel(ft, run_dsucc),
+			};
+
+			if (ft_cell_lockset_take(ft, NULL, txn, &plan)) {
+				ret = -EAGAIN;
+				goto sweep;
+			}
+		}
 		cn = ft_ord_cell_run_resplice_edges(ft, rfc, rlc, run_dpred,
 				run_dsucc, cedges, cn);
 		ft_ord_cell_record_into_ft(ft, txn, cedges, cn);

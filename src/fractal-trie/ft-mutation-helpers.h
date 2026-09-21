@@ -11263,6 +11263,9 @@ __attribute__((weak)) unsigned long ft_cow_ok, ft_cow_noctx, ft_cow_nocell,
 __attribute__((weak)) struct ft_tk_site *ft_cow_nh_site[FT_COW_NSITE];
 __attribute__((weak)) unsigned long ft_cow_nh_n[FT_COW_NSITE];
 __attribute__((weak)) unsigned long ft_cow_h_n[FT_COW_NSITE];
+# define FT_COW_NH_NPC	16
+__attribute__((weak)) void *ft_cow_nh_pc[FT_COW_NH_NPC];
+__attribute__((weak)) unsigned long ft_cow_nh_pc_n[FT_COW_NH_NPC];
 /*
  * ☞ BOTH ANSWERS PER PRODUCER, not just the refusals.  The migration's
  * question at every stage is "which producers hold the cell word yet", so a
@@ -11369,12 +11372,63 @@ static void ft_cow_report(void)
 		fprintf(stderr, "  (per-acquire table NOT ARMED: add "
 			"-DFT_DEBUG_TXN_KIND)\n");
 #endif
+	if (ft_cow_notheld) {
+		int k;
+
+		/*
+		 * Printed as a LIBRARY-RELATIVE offset: an absolute pc is
+		 * useless after the process exits, and addr2line wants the
+		 * offset anyway.  Dl_info gives the load base of whatever
+		 * object the pc is in.
+		 */
+		fprintf(stderr, "  the NOT-HELD records by PRODUCER "
+			"(addr2line -i -e <lib> <off>):\n");
+		for (k = 0; k < FT_COW_NH_NPC; k++)
+			if (ft_cow_nh_pc[k]) {
+				Dl_info di;
+
+				if (dladdr(ft_cow_nh_pc[k], &di) && di.dli_fbase)
+					fprintf(stderr, "    +0x%-14lx %12lu\n",
+						(unsigned long)
+						((char *) ft_cow_nh_pc[k] -
+						 (char *) di.dli_fbase),
+						ft_cow_nh_pc_n[k]);
+				else
+					fprintf(stderr, "    %-18p %12lu\n",
+						ft_cow_nh_pc[k],
+						ft_cow_nh_pc_n[k]);
+			}
+	}
 }
 # define FT_COW(c)	uatomic_inc(&ft_cow_##c)
 /* Bucket AND attribute in one macro, so the call cannot outlive the census. */
 # define FT_COW_NOTHELD(t)	do {					\
 		FT_COW(notheld);					\
 		ft_cow_note_site((t), false);				\
+	} while (0)
+/*
+ * ☞ THE SITE TABLE NAMES THE TXN, NOT THE PRODUCER, and for a residue that is
+ * not enough: one txn reaches several cell-edge builders and only some of them
+ * forgot the take.  Keying the leftovers by the RECORD's return address names
+ * the exact builder, which is what turns "546 records across five sites" into a
+ * work list.  Symbolize with addr2line -i -e <lib>.
+ */
+# define FT_COW_NH_PC()	do {						\
+		void *pc__ = __builtin_return_address(0);		\
+		int k__;						\
+									\
+		for (k__ = 0; k__ < FT_COW_NH_NPC; k__++) {		\
+			if (uatomic_read(&ft_cow_nh_pc[k__]) == pc__) {	\
+				uatomic_inc(&ft_cow_nh_pc_n[k__]);	\
+				break;					\
+			}						\
+			if (!uatomic_read(&ft_cow_nh_pc[k__]) &&	\
+			    uatomic_cmpxchg(&ft_cow_nh_pc[k__], NULL,	\
+					pc__) == NULL) {		\
+				uatomic_inc(&ft_cow_nh_pc_n[k__]);	\
+				break;					\
+			}						\
+		}							\
 	} while (0)
 # define FT_COW_HELD(t)		do {					\
 		FT_COW(ok);						\
@@ -11391,6 +11445,7 @@ static void ft_cow_report(void)
 #else
 # define FT_COW(c)	do { } while (0)
 # define FT_COW_NOTHELD(t)	do { } while (0)
+# define FT_COW_NH_PC()		do { } while (0)
 # define FT_COW_HELD(t)		do { } while (0)
 #endif
 
@@ -11468,6 +11523,7 @@ struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
 	 */
 	if (!ft_cell_word_held(t, e, lock)) {
 		FT_COW_NOTHELD(t);
+		FT_COW_NH_PC();
 		return NULL;
 	}
 	FT_COW_HELD(t);
@@ -12488,7 +12544,7 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
  * FT_STATE_PROXY and urcu_txn_desc_set_late_tag defers every such record to the
  * late pass.)
  */
-#define FT_CELL_LOCKSET_MAX_RECORDS	4
+#define FT_CELL_LOCKSET_MAX_RECORDS	6
 
 /*
  * THE CELL-LIST LOCK PLAN: the cells whose list words an op is about to write.
@@ -12533,6 +12589,16 @@ struct ft_cell_plan {
 	 * at the destination is the INSERT invariant, pred->next == succ.
 	 */
 	bool splice;
+	/*
+	 * ☞ A MOVE TOUCHES TWO PAIRS.  An op that DETACHES a run from one
+	 * place and RESPLICES it into another writes six cell words: the source
+	 * pair, the run's two ends, and the destination pair.  @pred/@succ are
+	 * the source pair (validated against the run's current links) and
+	 * @pred2/@succ2 the destination pair (validated as adjacent, the insert
+	 * invariant).  Both must be in the SAME take, or the two halves are not
+	 * one ordered set.
+	 */
+	struct ft_ord_cell *pred2, *succ2;
 };
 
 /*
@@ -12562,6 +12628,9 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 			return false;
 		if (urcu_txn_list_is_marked(rcu_dereference(last->lnode.next)))
 			return false;	/* the run's tail already deleted */
+		if (p->pred2 &&
+		    ft_ord_cell_resolve_ord(&p->pred2->lnode.next) != p->succ2)
+			return false;	/* destination pair no longer adjacent */
 	} else {
 		/* insert / splice: the DESTINATION pair must still be adjacent */
 		if (!p->pred)
@@ -12616,7 +12685,7 @@ static inline
 int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct ft_flip_txn *txn, const struct ft_cell_plan *p)
 {
-	struct ft_dlm_member set[4] = { 0 };
+	struct ft_dlm_member set[6] = { 0 };
 	unsigned int n = 0, i;
 	int ret;
 
@@ -12633,6 +12702,12 @@ int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		n++;
 	if (p->succ && ft_cell_lock_member(ft, p->succ,
 			&p->succ->lnode.prev, &set[n]))
+		n++;
+	if (p->pred2 && ft_cell_lock_member(ft, p->pred2,
+			&p->pred2->lnode.next, &set[n]))
+		n++;
+	if (p->succ2 && ft_cell_lock_member(ft, p->succ2,
+			&p->succ2->lnode.prev, &set[n]))
 		n++;
 	if (!n)
 		return 0;
