@@ -11614,6 +11614,14 @@ struct ft_ord_cell_edge {
 	 * NULL for a sentinel endpoint, which no holder owns.
 	 */
 	struct ft_ord_cell *owner_cell;
+	/*
+	 * The trie whose SENTINEL word @slot may be, when that is not the trie
+	 * the recorder is handed.  A sentinel carries no marker -- it is a bare
+	 * list node inside struct cds_ft -- so a word of ANOTHER trie's sentinel
+	 * (the cross-trie dual swap names both) is recognisable only if the
+	 * producer says whose it is.  NULL, the default: the recorder's own trie.
+	 */
+	const struct cds_ft *sentinel_ft;
 };
 
 /* Resolve an edge's engine proxy tag: unset (0) => the structural 0xF tag. */
@@ -11965,19 +11973,34 @@ static inline
 struct cds_ft_metadata *ft_cell_word_lock(const struct cds_ft *ft,
 		const struct ft_ord_cell_edge *e)
 {
-	if (!e->owner_cell)
-		return NULL;		/* not a cell link at all */
+	const struct cds_ft *sft = e->sentinel_ft ? e->sentinel_ft : ft;
+
 	/*
 	 * ☠ THE SENTINEL'S TWO ENDS ARE TOLD APART BY THE SLOT, NOT THE CELL.
 	 * ft_ord_is_end() answers for the sentinel as a WHOLE, and its two list
 	 * words are independent -- a head splice writes .next, a tail splice
 	 * .prev -- so asking "is this the sentinel" would name one lock for two
 	 * words and serialise them against each other for nothing.
+	 *
+	 * ☠ AND BEFORE THE @owner_cell TEST, NOT AFTER.  A point op names the
+	 * sentinel as its neighbour cell; the bulk producers (the root/list
+	 * swaps' ft_ord_sentinel_edges) name no cell at all.  Tested after, the
+	 * same begin/end word was locked and parked SW by one and recorded MW
+	 * unlocked by the other -- one word, two disciplines, excluded only by
+	 * the bulk gate (the 09-21 skeptic's finding).  The word's lock is a
+	 * function of the WORD, so the slot decides it, whoever built the edge.
+	 *
+	 * An EXCLUSIVE trie's sentinel needs no lock: it has no peer (the same
+	 * predicate as its root, ft_flip_txn_record_root).
 	 */
-	if ((const void *) e->slot == (const void *) &ft->ord_sentinel.node.next)
-		return (struct cds_ft_metadata *) &ft->ord_begin_lock;
-	if ((const void *) e->slot == (const void *) &ft->ord_sentinel.node.prev)
-		return (struct cds_ft_metadata *) &ft->ord_end_lock;
+	if ((const void *) e->slot == (const void *) &sft->ord_sentinel.node.next)
+		return sft->exclusive ? NULL :
+			(struct cds_ft_metadata *) &sft->ord_begin_lock;
+	if ((const void *) e->slot == (const void *) &sft->ord_sentinel.node.prev)
+		return sft->exclusive ? NULL :
+			(struct cds_ft_metadata *) &sft->ord_end_lock;
+	if (!e->owner_cell)
+		return NULL;		/* not a cell link at all */
 	return cds_ft_item_to_metadata((struct ft_ord_cell *) e->owner_cell);
 }
 
@@ -12353,10 +12376,16 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
 	struct ft_ord_cell *tp_old = ft_ord_or_sentinel(ft, tail_old);
 	struct ft_ord_cell *tp_new = ft_ord_or_sentinel(ft, tail_new);
 
+	/*
+	 * The begin/end words: @sentinel_ft names whose, so a cross-trie caller
+	 * (the dual swap records both tries' ends in one array) still resolves
+	 * each to ITS trie's begin/end lock -- see ft_cell_word_lock.
+	 */
 	if (hn_old != hn_new) {
 		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &ft->ord_sentinel.node.next;
-		edges[n].owner_cell = NULL;	/* not a cell link */
+		edges[n].owner_cell = NULL;	/* the sentinel: no cell */
+		edges[n].sentinel_ft = ft;
 		edges[n].old_target = hn_old;
 		edges[n].new_target = hn_new;
 		n++;
@@ -12364,7 +12393,8 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
 	if (tp_old != tp_new) {
 		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &ft->ord_sentinel.node.prev;
-		edges[n].owner_cell = NULL;	/* not a cell link */
+		edges[n].owner_cell = NULL;	/* the sentinel: no cell */
+		edges[n].sentinel_ft = ft;
 		edges[n].old_target = tp_old;
 		edges[n].new_target = tp_new;
 		n++;

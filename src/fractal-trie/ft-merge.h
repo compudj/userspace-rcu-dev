@@ -1082,6 +1082,42 @@ struct ft_merge_src_cap {
 };
 
 /*
+ * ☠ LOCK WHAT THE SPINE-COPY INTERLEAVE NAMES BEFORE RECORDING IT.
+ *
+ * A merged run that becomes the list's new minimum or maximum writes @dst_ft's
+ * sentinel .next / .prev.  Those are the words a point insert at either end
+ * parks SW under ord_begin_lock / ord_end_lock, so recording them here unlocked
+ * made them MW on this path and SW on that one -- one word, two disciplines,
+ * excluded only by the bulk gate (the 09-21 skeptic's finding).  The guard could
+ * not see it while ft_cell_word_lock tested @owner_cell first, and the interleave
+ * names no owner cell; resolving the SLOT first is what put these edges in front
+ * of it.
+ *
+ * Both callers are past the src unlink, so there is no bail left: a miss means no
+ * peer should have been inside these words and one was -- the bulk-gate premise
+ * failing, with the same answer the root take gives at the same site
+ * (ft_flip_txn_lock_root_unfailable).  An interior edge naming no cell resolves
+ * to no lock and is skipped here, as before.
+ */
+static inline
+void ft_merge_take_interleave_locks(struct cds_ft *dst_ft,
+		const struct ft_glue *gd, struct ft_flip_txn *txn,
+		const struct ft_ord_cell_edge *edges, unsigned int n)
+{
+	struct ft_lock_ctx ctx;
+
+	ft_glue_lock_ctx(gd, &ctx);
+	if (ft_cell_lockset_take_edges(dst_ft, &ctx, txn, edges, n)) {
+		fprintf(stderr, "FT SPINE-COPY INTERLEAVE: lock take failed on "
+			"an unfailable publish (ft %p) producer %p -- the "
+			"bulk-gate premise is false\n", (void *) dst_ft,
+			__builtin_return_address(0));
+		fflush(stderr);
+		abort();
+	}
+}
+
+/*
  * Compare two ordinal key suffixes.  Matches the ordered-list key ordering: a
  * shorter key that is a prefix of a longer one sorts FIRST (the prefix-key rule
  * ft_subtree_minmax_head relies on).  Returns <0 / 0 / >0.
@@ -2411,6 +2447,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * MEASURED: ft-merge.h's REAL OWN_MISS (the population left
 		 * after the doomed-commit split) 40,280 -> 0 per ft_inv leg.
 		 */
+		ft_merge_take_interleave_locks(dst_ft, &gd, txn, ms_edges, ms_n);
 		ft_ord_cell_record_into_ft(dst_ft, txn, ms_edges, ms_n);
 	}
 

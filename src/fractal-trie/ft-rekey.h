@@ -9583,32 +9583,29 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 	 *    src-run prev, which this collect leaves untouched.
 	 */
 	if (ms_ord) {
-		unsigned int i;
-
 		ms_n = ft_merge_ord_interleave_collect(dst_ft, dst_key_len,
 			ms_cursor, ms_succ, ms_prev, /*tail_link=*/ ms_succ,
 			/*head_linked=*/ true, ms_src_caps, ms_nsrc,
 			ms_src_pool, ms_edges, /*record_all=*/ false,
 			/*ncollide=*/ NULL, /*collided=*/ NULL);
 		/*
-		 * ☠ A RAW record_tag LOOP OVER ORD EDGES, which the sibling
-		 * graft path deliberately does NOT do (see the comment at
-		 * ft_ord_cell_record_into_ft's caller there): every edge here
-		 * takes the structural_sw dispatch, so a CELL edge parks SW
-		 * under an armed txn even though no cell carries a node lock.
-		 * Sound today only because the modes that arm -- COARSE and
-		 * exclusive -- exclude trie-wide.  The per-edge @owner is what
-		 * stops it at the PHASE B arm: a cell's owner is NULL, so the
-		 * record-time check refuses the park instead of taking it
-		 * silently.  Routing this loop through the tag-dispatching
-		 * recorder is the real fix and belongs with the site's arm.
+		 * ☑ ROUTED THROUGH THE TAG-DISPATCHING RECORDER, as its
+		 * ft_merge_spine_copy twin already is.  This was a RAW
+		 * record_tag loop: every edge took the structural_sw dispatch,
+		 * so a CELL edge could park SW under an armed txn with no cell
+		 * lock held, and the only thing refusing that park was the
+		 * per-edge @owner being NULL -- which, with @ms_edges malloc'd,
+		 * it was not.  It also kept every edge here out of the cell
+		 * guard's sight, including the dst sentinel's begin/end words a
+		 * new list minimum / maximum writes: SW under their lock for a
+		 * point op, unlocked here.
+		 *
+		 * So take what the edges name, then record by tag: a cell edge
+		 * the op holds parks under its lock, the rest stay MW, and an
+		 * unheld one the guard names.
 		 */
-		for (i = 0; i < ms_n; i++)
-			ft_flip_txn_record_tag(txn, ms_edges[i].owner,
-				(void **) ms_edges[i].slot,
-				(void *) ms_edges[i].old_target,
-				(void *) ms_edges[i].new_target,
-				ft_edge_tag(&ms_edges[i]));
+		ft_merge_take_interleave_locks(dst_ft, &gd, txn, ms_edges, ms_n);
+		ft_ord_cell_record_into_ft(dst_ft, txn, ms_edges, ms_n);
 	}
 
 	/*
