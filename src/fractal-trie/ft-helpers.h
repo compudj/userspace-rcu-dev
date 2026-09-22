@@ -1091,8 +1091,18 @@ static inline
 struct cds_ft_inode_flag *ft_head_parent_word(struct cds_ft_inode_flag *parent_nf,
 		bool prefix)
 {
-	if (!prefix || !((uintptr_t) parent_nf & FT_INTERNAL_MASK) ||
-	    ft_node_flip_proxy(parent_nf))
+	/*
+	 * A PROXY passes VERBATIM.  "Dropped" means not SET: stripping it
+	 * would clear bit 4 of a record ADDRESS (the proxy's 0xF nibble has
+	 * bit 0 set, which is all ft_parent_prefix_strip tests), and half the
+	 * records of a 0x30-stride descriptor have it -- a proxy naming the
+	 * middle of the record before.  No caller passes one today (both
+	 * ft_set_parent_raw callers hand it the node being built); the
+	 * comment there that says otherwise is older than they are.
+	 */
+	if (ft_node_flip_proxy(parent_nf))
+		return parent_nf;
+	if (!prefix || !((uintptr_t) parent_nf & FT_INTERNAL_MASK))
 		return ft_parent_prefix_strip(parent_nf);
 	return (struct cds_ft_inode_flag *)
 		((uintptr_t) parent_nf | FT_PARENT_PREFIX_HEAD);

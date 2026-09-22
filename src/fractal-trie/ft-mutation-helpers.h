@@ -12290,21 +12290,38 @@ int ft_txn_list_insert_between_prepare(struct cds_ft *ft,
 		struct urcu_txn_list_node *succ_expected)
 {
 	struct urcu_txn *txn = ft_flip_txn_handle(t);
-	void *pn = urcu_txn_load(txn, (void **) &pos->next, URCU_TXN_TAG);
+	void *pn;
+
+	if (caa_unlikely(!pos || !succ_expected))
+		ft_ord_neighbour_null("ft_txn_list_insert_between_prepare",
+			pos ? (const void *) pos : (const void *) newp);
+	pn = urcu_txn_load(txn, (void **) &pos->next, URCU_TXN_TAG);
 
 	if (urcu_txn_list_is_marked(pn))
 		return -ENOENT;				/* @pos was deleted */
 	if ((struct urcu_txn_list_node *) pn != succ_expected)
 		return -EAGAIN;				/* order intent stale: re-derive */
 	/*
-	 * Guard succ_expected->next (the slot del(succ) marks) so the &succ->prev
-	 * store serializes against del(succ) exactly as &pos->next does; skip it
-	 * when succ == pos (self-looping sentinel), whose next IS &pos->next, the
-	 * forward store's own slot.
+	 * ☞ THE SUCCESSOR'S MARK IS CHECKED UNDER THE LOCK, NOT VALIDATED HERE
+	 * (the cell-list scheme's §6 step 2).  This was an MW read-set validate
+	 * on &succ_expected->next -- the exclusion from before the cell locks
+	 * existed -- and a validate is a RECORD: it plants a proxy on a word
+	 * this op does not necessarily own, and every record's settle is a
+	 * BLIND store.  Once stage 4 made the list words SW under their cell
+	 * (and begin/end) locks, that was a SECOND DISCIPLINE on one word: an
+	 * insert at the TAIL validated the trie's BEGIN word -- @succ_expected
+	 * is the sentinel there, and the op holds the END lock, for
+	 * &sentinel->prev -- while the begin-lock holder's unsplice parked that
+	 * word SW.  The park erased the validate's proxy, the validate's settle
+	 * wrote its stale value back over the unsplice, and the list head was
+	 * TORN: sentinel.next naming a cell whose own next carried the deletion
+	 * mark, every front insert afterwards planning against it and retrying
+	 * for ever (measured: inv_graft_swap_whole_seam_points, W=2, no swaps,
+	 * 100% of runs; -DURCU_TXN_DEBUG_PARK_CLOBBER named both halves).
+	 *
+	 * ft_cell_plan_still_valid now reads that mark PLAIN under the take, on
+	 * the side that owns it, and skips the sentinel, which is never deleted.
 	 */
-	if (succ_expected != pos && urcu_txn_list_is_marked(urcu_txn_load_validate(
-			txn, (void **) &succ_expected->next, URCU_TXN_TAG)))
-		return -EAGAIN;				/* succ (a neighbour) deleted: retry */
 
 	/* Build the fresh node invisibly, then record the two forward edges. */
 	newp->next = succ_expected;
@@ -13319,7 +13336,6 @@ static inline
 bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 		const struct ft_cell_plan *p)
 {
-	(void) ft;
 	if (p->cell && !p->splice) {
 		const struct ft_ord_cell *last = p->last ? p->last : p->cell;
 
@@ -13350,6 +13366,19 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 			return false;
 		if (urcu_txn_list_is_marked(
 				rcu_dereference(p->pred->lnode.next)))
+			return false;
+		/*
+		 * ...AND THE SUCCESSOR IS NOT MID-DELETION -- §6 step 2, read
+		 * PLAIN under the lock in place of the pre-lock MW validate it
+		 * replaces (ft_txn_list_insert_between_prepare carries the why).
+		 * A cell's mark lives in its own next, under the very lock this
+		 * plan just took for @succ, so the answer cannot change before
+		 * the commit.  The SENTINEL is skipped: never deleted, and its
+		 * next is the BEGIN word, which this op does not hold.
+		 */
+		if (p->succ && !ft_ord_is_end(ft, p->succ) &&
+				urcu_txn_list_is_marked(
+					rcu_dereference(p->succ->lnode.next)))
 			return false;
 	}
 	return true;
