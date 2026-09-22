@@ -5992,6 +5992,89 @@ end:
 		for (oi = 0; oi < nr_orphan_locked; oi++)
 			if (!orphan_held[oi].shared &&
 					!orphan_held[oi].txn_owned) {
+				/*
+				 * ☠ ONLY A TXN THIS DETACH DOES NOT COMMIT is
+				 * safe to ask.  A commit CONSUMES the flip-txn
+				 * wrapper, so on every other path @commit_txn /
+				 * @shared_txn may already be freed here and
+				 * reading ->mtxn->desc is a use-after-free
+				 * (measured: SEGV at both fine spacings, test 9,
+				 * inside urcu_txn_find on a dead descriptor).
+				 * @record_only is exactly the deferred contract:
+				 * the collapse is RECORDED into the caller's txn
+				 * and the caller commits it, so it is open here.
+				 */
+				struct ft_flip_txn *pend_txn = record_only ?
+					shared_txn : NULL;
+				struct urcu_txn_record *pend =
+					ft_lock_terminal_pending(pend_txn,
+						orphan_held[oi].lock);
+				/*
+				 * ☠ THE TERMINAL HAS NOT RUN YET.  The sweep's
+				 * premise -- a successful detach COMMITTED this
+				 * word's fused tombstone, an aborted one recorded
+				 * none -- holds only when the detach commits its
+				 * own txn.  Under a DEFERRED commit (@record_only
+				 * / @fold_replace: the rekey's one-decide writer
+				 * commits @shared_txn later) the record exists
+				 * and is UNDECIDED right here, and its expected
+				 * old is {LOCK|s}: a plain-CAS release now drops
+				 * a bit the record still counts on, the word
+				 * becomes lockable by a peer, and the SW park
+				 * that follows writes over the peer blind.
+				 *
+				 * So hand the word to the txn that carries the
+				 * terminal and let it own the clear on BOTH
+				 * outcomes: its commit consumes the bit into the
+				 * tombstone, its destroy releases it.  Measured
+				 * (-DURCU_TXN_DEBUG_PARK_CLOBBER): the parks that
+				 * clobbered {old 0x80004, found 0x4} were all
+				 * this, worst at per-node spacing, where the
+				 * orphan's lock IS its own word and the existing
+				 * hand-off (h->lock != m) never fires.
+				 */
+#ifdef FT_RED_ORPHAN_RELEASE_EARLY
+				pend = NULL;	/* red control: release anyway */
+#endif
+				if (pend) {
+					FT_ORPHAN_HANDED();
+					if (!ft_flip_txn_holds(pend_txn,
+							orphan_held[oi].lock)) {
+						unsigned int ls;
+
+						/*
+						 * ☠ REGISTER, BUT WITHOUT THE
+						 * SILENCER.  ft_flip_txn_lock_own
+						 * links &h->shared so the commit's
+						 * terminal can scrub the handing
+						 * entry -- and @orphan_held is THIS
+						 * FRAME'S STACK.  A deferred commit
+						 * runs after ft_detach_node has
+						 * returned, so that pointer would be
+						 * dangling: the terminal writes
+						 * through it (*src_shared = true)
+						 * and the run SEGVs (measured, both
+						 * fine spacings).  Nothing reads
+						 * @orphan_held past this sweep --
+						 * it is the frame's last use -- so
+						 * the silencer has no job here.
+						 */
+						ft_flip_txn_lock_register_member(
+							pend_txn,
+							orphan_held[oi].lock,
+							orphan_held[oi].lock_snap,
+							orphan_held[oi].member);
+						ls = pend_txn->nr_locks - 1;
+						if ((uintptr_t) pend->new_ptr &
+								FT_STATE_TOMBSTONE)
+							pend_txn->locks[ls].
+								tombstone_terminal =
+								true;
+					}
+					orphan_held[oi].txn_owned = true;
+					continue;
+				}
+				FT_ORPHAN_RELEASED();
 				ft_meta_lock_release_if_held(
 					orphan_held[oi].lock);
 				/*

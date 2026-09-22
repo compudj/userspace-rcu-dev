@@ -5648,6 +5648,62 @@ void ft_flip_txn_lock_register_held(struct ft_flip_txn *t,
 	ft_flip_txn_lock_register_member(t, h->lock, h->lock_snap, h->member);
 }
 
+#ifdef FT_DEBUG_ORPHAN_RELEASE
+/*
+ * ARM YIELD for the orphan sweep's two outcomes: released by plain CAS here,
+ * or HANDED to the txn that still carries the word's terminal.  A zero on the
+ * hand-over line means the path never armed -- not that it is sound.  The red
+ * control -DFT_RED_ORPHAN_RELEASE_EARLY forces the old always-release
+ * behaviour, and the park-clobber detector must go loud again.
+ */
+static unsigned long ft_orphan_rel_released, ft_orphan_rel_handed;
+# define FT_ORPHAN_RELEASED()	uatomic_inc(&ft_orphan_rel_released)
+# define FT_ORPHAN_HANDED()	uatomic_inc(&ft_orphan_rel_handed)
+static __attribute__((destructor)) void ft_orphan_release_report(void)
+{
+	if (!uatomic_read(&ft_orphan_rel_released) &&
+			!uatomic_read(&ft_orphan_rel_handed))
+		return;		/* per-TU statics: do not print a wrong zero */
+	fprintf(stderr, "FT ORPHAN SWEEP: released by CAS %lu, handed to the terminal's txn %lu\n",
+		uatomic_read(&ft_orphan_rel_released),
+		uatomic_read(&ft_orphan_rel_handed));
+}
+#else
+# define FT_ORPHAN_RELEASED()	do { } while (0)
+# define FT_ORPHAN_HANDED()	do { } while (0)
+#endif
+
+/*
+ * IS THIS WORD'S TERMINAL STILL PENDING IN @t?
+ *
+ * A lock TAKE is a plain CAS outside any transaction -- held the instant it
+ * succeeds (ft_dlm_acquire_set_at) -- while its RELEASE has two disciplines:
+ * a plain CAS (ft_meta_lock_release{,_if_held}), or a RECORD in a txn, which
+ * only applies at that txn's commit.  A sweep that takes the plain-CAS route on
+ * a word whose {LOCK|s -> TOMBSTONE|s} record is still UNDECIDED drops the bit
+ * early: the word becomes lockable by a peer, and the record's later SW park
+ * writes over it blind.
+ *
+ * Ask the DESCRIPTOR rather than any flag: the descriptor is what actually
+ * carries the pending terminal, and it is also what says whether the terminal
+ * has already run (any status but UNDECIDED).  Returns the record, so the
+ * caller can read what the terminal will DO to the word.
+ */
+static inline
+struct urcu_txn_record *ft_lock_terminal_pending(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *lock)
+{
+	struct urcu_txn_desc *d;
+
+	if (!t || !t->mtxn || !lock)
+		return NULL;
+	d = t->mtxn->desc;
+	if (!d || urcu_txn_desc_status(d) != URCU_TXN_DESC_UNDECIDED)
+		return NULL;
+	return urcu_txn_find(d, (void **) (void *)
+		&((struct cds_ft_metadata *) (uintptr_t) lock)->state);
+}
+
 /*
  * Hand @lock over to @t: register it AND link the handing-over entry's
  * silencer, so the commit's terminal can scrub an entry that would otherwise
