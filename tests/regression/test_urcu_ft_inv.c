@@ -82,7 +82,8 @@
  */
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
-#define NR_TESTS	(130 + NR_TESTS_REKEY_DLM)	/* +1: inv_concurrent_merge_colliding_chains */
+/* +1 inv_graft_swap_whole_seam_points */
+#define NR_TESTS	(131 + NR_TESTS_REKEY_DLM)	/* +1: inv_graft_swap_whole_seam_points */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -14871,6 +14872,300 @@ static int inv_graft_swap_shared_dst_delegate_solo(void)
 		/*list_on=*/ false, &gs_lay_delegate_solo);
 }
 
+/*
+ * ☞ POINT WRITERS INSIDE A WHOLE-TRIE GRAFT_SWAP'S DRAIN SEAM.
+ *
+ * A key_len 0 cds_ft_graft_swap swaps the two tries' roots and ordered lists in
+ * ONE dual flip, NULL-terminating each moved run's outer links (a straddler of
+ * either run must see a universal end), and restores them to circular form --
+ * first->prev / last->next at the sentinel -- only AFTER a drain.  That drain
+ * is ft_writer_lock_gp_wait, which RELEASES @dst's FT-wide writer lock for the
+ * grace period (a QSBR writer parked on it is an online reader), so a FINE
+ * point writer on the live @dst can run inside it and meet a list whose two
+ * ends point at NULL.  No other test puts a point writer on a graft_swap
+ * destination: gs_shared_oracle's writers are graft_swaps, mw_gs_oracle's
+ * inserts go into their private swap tries.
+ *
+ * The swapper whole-swaps a fresh block of keys into @dst; the point writers
+ * remove @dst's current FIRST and LAST keys and insert new keys at both ends --
+ * exactly the two cells the seam leaves unfinalized.  Ownership: whoever
+ * removes a node frees it; whatever a swap carries out is drained by the
+ * swapper.  Oracle, every round with the writers parked: cds_ft_verify, and a
+ * forward and a reverse walk that must agree with cds_ft_count_keys.
+ */
+#define GSS_W		2	/* point writers (default) */
+#define GSS_W_MAX	8	/* FT_INV_GSS_W ceiling */
+#define GSS_K		16	/* keys per swapped-in block */
+#define GSS_SWAPS	16	/* swaps per round */
+#define GSS_MS		1500	/* default run time (FT_INV_GSS_MS overrides) */
+
+struct gss_ctx {
+	struct cds_ft *dst;
+	int run;
+	int stop;
+	int parked;
+	unsigned long ins, ins_fail, rm, rm_miss;
+};
+
+struct gss_arg {
+	struct gss_ctx *c;
+	unsigned int w;
+};
+
+static struct ft_test_node *gss_node(const uint8_t *key, size_t klen,
+		uint64_t tag)
+{
+	struct ft_test_node *n = node_alloc(tag);
+
+	memcpy(n->okey, key, klen);
+	n->value = klen;
+	return n;
+}
+
+/* Remove @ft's first (or last) key's head node; whoever removes it frees it. */
+static int gss_remove_end(struct cds_ft *ft, struct cds_ft_iter *iter,
+		bool last)
+{
+	struct cds_ft_node *node;
+	enum cds_ft_status st;
+
+	st = last ? cds_ft_lookup_last(ft, iter) : cds_ft_lookup_first(ft, iter);
+	if (st != CDS_FT_STATUS_OK || !(node = cds_ft_iter_node(iter)))
+		return -1;
+	if (cds_ft_remove(ft, iter, node) != CDS_FT_STATUS_OK)
+		return -1;
+	node_free_rcu(to_test_node(node));
+	return 0;
+}
+
+static void *gss_point_writer(void *arg)
+{
+	struct gss_arg *a = (struct gss_arg *) arg;
+	struct gss_ctx *c = a->c;
+	struct cds_ft_iter *iter;
+	unsigned int seq = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(c->dst, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	while (!uatomic_load(&c->stop, CMM_RELAXED)) {
+		unsigned int side;
+
+		if (!uatomic_load(&c->run, CMM_ACQUIRE)) {
+			uatomic_inc(&c->parked);
+			while (!uatomic_load(&c->run, CMM_ACQUIRE) &&
+					!uatomic_load(&c->stop, CMM_RELAXED)) {
+				caa_cpu_relax();
+				rcu_quiescent_state();
+			}
+			uatomic_dec(&c->parked);
+			continue;
+		}
+		for (side = 0; side < 2; side++) {
+			uint8_t key[4] = { side ? 0xFF : 0x00, (uint8_t) a->w,
+				(uint8_t) (seq >> 8), (uint8_t) seq };
+			struct ft_test_node *n = gss_node(key, sizeof(key),
+				((uint64_t) 0x5500 + a->w) << 32 | seq);
+
+			rcu_read_lock();
+			if (cds_ft_insert(c->dst, key, sizeof(key), &n->node)
+					== CDS_FT_STATUS_OK) {
+				uatomic_inc(&c->ins);
+			} else {
+				uatomic_inc(&c->ins_fail);
+				node_free(n);	/* never published */
+			}
+			if (gss_remove_end(c->dst, iter, side))
+				uatomic_inc(&c->rm_miss);
+			else
+				uatomic_inc(&c->rm);
+			rcu_read_unlock();
+		}
+		seq++;
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * Empty @ft, freeing every node it still holds.  One read-side section per key
+ * and a quiescent state between them: a QSBR thread that loops without one
+ * holds back every grace period, the swapper's own drain included.
+ */
+static void gss_drain(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+
+	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (;;) {
+		struct cds_ft_node *node, *p;
+
+		rcu_read_lock();
+		if (cds_ft_lookup_first(ft, iter) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			break;
+		}
+		if (cds_ft_remove_all(ft, iter, &node) != CDS_FT_STATUS_OK)
+			abort();
+		cds_ft_for_each_duplicate_safe_rcu(node, p)
+			node_free_rcu(to_test_node(node));
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+}
+
+/* Structure, forward list, reverse list and count must all agree. */
+static int gss_check(struct cds_ft *ft, unsigned long round)
+{
+	struct cds_ft_iter *iter;
+	unsigned long fwd = 0, rev = 0, cnt;
+	int ret = 0;
+
+	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_lock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_graft_swap_whole_seam_points: round %lu: "
+			"verify RED\n", round);
+		ret = -1;
+	}
+	rcu_read_unlock();
+	rcu_quiescent_state();
+	rcu_read_lock();
+	cds_ft_for_each_rcu(ft, iter)
+		fwd++;
+	rcu_read_unlock();
+	rcu_quiescent_state();
+	rcu_read_lock();
+	cds_ft_for_each_reverse_rcu(ft, iter)
+		rev++;
+	cnt = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+	rcu_quiescent_state();
+	cds_ft_iter_destroy(iter);
+	if (fwd != rev || fwd != cnt) {
+		fprintf(stderr, "inv_graft_swap_whole_seam_points: round %lu: "
+			"forward %lu, reverse %lu, count_keys %lu disagree\n",
+			round, fwd, rev, cnt);
+		ret = -1;
+	}
+	return ret;
+}
+
+static int inv_graft_swap_whole_seam_points(void)
+{
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	struct cds_ft_group *group;
+	struct gss_ctx c;
+	struct gss_arg args[GSS_W_MAX];
+	pthread_t th[GSS_W_MAX];
+	struct timespec t0;
+	const char *env = getenv("FT_INV_GSS_MS");
+	unsigned long long ms = env ? strtoull(env, NULL, 10) : GSS_MS;
+	/* FT_INV_GSS_W: point writers, 0 = the swaps-only CONTROL. */
+	const char *wenv = getenv("FT_INV_GSS_W");
+	unsigned int nw = wenv ? (unsigned int) atoi(wenv) : GSS_W;
+	/* FT_INV_GSS_SWAPS: swaps per round; 0 = point writers only (CONTROL). */
+	const char *senv = getenv("FT_INV_GSS_SWAPS");
+	unsigned int nswaps = senv ? (unsigned int) atoi(senv) : GSS_SWAPS;
+	unsigned long round = 0, swaps = 0, busy = 0;
+	unsigned int i, s;
+	int ret = 0;
+
+	memset(&c, 0, sizeof(c));
+	if (nw > GSS_W_MAX)
+		nw = GSS_W_MAX;
+	c.dst = create_varlen_ord_ft_ws(&group, &ws);
+	cds_ft_make_shared(c.dst);
+	for (i = 0; i < nw; i++) {
+		args[i].c = &c;
+		args[i].w = i;
+		pthread_create(&th[i], NULL, gss_point_writer, &args[i]);
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (!ret && elapsed_ms(&t0) < ms) {
+		uatomic_store(&c.run, 1, CMM_RELEASE);
+		if (!nswaps) {
+			struct timespec r0;
+
+			/* Point writers alone for ~100 ms, with QS. */
+			clock_gettime(CLOCK_MONOTONIC, &r0);
+			while (elapsed_ms(&r0) < 100) {
+				caa_cpu_relax();
+				rcu_quiescent_state();
+			}
+		}
+		for (s = 0; s < nswaps; s++, swaps++) {
+			struct cds_ft *swap;
+			enum cds_ft_status st;
+			unsigned int k, attempt;
+
+			if (cds_ft_create(group, NULL, &swap) < 0)
+				abort();
+			for (k = 0; k < GSS_K; k++) {
+				uint8_t key[4] = { 0x80, (uint8_t) (swaps >> 8),
+					(uint8_t) swaps, (uint8_t) k };
+				struct ft_test_node *n = gss_node(key,
+					sizeof(key), (uint64_t) swaps << 8 | k);
+
+				if (cds_ft_insert(swap, key, sizeof(key),
+						&n->node) != CDS_FT_STATUS_OK)
+					abort();
+			}
+			/* The consumed swap trie must be exclusive (step 6). */
+			cds_ft_make_exclusive(swap);
+			for (attempt = 0; attempt < 64; attempt++) {
+				st = cds_ft_graft_swap(c.dst, NULL, 0, swap);
+				if (st != CDS_FT_STATUS_BUSY_ERROR)
+					break;
+				busy++;
+				rcu_quiescent_state();
+			}
+			if (st != CDS_FT_STATUS_OK &&
+					st != CDS_FT_STATUS_BUSY_ERROR) {
+				fprintf(stderr, "inv_graft_swap_whole_seam_points: "
+					"graft_swap: %s\n",
+					cds_ft_status_to_string(st));
+				ret = -1;
+			}
+			/* Whatever @swap holds now -- the old @dst, or its own
+			 * block after a BUSY -- is the swapper's to free. */
+			cds_ft_make_exclusive(swap);
+			gss_drain(swap);
+			cds_ft_destroy(swap);
+			rcu_quiescent_state();
+		}
+		uatomic_store(&c.run, 0, CMM_RELEASE);
+		while (uatomic_load(&c.parked, CMM_ACQUIRE) != (int) nw) {
+			caa_cpu_relax();
+			rcu_quiescent_state();
+		}
+		if (gss_check(c.dst, round))
+			ret = -1;
+		round++;
+	}
+	uatomic_store(&c.stop, 1, CMM_RELEASE);
+	/* Blocked in a join, this thread must not hold back grace periods. */
+	rcu_thread_offline();
+	for (i = 0; i < nw; i++)
+		pthread_join(th[i], NULL);
+	rcu_thread_online();
+	gss_drain(c.dst);
+	rcu_barrier();
+	cds_ft_destroy(c.dst);
+	cds_ft_group_destroy(group);
+	fprintf(stderr, "# inv_graft_swap_whole_seam_points: %u point writers, "
+		"%lu rounds, %lu "
+		"whole-trie swaps (%lu BUSY), %lu point inserts (%lu failed), "
+		"%lu end removes (%lu missed) -> %s\n", nw, round, swaps, busy,
+		c.ins, c.ins_fail, c.rm, c.rm_miss, ret ? "RED" : "ok");
+	return ret;
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*   INVARIANT: writers keep making progress under chain-merge        */
@@ -26001,6 +26296,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_swap_shared_dst_extchild_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_delegate_nolist);
 	RUN_TEST(inv_graft_swap_shared_dst_delegate_solo);
+	RUN_TEST(inv_graft_swap_whole_seam_points);
 	RUN_TEST(inv_writer_progress_chainmerge);
 	RUN_TEST(inv_graft_swap_shared_dst_kshort_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_deep_solo);

@@ -2013,9 +2013,9 @@ struct ft_flip_txn {
 	 * ☠ BLIND TO A CROSS-TRIE TXN'S SECOND ROOT.  A dual names one trie
 	 * and writes two roots, and this word can hold only one of them --
 	 * which is precisely why the helper, not this assert, is the
-	 * mechanism.  The dual's two roots are marked at the one helper both
-	 * whole-trie swaps go through (ft_root_list_swap_publish_dual), so
-	 * they are covered by construction rather than by detection.
+	 * mechanism.  The dual's two roots are marked at its one helper
+	 * (ft_root_list_swap_publish_dual), so they are covered by
+	 * construction rather than by detection.
 	 */
 	FT_ROOT_ASSERT_TXN_FIELD
 	/*
@@ -2448,8 +2448,8 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v);
  * suite never entered.  The default strategy is FINE.
  *
  * The answer is SHAPE-INDEPENDENT: a CROSS-TRIE txn names one trie and may
- * write two roots (the graft / graft_swap duals flip &dst_ft->root together
- * with &src_ft->root, resp. &swap_ft->root), and arming off the named trie is
+ * write two roots (the empty-dst root graft's dual flips &dst_ft->root together
+ * with &src_ft->root), and arming off the named trie is
  * sound anyway because roots record MW by construction -- every root edge goes
  * through ft_flip_txn_record_root, whichever trie it belongs to.  What remains
  * to argue per arm is only the ordinary one: that the op excludes every peer
@@ -8330,7 +8330,7 @@ enum { FT_RTAKE_CALL, FT_RTAKE_HELD, FT_RTAKE_TOOK, FT_RTAKE_MISS,
  *     dies, so a mark leaked on it would have no natural end.
  *
  * The rule is a property of the SLOT, not of the txn's named trie, which is
- * what lets a CROSS-TRIE dual -- one txn, two roots (ft_graft / graft_swap) --
+ * what lets a CROSS-TRIE dual -- one txn, two roots (the empty-dst ft_graft) --
  * record both of them MW while its own trie's content parks SW.  Counted
  * MW_ALWAYS: a root can never convert, so it is not part of the MW_STRUCT
  * conversion surface.
@@ -15198,15 +15198,38 @@ struct ft_root_swap_side {
 	struct cds_ft_inode_flag *old_root, *new_root;
 	struct ft_ord_cell *head_old, *head_new;
 	struct ft_ord_cell *tail_old, *tail_new;
+	/*
+	 * Where this side's OUTGOING run [head_old..tail_old] points its outer
+	 * links in the flip: NULL (the default) is the universal end, and
+	 * leaves the receiving trie to finalize it after a drain; a trie names
+	 * the RECEIVING trie, whose sentinel they point at directly.  Set it only
+	 * when THIS side is EXCLUSIVE -- no reader of it exists, so no straddler
+	 * can resolve that link to a foreign sentinel -- and see the header for
+	 * why the receiving side needs it.
+	 */
+	struct cds_ft *out_relink;
 };
 
 /*
+ * RED CONTROL for the seam fix, never a shipping configuration: an exclusive
+ * source's run is NOT relinked to the receiving sentinel in the flip (the
+ * empty-dst root graft's dual gets the universal end back, the whole-trie
+ * graft_swap leaves the run on @swap_ft's sentinel), and the caller gets the
+ * post-drain finalize back -- so -DFT_DEBUG_SEAM must fire at the graft_swap
+ * seam.
+ */
+#ifdef FT_RED_SEAM_NULLTERM
+# define FT_SEAM_RELINK(receiver)	((struct cds_ft *) NULL)
+#else
+# define FT_SEAM_RELINK(receiver)	(receiver)
+#endif
+
+/*
  * Whole-trie root swap across TWO tries fused in ONE flip.  The empty-dst
- * root-level graft (dst appears / src retires to a fresh empty root) and the
- * whole-trie graft_swap (dst <-> swap exchange) both publish two root slots --
- * historically as two separate ft_root_list_swap_publish flips, leaving a
- * cross-trie window where a reader sees a key reachable in BOTH tries (appear
- * committed, disappear not yet) or in NEITHER.  Recording both sides' root (and,
+ * root-level graft (dst appears / src retires to a fresh empty root) publishes
+ * two root slots -- historically as two separate ft_root_list_swap_publish
+ * flips, leaving a cross-trie window where a reader sees a key reachable in BOTH
+ * tries (appear committed, disappear not yet) or in NEITHER.  Recording both sides' root (and,
  * list-on, head/tail) edges in ONE flip closes that window: the two
  * tries share a group, hence a flip selector, so a single epoch flip settles all
  * <= 10 edges atomically -- a reader resolves every root/endpoint proxy to ONE
@@ -15214,18 +15237,36 @@ struct ft_root_swap_side {
  * by the caller before the call (the two sides reference each other's pre-swap
  * roots/endpoints).
  *
- * Sentinel topology: unlike the single-side moves (detach / graft run-splice),
- * the dual has NO drain between detach and attach -- it fuses both into ONE flip
- * -- so it must NOT relink a moved run's outer links to the OTHER (foreign) trie's
- * sentinel: a source straddler resolving that flipped link (global selector ->
- * new) would land on a foreign sentinel and dereference it as a cell.  Instead
- * each side NULL-TERMINATES its OUTGOING run's outer links in the flip (NULL is
- * the universal end -- safe for a source straddler mid-iteration AND for a fresh
- * reader on the receiving side).  Only the head/tail sentinel endpoints are
- * relinked across the boundary (ft_ord_sentinel_edges, @relink_dest = NULL =
- * head/tail only).  The caller then drains (synchronize_rcu, retiring straddlers)
- * and calls ft_ord_finalize_circular() on each receiving side to repoint the run
- * at its new sentinel, restoring the circular invariant the remove folding needs.
+ * Sentinel topology, PER SIDE -- the two sides' outgoing runs get different
+ * outer links, and each choice is forced:
+ *
+ *  - A LIVE side's outgoing run: NULL, the universal end.  The dual has no
+ *    drain between detach and attach -- it fuses both into ONE flip -- so a
+ *    reader of the live side may be STRADDLING that run; relinked to the
+ *    receiving trie's sentinel it would resolve the flipped link (global
+ *    selector -> new) onto a foreign sentinel and dereference it as a cell.
+ *    NULL is an end for that straddler and for a fresh reader of the receiving
+ *    side alike.  The caller drains (synchronize_rcu retires the straddlers)
+ *    and then ft_ord_finalize_circular() repoints the run at its new sentinel.
+ *
+ *  - An EXCLUSIVE side's outgoing run: the RECEIVING trie's sentinel, IN the
+ *    flip (@out_relink).  An exclusive trie has no reader, hence no straddler,
+ *    so the foreign-sentinel hazard above cannot arise -- and it MUST NOT get
+ *    the universal end when the receiving trie is live.  That drain is
+ *    ft_writer_lock_gp_wait, which DROPS the receiving trie's FT-wide writer
+ *    lock for the grace period: the seam G5.25 lets point writers through, on
+ *    the rule that a seam sits between two consistent commits.  A live trie
+ *    holding a NULL-terminated run breaks that rule.  MEASURED on the
+ *    whole-trie graft_swap while it still went through this dual
+ *    (inv_graft_swap_whole_seam_points): a FINE point writer admitted at the
+ *    seam, holding the writer lock, inserted after a last cell whose next was
+ *    NULL or unspliced a first cell whose prev was NULL -- both built an edge
+ *    through a NULL neighbour and faulted -- or spun in its retry loop, online,
+ *    so the drain never ended and the list was never finalized.
+ *
+ * Only the head/tail sentinel endpoints cross the boundary in both cases
+ * (ft_ord_sentinel_edges, @relink_dest = NULL).  ☠ Do not "simplify" the
+ * exclusive side back to NULL, nor the live side to the sentinel.
  */
 #define FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES	10	/* 2 roots + 2x (2 sentinel + 2 null-term) */
 static
@@ -15242,12 +15283,16 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 
 		/*
 		 * Each side's new root changes trie, so it names its NEW owner.
-		 * Done here, at the one helper both whole-trie swaps go through
-		 * (empty-dst root graft and whole-trie graft_swap), so neither
-		 * caller can forget.  Invisible to readers and mutators: they all
-		 * read a parent through ft_parent_node, which answers NULL for
-		 * either trie pointer, so an up-walk still just stops at the
-		 * root.  Only cds_ft_verify reads the identity.
+		 * Done here so the caller cannot forget.  Invisible to readers
+		 * and mutators: they all read a parent through ft_parent_node,
+		 * which answers NULL for either trie pointer, so an up-walk still
+		 * just stops at the root.  Only cds_ft_verify and the debug
+		 * ownership oracles read the identity.  ☠ Stamping BEFORE the
+		 * flip is right only for a root that leaves an EXCLUSIVE trie or
+		 * a fresh one: a root leaving a LIVE trie still has that trie's
+		 * readers inside it until a drain, and must name it until then
+		 * (detach, drain, THEN attach -- why the whole-trie graft_swap no
+		 * longer comes through here).
 		 */
 		if (r->new_root && !ft_node_flip_proxy(r->new_root))
 			cds_ft_item_to_metadata(ft_node_ptr(r->new_root))
@@ -15280,20 +15325,23 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 		 */
 		if (r->head_old) {
 			struct ft_ord_cell *self = ft_ord_sentinel_cell(r->ft);
+			/* NULL: the universal end; else the receiver's sentinel. */
+			struct ft_ord_cell *end = r->out_relink ?
+				ft_ord_sentinel_cell(r->out_relink) : NULL;
 
 			edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 			edges[n].slot = (struct ft_ord_cell **)
 				&r->head_old->lnode.prev;
 			edges[n].owner_cell = r->head_old;
 			edges[n].old_target = self;
-			edges[n].new_target = NULL;
+			edges[n].new_target = end;
 			n++;
 			edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 			edges[n].slot = (struct ft_ord_cell **)
 				&r->tail_old->lnode.next;
 			edges[n].owner_cell = r->tail_old;
 			edges[n].old_target = self;
-			edges[n].new_target = NULL;
+			edges[n].new_target = end;
 			n++;
 		}
 	}
@@ -15473,7 +15521,7 @@ void ft_ord_cell_run_install(struct cds_ft *into, struct ft_ord_cell *first,
  * the in-trie invariant (first->prev == sentinel) the remove folding and reverse
  * walk rely on.  A no-op on an empty list.
  *
- * @ft may be LIVE here (the empty-dst graft / whole-trie swap finalize a trie
+ * @ft may be LIVE here (the empty-dst graft of a live src finalizes a trie
  * that already carries concurrent readers of the just-moved run), so the stores
  * are rcu_assign_pointer, not plain: a receiving-side reader racing the finalize
  * resolves the outer link to either the old terminator (NULL / its own sentinel)

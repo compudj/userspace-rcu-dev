@@ -4017,6 +4017,49 @@ static unsigned long ft_ba_seams_in_bulk __attribute__((unused));
 #else
 # define FT_BA_GATE_NOTE()	do { } while (0)
 #endif
+#ifdef FT_DEBUG_SEAM
+/*
+ * ☞ -DFT_DEBUG_SEAM: THE SEAM RULE, CHECKED WHERE IT IS RELIED ON.
+ *
+ * ft_writer_lock_gp_wait drops the writer lock of @h -- the trie this thread
+ * actually HOLDS, which is not always the argument (graft / rekey pass @src_ft
+ * while holding the destination's) -- for a grace period, and G5.25 lets FINE
+ * point writers of @h through while it is down, on the rule that the seam sits
+ * BETWEEN two consistent commits.  The part of that rule a point writer can trip
+ * over structurally is the ordered list: every writer primitive assumes it is
+ * circular through @h's own sentinel.  A bulk op that leaves a NULL or foreign
+ * end on @h here broke the rule (the whole-trie graft_swap did:
+ * inv_graft_swap_whole_seam_points), so name the seam and stop.  Two resolving
+ * loads per end; the list cannot move under us (point writers of @h are held
+ * off by the lock we still hold, the rest drained by the bulk gate).
+ */
+static __attribute__((noinline, unused))
+void ft_seam_check_list(struct cds_ft *h, const void *site)
+{
+	struct urcu_txn_list_node *s, *first, *last, *fp, *ln;
+
+	if (!h || !h->ordered_list)
+		return;
+	s = &h->ord_sentinel.node;
+	first = urcu_txn_list_unmark(urcu_txn_list_next_rcu(s));
+	last = urcu_txn_list_unmark(urcu_txn_list_prev_rcu(s));
+	if (first == s && last == s)
+		return;				/* empty: self-looped */
+	fp = first ? urcu_txn_list_unmark(urcu_txn_list_prev_rcu(first)) : NULL;
+	ln = last ? urcu_txn_list_unmark(urcu_txn_list_next_rcu(last)) : NULL;
+	if (caa_likely(first && last && fp == s && ln == s))
+		return;
+	fprintf(stderr, "FT SEAM RULE: trie %p dropped its writer lock for a grace "
+		"period with its ordered list NOT circular (first %p ->prev %p, "
+		"last %p ->next %p, sentinel %p) at %p -- a bulk op left a "
+		"transient end visible to the point writers this seam admits\n",
+		(void *) h, (void *) first, (void *) fp, (void *) last,
+		(void *) ln, (void *) s, site);
+	fflush(stderr);
+	abort();
+}
+#endif
+
 static inline
 void ft_writer_lock_gp_wait(struct cds_ft *ft)
 {
@@ -4035,6 +4078,9 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 #endif
 	struct cds_ft *held = ft_wlock_held;
 
+#ifdef FT_DEBUG_SEAM
+	ft_seam_check_list(held, __builtin_return_address(0));
+#endif
 	FT_BL_TALLY(ft_bl_seam_all);
 	if (ft_bulk_lock_held != NULL) {
 		FT_BL_TALLY(ft_bl_seam_under);
