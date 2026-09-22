@@ -5408,8 +5408,28 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 		if (!(s & FT_STATE_LOCK))
 			return;
 #endif
-		if (caa_unlikely(!(s & FT_STATE_LOCK)))
+		if (caa_unlikely(!(s & FT_STATE_LOCK))) {
 			ft_hold_trace_bad_release(meta, s);
+			/*
+			 * A PROBE THAT RECORDS BEATS A GUARD THAT REFUSES: the
+			 * assert below says the bit is gone, never who took it.
+			 * Replay the word first -- the LOCK ring carries the
+			 * plain-CAS take/release pairs (no record ever sees
+			 * them) and the engine ring carries the parks and
+			 * settles, which is the other way a LOCK bit dies (an
+			 * SW park whose old is LOCK-masked).
+			 */
+#ifdef FT_DEBUG_LOCK_LEAK
+			ft_ll_replay(meta, "release of an unlocked word");
+#endif
+#ifdef FT_DEBUG_SLOT_HIST
+			ft_sh_replay("released word",
+				(void *const *) (const void *) &meta->state);
+#endif
+#if defined(FT_DEBUG_LOCK_LEAK) || defined(FT_DEBUG_SLOT_HIST)
+			fflush(stderr);
+#endif
+		}
 		assert(s & FT_STATE_LOCK);
 		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
 				s & ~FT_STATE_LOCK) == s)) {
@@ -13622,10 +13642,164 @@ struct ft_cell_plan {
  * This is ft_unchain_node's own "\u2605 RE-DERIVE AFTER THE ACQUIRE" idiom, which
  * the tree already carries for the holder; it is established, not invented.
  */
+/*
+ * ☠ A TORN LIST IS NOT A STALE PLAN, AND THE DIFFERENCE IS DIRECTIONAL.
+ *
+ * Every check in ft_cell_plan_still_valid compares the list against what the
+ * PLAN remembers, and answers false for both cases: the list moved on (stale --
+ * re-plan and retry, the normal outcome), or the list is internally broken
+ * (torn -- retrying can never converge, because the peer that half-applied an
+ * unsplice is not coming back to finish it).  Told apart:
+ *
+ *   stale: pred->next names X and X->prev names pred.  Self-consistent; only
+ *          the plan is out of date.
+ *   torn:  pred->next names X but X->prev names someone else -- or succ->prev
+ *          names P whose next is not succ.  The measured shape is the second
+ *          one: an unsplice that applied succ->prev (and the mark) but not
+ *          pred->next, so the list disagrees with itself across one pair.
+ *
+ * ☞ WHY THE ANSWER IS STABLE.  The plan's take holds @pred and @succ, and a
+ * peer cannot change X->prev without also writing pred->next (an insert between
+ * them, or a removal of X) -- which needs the lock we hold.  So a mismatch read
+ * here is not a race, and an unsplice in flight does not produce one: its
+ * edges commit as ONE descriptor, and resolving through the proxy yields the
+ * committed value on both sides.
+ *
+ * ABORT, not -EAGAIN (design call, 09-22): -EAGAIN on a torn list is an
+ * infinite retry, and in a drain seam it deadlocks against the op waiting for
+ * the grace period.  MEASURED: the red control below tears one unsplice and the
+ * pre-tripwire build HANGS (rc=124) with no diagnostic -- which is the bug this
+ * turns into a backtrace.
+ *
+ * Armed on every --enable-rcu-debug build (and -DFT_DEBUG_CELL_TORN), which the
+ * gate runs: a tripwire nobody builds catches nothing.
+ *
+ * ☞ THE RULE TOOK TWO TRIES.  "The neighbour disagrees" ALONE is not a tear:
+ * armed on the gate it aborted ft_inv test 84 on a HEALTHY tree, because a
+ * whole-trie graft_swap displaces a run whose cells keep naming a sentinel that
+ * has moved on, and a point writer really does plan across them in the seam.
+ * Gating on ft_bulk_active() did not fix that (measured: the gate is already
+ * clear when the point writer validates).  What separates the two is WHAT the
+ * disagreement points at -- a DELETED cell, or a live one -- which is the
+ * predicate ft_cell_pair_check states.
+ */
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG) || defined(FT_DEBUG_CELL_TORN)
+static __attribute__((noinline, cold, noreturn))
+void ft_cell_torn(const struct cds_ft *ft, const char *what,
+		const struct ft_ord_cell *from, const struct ft_ord_cell *via,
+		const struct ft_ord_cell *back)
+{
+	/*
+	 * WHICH LIST, AND IS ANYONE MID-REMOVAL?  A whole-trie graft_swap has
+	 * TWO sentinels in flight and a floating run whose ends still name the
+	 * OTHER trie's, so "sentinel of @ft" vs "some other cell" is the first
+	 * thing that classifies a report.
+	 */
+	fprintf(stderr, "FT CELL TORN: %s: %p%s -> %p%s, but back -> %p%s (ft %p sentinel %p)\n",
+		what, (const void *) from,
+		ft_ord_is_end(ft, from) ? " [SENTINEL of ft]" : "",
+		(const void *) via,
+		!via ? "" : ft_ord_is_end(ft, via) ? " [SENTINEL of ft]" :
+			urcu_txn_list_is_marked(rcu_dereference(via->lnode.next)) ?
+			" [MARKED]" : "",
+		(const void *) back,
+		!back ? "" : ft_ord_is_end(ft, back) ? " [SENTINEL of ft]" :
+			urcu_txn_list_is_marked(rcu_dereference(back->lnode.next)) ?
+			" [MARKED]" : "",
+		(const void *) ft, (const void *) &ft->ord_sentinel);
+#ifdef FT_DEBUG_SLOT_HIST
+	ft_sh_replay("torn: from->next", (void *const *) (const void *)
+		&from->lnode.next);
+	ft_sh_replay("torn: from->prev", (void *const *) (const void *)
+		&from->lnode.prev);
+	if (via) {
+		ft_sh_replay("torn: via->next", (void *const *) (const void *)
+			&via->lnode.next);
+		ft_sh_replay("torn: via->prev", (void *const *) (const void *)
+			&via->lnode.prev);
+	}
+#endif
+	fflush(stderr);
+	abort();
+}
+
+/*
+ * IS @c LOGICALLY DELETED?  The mark rides in the cell's OWN next word, and
+ * that word may currently hold a proxy, so resolve the proxy to the value its
+ * commit denotes and ask the MARK of that -- urcu_txn_list_resolve() is no use
+ * here, it strips the very bit in question.
+ */
+static inline
+bool ft_cell_deleted(const struct ft_ord_cell *c)
+{
+	void *raw = (void *) rcu_dereference(
+		ft_ord_cell_lnode((struct ft_ord_cell *) (uintptr_t) c)->next);
+
+	if (urcu_txn_is_proxy(raw, URCU_TXN_TAG))
+		raw = urcu_txn_resolve(raw, URCU_TXN_TAG);
+	return urcu_txn_list_is_marked(raw);
+}
+
+/*
+ * @c's neighbour must name @c back -- AND THE DISAGREEMENT MUST POINT AT A
+ * DELETED CELL.  That second half is the whole rule, and it is what tells the
+ * two measured disagreements apart:
+ *
+ *   TORN: the neighbour still names a cell that is already MARKED.  Every
+ *         producer of a mark (urcu_txn_list_del_prepare, _replace_prepare,
+ *         ft_ord_cell_unsplice_edges, the cell-swap site) records the mark AND
+ *         both neighbour edges in ONE descriptor, so a committed mark whose
+ *         neighbour edge did not move cannot happen -- unless the unsplice was
+ *         half-applied, which is the defect.
+ *   LEGAL: the neighbour names a live cell that is simply not us.  A whole-trie
+ *         graft_swap DISPLACES a run and its cells keep naming a sentinel that
+ *         has moved on -- one-way staleness, by design, and the staleness
+ *         answer re-plans.  Measured as this detector's first (false) finding.
+ *
+ * Proxies are resolved on both sides, so a commit in flight reads as its
+ * committed value and never as a disagreement.
+ */
+static inline
+void ft_cell_pair_check(const struct cds_ft *ft, const struct ft_ord_cell *c)
+{
+	const struct ft_ord_cell *o, *back;
+
+	if (!c)
+		return;
+	o = ft_ord_cell_resolve_ord(&c->lnode.prev);
+	if (o) {
+		back = ft_ord_cell_resolve_ord(&o->lnode.next);
+		if (caa_unlikely(back && back != c && ft_cell_deleted(back)))
+			ft_cell_torn(ft, "pred->next still names a DELETED cell",
+				c, o, back);
+	}
+	o = ft_ord_cell_resolve_ord(&c->lnode.next);
+	if (o) {
+		back = ft_ord_cell_resolve_ord(&o->lnode.prev);
+		if (caa_unlikely(back && back != c && ft_cell_deleted(back)))
+			ft_cell_torn(ft, "succ->prev still names a DELETED cell",
+				c, o, back);
+	}
+}
+# define FT_CELL_PAIR_CHECK(c)	ft_cell_pair_check(ft, (c))
+#else
+# define FT_CELL_PAIR_CHECK(c)	do { } while (0)
+#endif
+
 static inline
 bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 		const struct ft_cell_plan *p)
 {
+	/*
+	 * TORN BEFORE STALE.  Every answer below is "false", which the caller
+	 * reads as "re-plan and retry"; ask FIRST whether the list around the
+	 * words this plan holds is self-consistent, because a tear makes that
+	 * retry an infinite loop (see ft_cell_pair_check).  Debug builds only.
+	 */
+	FT_CELL_PAIR_CHECK(p->pred);
+	FT_CELL_PAIR_CHECK(p->succ);
+	FT_CELL_PAIR_CHECK(p->pred2);
+	FT_CELL_PAIR_CHECK(p->succ2);
 	if (p->cell && !p->splice) {
 		const struct ft_ord_cell *last = p->last ? p->last : p->cell;
 
@@ -16716,12 +16890,57 @@ unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
 	(void) ft;
 	if (caa_unlikely(!pred || !succ))
 		ft_ord_neighbour_null("ft_ord_cell_unsplice_edges", cell);
+#ifndef FT_RED_CELL_TEAR
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 	edges[n].owner_cell = pred;
 	edges[n].old_target = cell;
 	edges[n].new_target = succ;
 	n++;
+#else
+	/*
+	 * POSITIVE CONTROL for the torn-edge tripwire, never a shipped
+	 * configuration: drop the pred->next half of ONE unsplice.  The cell
+	 * then leaves the list on the SUCC side only -- succ->prev names pred
+	 * while pred->next still names the removed cell -- which is exactly the
+	 * half-applied unsplice measured in the graft_swap drain seam.  A
+	 * tripwire that does not fire under this is BLIND, and a detector that
+	 * cannot be made to go red measures the suite, not the code.
+	 *
+	 * ☠ ONE-SHOT, deliberately.  Tearing EVERY unsplice leaves removed
+	 * cells referenced after they are freed, and the run dies in an
+	 * unrelated walk on a dangling pointer (measured: SEGV in
+	 * ft_resolve_head_prev, and before that a HANG) -- a control so
+	 * destructive that it destroys the thing it was meant to measure.
+	 */
+	{
+		static int torn_once;
+
+		/*
+		 * ☠ AND ONLY A MIDDLE PAIR.  Tearing the ends -- or a
+		 * single-cell list, where pred == succ == the sentinel -- takes
+		 * the list out of service immediately and the run hangs in a
+		 * drain before any plan is ever validated, so the detector under
+		 * test never gets asked (measured: rc=124 with no diagnostic).
+		 * A tear between two ordinary cells leaves the list usable, and
+		 * the next op that plans across that pair is the consumer this
+		 * control exists to reach.
+		 */
+		if (pred == succ || ft_ord_is_end(ft, pred) ||
+				ft_ord_is_end(ft, succ) ||
+				uatomic_cmpxchg(&torn_once, 0, 1) != 0) {
+			edges[n].tag = URCU_TXN_TAG;
+			edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+			edges[n].owner_cell = pred;
+			edges[n].old_target = cell;
+			edges[n].new_target = succ;
+			n++;
+		} else {
+			fprintf(stderr, "FT RED CELL TEAR: dropping %p->next (cell %p, succ %p)\n",
+				(void *) pred, (void *) cell, (void *) succ);
+		}
+	}
+#endif
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 	edges[n].owner_cell = succ;
