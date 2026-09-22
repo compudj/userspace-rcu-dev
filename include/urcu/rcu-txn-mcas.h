@@ -553,25 +553,63 @@ int urcu_txn_plant(struct urcu_txn_record *r)
  * (or a peer's parked proxy) sat in the slot, and this park has just erased it.
  */
 static unsigned long urcu_txn_dbg_park_total, urcu_txn_dbg_park_clobber;
+/* Of the clobbers, how many erased a same-value record -- a VALIDATE. */
+static unsigned long urcu_txn_dbg_park_clobber_validate;
 static void urcu_txn_dbg_park_report(void) __attribute__((destructor));
 static void urcu_txn_dbg_park_report(void)
 {
-	fprintf(stderr, "URCU-TXN PARK total=%lu clobber=%lu\n",
+	fprintf(stderr, "URCU-TXN PARK total=%lu clobber=%lu (erased validates %lu)\n",
 		uatomic_read(&urcu_txn_dbg_park_total),
-		uatomic_read(&urcu_txn_dbg_park_clobber));
+		uatomic_read(&urcu_txn_dbg_park_clobber),
+		uatomic_read(&urcu_txn_dbg_park_clobber_validate));
 }
 static
 void urcu_txn_dbg_park_clobbered(struct urcu_txn_record *r, void *prev)
 {
 	unsigned long n = uatomic_add_return(&urcu_txn_dbg_park_clobber, 1);
 
-	if (n <= 12) {
+	/*
+	 * ☠ A TAGGED VALUE IS NOT A PROXY.  A list word carries its own tag bits
+	 * -- the deletion MARK above all -- so decode only what this record's
+	 * OWN tag says is a proxy, and even then only as a debug heuristic (a
+	 * foreign record may use a different tag).  Tested raw, this walked off
+	 * a marked list pointer and crashed the run it was measuring.
+	 */
+	if (urcu_txn_is_proxy(prev, r->proxy_tag)) {
+		const struct urcu_txn_record *o = (const struct urcu_txn_record *)
+			urcu_txn_untag(prev, r->proxy_tag);
+
+		if (o->old_ptr == o->new_ptr)
+			uatomic_inc(&urcu_txn_dbg_park_clobber_validate);
+	}
+	if (n <= 40) {
 		void *bt[24];
 		int nbt = backtrace(bt, 24);
 
 		fprintf(stderr, "URCU-TXN PARK-CLOBBER #%lu slot=%p old=%p prev=%p new=%p tag=%#lx kind=%d desc=%p\n",
 			n, (void *) r->slot, r->old_ptr, prev, r->new_ptr,
 			(unsigned long) r->proxy_tag, (int) r->kind, (void *) r->desc);
+		/*
+		 * WHOSE PROXY DID THIS PARK ERASE?  A tagged @prev is a record
+		 * address (records are 16-byte aligned, whatever the embedder's
+		 * tag), so decode it and name the record the park is about to
+		 * lose -- its slot says whether it even belongs to this word,
+		 * and old == new says it is a VALIDATE, whose settle will write
+		 * this value back over the parker's.
+		 */
+		if (urcu_txn_is_proxy(prev, r->proxy_tag)) {
+			const struct urcu_txn_record *o =
+				(const struct urcu_txn_record *)
+				urcu_txn_untag(prev, r->proxy_tag);
+
+			fprintf(stderr, "URCU-TXN PARK-CLOBBER #%lu   erased record %p {slot %p old %p new %p tag %#lx kind %d} desc %p status %lu%s\n",
+				n, (const void *) o, (void *) o->slot,
+				o->old_ptr, o->new_ptr,
+				(unsigned long) o->proxy_tag, (int) o->kind,
+				(void *) o->desc,
+				o->desc ? urcu_txn_desc_status(o->desc) : 99UL,
+				o->old_ptr == o->new_ptr ? " VALIDATE" : "");
+		}
 		backtrace_symbols_fd(bt, nbt, 2);
 	}
 }

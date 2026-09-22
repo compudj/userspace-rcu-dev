@@ -5580,8 +5580,9 @@ int ft_detach_node(struct cds_ft *ft,
 			 * ft_flip_txn_record_release_lock.)
 			 */
 			if (!(ft->lock_fine && old_recompacted_node))
-				ft_flip_txn_guard_parent(ft, commit_txn,
-					ft_parent_node(iter_meta->parent_word));
+				ft_flip_txn_guard_parent_ctx(ft, commit_txn,
+					ft_parent_node(iter_meta->parent_word),
+					op_ctx);
 			/*
 			 * PHASE B, STEP B2 -- THE ARM, RECOMPACTION PUBLISH
 			 * (fused).  This is where the remove surface commits
@@ -8579,11 +8580,14 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * terminates (no livelock).  Exclusive trie: the bracket opens nothing
 	 * and no conflict ever fires.
 	 */
+	FT_SH_STALL_DECL;
+
 	ft_op_retry_init(&op_retry, FT_OP_REMOVE, NULL, 0);
 	ft_txn_op_init(ft, &optxn);
 	for (;;) {
 		need_retry = false;
 		ft_op_retry_tick(ft, &op_retry, 0);
+		FT_SH_STALL_TICK(ft, "cds_ft_remove");
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		ft_tA = ft_dbg_now_ns();
 #endif

@@ -1437,6 +1437,154 @@ extern unsigned long ft_acq_heap_taken;
 # define FT_ACQ_EMBED_LOCKS	FT_FLIP_TXN_MAX_LOCKS
 #endif
 
+#ifdef FT_DEBUG_SLOT_HIST
+/*
+ * -DFT_DEBUG_SLOT_HIST (see ft-txn-rec-dbg.h): every engine store, filed in a
+ * ring hashed by SLOT address.  Racy by design, like the lock-leak ring: a slot
+ * claimed by one atomic add, plain stores into it, every event naming its word so
+ * a hash collision is visible.  Replayed when a writer stalls.
+ */
+# include <sys/syscall.h>
+# include <time.h>
+struct ft_sh_ev {
+	void **slot;
+	void *val, *old, *nw;
+	const void *desc;
+	uint64_t ts;
+	uint32_t tid;
+	uint16_t nr;
+	uint8_t kind, status;
+};
+# define FT_SH_NSLOT	16384
+# define FT_SH_HIST	32
+static struct ft_sh_slot {
+	unsigned long head;
+	struct ft_sh_ev ev[FT_SH_HIST];
+} ft_sh_map[FT_SH_NSLOT];
+static __thread uint32_t ft_sh_tid;
+
+static inline uint64_t ft_sh_now(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+static inline struct ft_sh_slot *ft_sh_slot_of(void *const *slot)
+{
+	return &ft_sh_map[((uintptr_t) slot >> 3) & (FT_SH_NSLOT - 1)];
+}
+
+static void ft_sh_note(const struct urcu_txn_record *r, void *v)
+{
+	struct ft_sh_slot *sl;
+	unsigned long i;
+	struct ft_sh_ev *e;
+
+	/*
+	 * A same-value MW record is a VALIDATE: its CAS installs only over the
+	 * value it names.  Skipped, or a hot word's validates scroll every real
+	 * transition out of its ring (measured: the list head's).  A same-value
+	 * SW record is KEPT: a park is a blind store, so it can write its
+	 * value back over a peer's.
+	 */
+	if (r->old_ptr == r->new_ptr && r->kind == URCU_TXN_KIND_MW)
+		return;
+	sl = ft_sh_slot_of(r->slot);
+	i = uatomic_add_return(&sl->head, 1) - 1;
+	e = &sl->ev[i % FT_SH_HIST];
+
+	if (caa_unlikely(!ft_sh_tid))
+		ft_sh_tid = (uint32_t) syscall(SYS_gettid);
+	e->slot = r->slot;
+	e->val = v;
+	e->old = r->old_ptr;
+	e->nw = r->new_ptr;
+	e->desc = r->desc;
+	e->nr = r->desc ? (uint16_t) r->desc->nr : 0;
+	e->status = r->desc ? (uint8_t) CMM_LOAD_SHARED(r->desc->status) : 9;
+	e->kind = (uint8_t) r->kind;
+	e->tid = ft_sh_tid;
+	e->ts = ft_sh_now();
+}
+
+static void ft_sh_replay(const char *name, void *const *slot)
+{
+	struct ft_sh_slot *sl = ft_sh_slot_of(slot);
+	unsigned long h = CMM_LOAD_SHARED(sl->head);
+	unsigned long i = h > FT_SH_HIST ? h - FT_SH_HIST : 0;
+
+	fprintf(stderr, "FT SLOT HIST %s %p = %p now (%lu stores hashed here)\n",
+		name, (void *) slot, CMM_LOAD_SHARED(*slot), h);
+	for (; i < h; i++) {
+		const struct ft_sh_ev *e = &sl->ev[i % FT_SH_HIST];
+		const char *ph = e->val == e->nw ? "NEW" :
+			e->val == e->old ? "OLD(restore)" : "PROXY";
+
+		if (e->slot != slot)
+			continue;
+		fprintf(stderr, "  #%lu ts=%llu tid=%u wrote %p [%s] rec{old %p new %p} %s desc %p nr %u status %u\n",
+			i, (unsigned long long) e->ts, e->tid, e->val, ph,
+			e->old, e->nw, e->kind ? "MW" : "SW", e->desc,
+			e->nr, e->status);
+	}
+}
+
+/*
+ * A point writer that has retried for 2 s on an ordered trie: dump the list
+ * head -- the sentinel, its first cell and that cell's successor -- with each
+ * word's store history, then stop.  The measured stall (seam test, W=2, no
+ * swaps) is a TORN head: sentinel.next names a cell whose next carries the
+ * deletion mark while its successor's prev already names the sentinel.
+ */
+static __attribute__((noinline, cold, noreturn))
+void ft_sh_stall_dump(struct cds_ft *ft, const char *who)
+{
+	struct urcu_txn_list_node *s = &ft->ord_sentinel.node;
+	struct urcu_txn_list_node *h, *f;
+
+	fprintf(stderr, "FT SLOT HIST STALL: %s (tid %ld) retried > 2 s on trie %p\n",
+		who, (long) syscall(SYS_gettid), (void *) ft);
+	if (ft->ordered_list) {
+		h = urcu_txn_list_resolve(CMM_LOAD_SHARED(s->next));
+		f = h && h != s ?
+			urcu_txn_list_resolve(CMM_LOAD_SHARED(h->next)) : NULL;
+		fprintf(stderr, "FT SLOT HIST head: sentinel %p {next %p prev %p} "
+			"first %p {next %p prev %p} succ %p {next %p prev %p}\n",
+			(void *) s, CMM_LOAD_SHARED(s->next),
+			CMM_LOAD_SHARED(s->prev), (void *) h,
+			h ? CMM_LOAD_SHARED(h->next) : NULL,
+			h ? CMM_LOAD_SHARED(h->prev) : NULL, (void *) f,
+			f ? CMM_LOAD_SHARED(f->next) : NULL,
+			f ? CMM_LOAD_SHARED(f->prev) : NULL);
+		ft_sh_replay("sentinel.next", (void **) &s->next);
+		ft_sh_replay("sentinel.prev", (void **) &s->prev);
+		if (h && h != s) {
+			ft_sh_replay("first.next", (void **) &h->next);
+			ft_sh_replay("first.prev", (void **) &h->prev);
+		}
+		if (f && f != s) {
+			ft_sh_replay("succ.prev", (void **) &f->prev);
+			ft_sh_replay("succ.next", (void **) &f->next);
+		}
+	}
+	fflush(stderr);
+	abort();
+}
+# define FT_SH_STALL_DECL		uint64_t ft_sh_t0 = 0
+# define FT_SH_STALL_TICK(ft_, who_)					\
+	do {								\
+		if (!ft_sh_t0)						\
+			ft_sh_t0 = ft_sh_now();				\
+		else if (ft_sh_now() - ft_sh_t0 > 2000000000ULL)	\
+			ft_sh_stall_dump((ft_), (who_));		\
+	} while (0)
+#else
+# define FT_SH_STALL_DECL		do { } while (0)
+# define FT_SH_STALL_TICK(ft_, who_)	do { } while (0)
+#endif
+
 /*
  * ☞ -DFT_DEBUG_LOCK_LEAK: WHO LEFT THIS LOCK WORD SET?  (diagnosis only)
  *
@@ -14324,9 +14472,82 @@ void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
  * the retained single-writer exclusion the guard always passes =>
  * behaviour-identical; Phase 4.3 makes it load-bearing.  @t must reserve +1.
  */
+#ifdef FT_DEBUG_GUARD_AUDIT
+# include <dlfcn.h>
+static unsigned long ft_guard_total, ft_guard_unheld, ft_guard_unheld_fine;
+static unsigned long ft_guard_ctx_covered, ft_guard_truly_unheld;
+/* ...and the plants with NO ctx to ask: unknown, never "unheld". */
+static unsigned long ft_guard_no_ctx;
+/* lock_or_guard exits that still planted a guard, by exit code. */
+static unsigned long ft_guard_exit[4];
+/* Per-CALLER tally of the unowned plants: which sites still guard, not lock. */
+#define FT_GUARD_SITES	16
+static struct ft_guard_site {
+	const void *pc;
+	unsigned long n;
+} ft_guard_site[FT_GUARD_SITES];
+static void ft_guard_note_site(const void *pc)
+{
+	unsigned int i;
+
+	for (i = 0; i < FT_GUARD_SITES; i++) {
+		if (uatomic_read(&ft_guard_site[i].pc) == pc) {
+			uatomic_inc(&ft_guard_site[i].n);
+			return;
+		}
+		if (!uatomic_read(&ft_guard_site[i].pc) &&
+				uatomic_cmpxchg(&ft_guard_site[i].pc, NULL,
+					(void *) pc) == NULL) {
+			uatomic_inc(&ft_guard_site[i].n);
+			return;
+		}
+	}
+}
+static __attribute__((destructor)) void ft_guard_audit_report(void)
+{
+	unsigned int i;
+
+	/*
+	 * A plant at the guard label is either "this trie takes no per-node
+	 * locks / nothing to lock" or an acquire MISS, whose commit is
+	 * DISCARDED unplanted -- so its validate never installs.  (@acquire_miss
+	 * is per-txn, so an earlier miss in the same txn counts here too.)
+	 */
+	fprintf(stderr, "FT GUARD AUDIT: lock_or_guard guard-label plants -- "
+		"no lock to take %lu, [unused %lu], after an EARLIER miss in the "
+		"same txn %lu, THIS call missed %lu\n",
+		uatomic_read(&ft_guard_exit[0]), uatomic_read(&ft_guard_exit[1]),
+		uatomic_read(&ft_guard_exit[2]), uatomic_read(&ft_guard_exit[3]));
+	fprintf(stderr, "FT GUARD AUDIT: §4.B parent guards planted %lu, of them "
+		"on a word this txn does NOT own %lu (FINE concurrent %lu = "
+		"covered by the op's ctx %lu + TRULY UNHELD %lu + no ctx to "
+		"ask %lu)\n",
+		uatomic_read(&ft_guard_total), uatomic_read(&ft_guard_unheld),
+		uatomic_read(&ft_guard_unheld_fine),
+		uatomic_read(&ft_guard_ctx_covered),
+		uatomic_read(&ft_guard_truly_unheld),
+		uatomic_read(&ft_guard_no_ctx));
+	for (i = 0; i < FT_GUARD_SITES; i++) {
+		const void *pc = uatomic_read(&ft_guard_site[i].pc);
+		Dl_info info;
+
+		if (!pc)
+			continue;
+		/* Offsets, not absolute addresses: ASLR moves the library. */
+		fprintf(stderr, "FT GUARD AUDIT:   caller +0x%lx  %lu\n",
+			dladdr(pc, &info) && info.dli_fbase ?
+				(unsigned long) ((const char *) pc -
+					(const char *) info.dli_fbase) :
+				(unsigned long) (uintptr_t) pc,
+			uatomic_read(&ft_guard_site[i].n));
+	}
+}
+#endif
+
 static inline
-void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
-		struct cds_ft_inode_flag *parent_nf)
+void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t,
+		struct cds_ft_inode_flag *parent_nf,
+		const struct ft_lock_ctx *ctx)
 {
 	/*
 	 * NULL @t: the forward publish is a lone on-stack edge with no txn to
@@ -14357,6 +14578,50 @@ void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
 	{
 		struct cds_ft_metadata *pm = ft_flag_to_metadata(ft, parent_nf);
 
+#ifdef FT_DEBUG_GUARD_AUDIT
+		/*
+		 * ARM YIELD for the guard audit: how many §4.B guards are
+		 * planted on a word this txn does NOT own?  Those are MW
+		 * records (a validate) on a word its OWNER parks SW -- the
+		 * shape that tore the list head from the other side, and the
+		 * one a converted site is supposed to have REPLACED with the
+		 * lock.  The owned ones are safe: same op, one discipline.
+		 */
+		uatomic_inc(&ft_guard_total);
+		if (!ft_flip_txn_owns(t, pm)) {
+			uatomic_inc(&ft_guard_unheld);
+			/*
+			 * Only a FINE, non-exclusive trie has a PEER that could
+			 * SW-park this word under its lock while our validate's
+			 * proxy sits on it.  Everywhere else one writer owns the
+			 * whole trie, so the guard is merely redundant.
+			 */
+			if (ft->lock_fine && !ft->exclusive) {
+				uatomic_inc(&ft_guard_unheld_fine);
+				/*
+				 * ☞ AND IS IT REALLY UNHELD?  The txn registry
+				 * is not the op's whole held set: a hold taken
+				 * on the ACQUIRE txn, or living in the ctx's
+				 * extra[] frames, is invisible to it (the
+				 * replace site says so in its own comment).
+				 * ft_lock_ctx_covers answers for the op, member
+				 * identity included -- which decides whether the
+				 * cure is "take the lock" or "skip a guard the
+				 * op's own lock already subsumes".
+				 */
+				if (!ctx) {
+					uatomic_inc(&ft_guard_no_ctx);
+				} else if (ft_lock_ctx_covers(ctx, pm)) {
+					uatomic_inc(&ft_guard_ctx_covered);
+				} else {
+					uatomic_inc(&ft_guard_truly_unheld);
+					/* Tally ONLY the class that matters. */
+					ft_guard_note_site(
+						__builtin_return_address(0));
+				}
+			}
+		}
+#endif
 		if (ft_flip_txn_owns(t, pm)) {
 			/*
 			 * The REGISTRY is the skip's predicate -- order-
@@ -14413,6 +14678,14 @@ void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
 	urcu_txn_validate(t->mtxn,
 			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
 			(void *) live, FT_STATE_PROXY);
+}
+
+/* The ctx-less spelling: a site that has no lock context to offer. */
+static inline
+void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
+		struct cds_ft_inode_flag *parent_nf)
+{
+	ft_flip_txn_guard_parent_ctx(ft, t, parent_nf, NULL);
 }
 
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -14518,6 +14791,9 @@ void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 	ft_delay_seam(FT_DELAY_SITE_ACQUIRE);
 	if (exit_ret)
 		*exit_ret = FT_LOG_EXIT_NOT_FINE;
+#ifdef FT_DEBUG_GUARD_AUDIT
+	bool ga_was_miss = t && t->acquire_miss;
+#endif
 	if (ft->lock_fine && t && parent_nf) {
 		/*
 		 * @t is the registry this record joins, so it is authoritative
@@ -14594,8 +14870,8 @@ void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 			if (held.shared) {
 				if (held.lock != ft_flag_to_metadata(ft, parent_nf)
 						&& !held.node_held)
-					ft_flip_txn_guard_parent(ft, t,
-						parent_nf);
+					ft_flip_txn_guard_parent_ctx(ft, t,
+						parent_nf, ctx);
 				if (exit_ret)
 					*exit_ret = FT_LOG_EXIT_SHARED;
 				return;
@@ -14648,7 +14924,16 @@ void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 			t->acquire_enomem = true;
 	}
 guard:
-	ft_flip_txn_guard_parent(ft, t, parent_nf);
+#ifdef FT_DEBUG_GUARD_AUDIT
+	/*
+	 * WHICH EXIT brought this plant here?  A MISS discards the commit, so
+	 * its validate never installs and costs only work; SHARED and NOT_FINE
+	 * install.  The classes need different cures, so count them apart.
+	 */
+	uatomic_inc(&ft_guard_exit[!t ? 0 : (t->acquire_miss && !ga_was_miss) ?
+			3 : t->acquire_miss ? 2 : 0]);
+#endif
+	ft_flip_txn_guard_parent_ctx(ft, t, parent_nf, ctx);
 }
 
 static inline
@@ -14664,6 +14949,8 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 #define ft_flip_txn_lock_or_guard_parent(ft, t, ctx, parent_nf, parent_depth)	\
 	ft_flip_txn_lock_or_guard_parent_at(__func__, __LINE__, (ft), (t),	\
 		(ctx), (parent_nf), (parent_depth))
+
+
 
 /*
  * §9.3's THIRD LOCK-SET MEMBER: "{C, P} (+ {GP} iff P compressed)".

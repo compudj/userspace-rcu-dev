@@ -278,4 +278,17 @@ static void ft_win_lost(const struct urcu_txn_record *rec, void *seen);
 #define FT_WIN_NOTE_RAW(slot_, val_, k_)	do { } while (0)
 #endif
 
+#if defined(FT_DEBUG_SLOT_HIST) && !defined(URCU_TXN_REC_WROTE)
+/*
+ * -DFT_DEBUG_SLOT_HIST: a per-SLOT history of every engine store -- plant,
+ * park, settle, abort restore, lone edge -- replayed by a writer that stalls,
+ * so a TORN multi-word edit names the commit that wrote (or failed to write)
+ * each of its words.  Tag the producer, not the consumer.  Defined in
+ * ft-mutation-helpers.h, where the record type is complete.
+ */
+struct urcu_txn_record;
+static void ft_sh_note(const struct urcu_txn_record *r, void *v);
+# define URCU_TXN_REC_WROTE(r, v)	ft_sh_note((r), (void *) (v))
+#endif
+
 #endif /* _FT_TXN_REC_DBG_H */

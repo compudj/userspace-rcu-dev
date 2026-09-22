@@ -891,7 +891,7 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 		 */
 		ft_flip_txn_cover_member(ic->txn,
 			ft_flag_to_metadata(ft, parent_nf));
-		ft_flip_txn_guard_parent(ft, ic->txn, parent_nf);
+		ft_flip_txn_guard_parent_ctx(ft, ic->txn, parent_nf, ctx);
 	}
 	else
 		ft_flip_txn_hold_or_lock_parent(ft, ic->txn, ctx, parent_nf,
@@ -3633,6 +3633,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	struct ft_ord_cell *precell;
 	void *cell = NULL;			/* @precell's carrier; reused across retries */
 	enum urcu_txn_status cst = URCU_TXN_STATUS_OK;	/* last commit outcome */
+	FT_SH_STALL_DECL;
 	struct ft_insert_commit ic = { 0 };
 	/*
 	 * The attach's recompactions lock {C, P, GP}; @d dates them and @ic.txn
@@ -3695,6 +3696,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	ft_txn_op_init(ft, &optxn);
 
 restart_attempt:
+	FT_SH_STALL_TICK(ft, "_cds_ft_insert");
 	urcu_txn_begin(&optxn);
 	/*
 	 * Per-attempt setup, re-entered on a concurrent-writer conflict (a
@@ -6453,7 +6455,8 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * this op set no LOCK on @parent_nf itself.
 			 */
 			if (!hm || ft_flag_to_metadata(ft, parent_nf) != hm)
-				ft_flip_txn_guard_parent(ft, txn, parent_nf);
+				ft_flip_txn_guard_parent_ctx(ft, txn, parent_nf,
+					&hctx);
 			/*
 			 * §9.3's THIRD LOCK-SET MEMBER.  A COMPRESSED
 			 * @parent_nf makes this publish write TWO reader-visible
@@ -6585,7 +6588,8 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * this op set no LOCK on @parent_nf itself.
 			 */
 			if (!hm || ft_flag_to_metadata(ft, parent_nf) != hm)
-				ft_flip_txn_guard_parent(ft, txn, parent_nf);
+				ft_flip_txn_guard_parent_ctx(ft, txn, parent_nf,
+					&hctx);
 			/*
 			 * §9.3's THIRD LOCK-SET MEMBER.  A COMPRESSED
 			 * @parent_nf makes this publish write TWO reader-visible
