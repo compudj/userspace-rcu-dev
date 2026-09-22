@@ -12218,6 +12218,70 @@ static void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
  * insert_after_prepare edge recording, including its succ == pos self-loop guard
  * skip; compose on a DEFAULT (read-your-own-writes) handle.
  */
+/*
+ * ☠ A NODE-BASED WRITER ENTERED WHILE A BULK OP IS LIVE MUST NOT TRUST THE
+ * CALLER'S REFERENCES (cds_ft_remove, cds_ft_replace).
+ *
+ * The bulk gate's grace period drains only the readers active when the bulk op
+ * began.  A caller whose read-side section begins INSIDE the window can look
+ * @node up before the op's flip and reach the writer after it: its writer part
+ * queues on the FT-wide lock, and the op's drain seam must admit it (the seam's
+ * grace period waits for that very section).  By then a whole-trie graft_swap has
+ * moved @node into the swap trie, and a writer that derives @node's holder from
+ * its back pointers -- remove never descends -- works on the OTHER trie
+ * (inv_graft_swap_whole_seam_points: the NULL-neighbour abort, the recompact
+ * assert, a remover spinning online against the op's own drain).  A rekey moves
+ * @node to another KEY of the same trie.
+ *
+ * THE ITERATOR'S KEY IS THE ABSOLUTE TRUTH of its position (MATHIEU).  So with
+ * the gate set, drop the cached position, look the key up from the root, and
+ * act on @node only if it is in the chain at that key: a node a bulk op moved
+ * away -- to another trie or to another key -- is not at the iterator's position,
+ * and NOT_FOUND is the right answer.  The lookup is ft->lookup_iter_fn, which is
+ * the two-descent coherent variant on every trie that can host a rekey
+ * (rekey_coherence), so a key in flight is not transiently missed.
+ *
+ * Sufficient at entry: a section that spans a bulk op's flip cannot outlive
+ * that op's post-flip grace period, so the op is still live -- the gate still
+ * set -- when such a writer arrives; and with the gate clear at entry, a bulk op
+ * starting later waits for this section before it mutates anything.
+ */
+static inline
+enum cds_ft_status ft_iter_redescend_node(struct cds_ft *ft,
+		struct cds_ft_iter *iter, struct cds_ft_node *node)
+{
+	struct cds_ft_node *h;
+
+	ft_iter_drop_position_keep_key(iter);
+	if ((*ft->lookup_iter_fn)(ft, iter) != CDS_FT_STATUS_OK)
+		return CDS_FT_STATUS_NOT_FOUND;
+	for (h = iter->node; h; h = cds_ft_node_next_rcu(h))
+		if (h == node)
+			return CDS_FT_STATUS_OK;
+	return CDS_FT_STATUS_NOT_FOUND;		/* moved away, or already gone */
+}
+
+/*
+ * ☠ A NULL ORDERED-LIST NEIGHBOUR UNDER A POINT WRITER IS A BROKEN LIST, NOT A
+ * RACE TO RETRY.  The only producer of a NULL outer link is a bulk move's
+ * universal end (ft_root_list_swap_publish_dual), and a point writer can meet it
+ * only if a bulk op left it visible across a seam that admits point writers --
+ * the rule G5.25's writer-lock drop relies on.  Building an edge through it
+ * faults (a slot at address 0: both shapes measured by
+ * inv_graft_swap_whole_seam_points), and retrying on it spins for ever, online,
+ * stalling the very grace period that would finalize it.  So stop HERE, and say
+ * which seam to look at.  Every caller is a point op.
+ */
+static __attribute__((noreturn, noinline))
+void ft_ord_neighbour_null(const char *who, const void *cell)
+{
+	fprintf(stderr, "FT NULL ORDERED-LIST NEIGHBOUR in %s (cell %p) -- a "
+		"bulk op left the list NULL-terminated across a seam that "
+		"admits point writers\n", who, cell);
+	fflush(stderr);
+	abort();
+}
+
 static inline
 int ft_txn_list_insert_between_prepare(struct cds_ft *ft,
 		struct ft_flip_txn *t,
@@ -16018,6 +16082,8 @@ unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&cell->lnode.next);
 
 	(void) ft;
+	if (caa_unlikely(!pred || !succ))
+		ft_ord_neighbour_null("ft_ord_cell_unsplice_edges", cell);
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 	edges[n].owner_cell = pred;

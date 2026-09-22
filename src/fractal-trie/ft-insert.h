@@ -6593,6 +6593,12 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	struct ft_op_retry retry;
 
 	CDS_FT_SCOPED_WRITER(ft);
+	if (caa_unlikely(ft_bulk_active(ft))) {
+		/* See ft_iter_redescend_node: the gate is set, so re-derive. */
+		s = ft_iter_redescend_node(ft, iter, old_node);
+		if (s != CDS_FT_STATUS_OK)
+			return s;
+	}
 	ft_op_retry_init(&retry, FT_OP_REPLACE, NULL, 0);
 	ft_txn_op_init(ft, &optxn);
 	for (;;) {

@@ -8532,6 +8532,12 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 #endif
 
 	CDS_FT_SCOPED_WRITER(ft);
+	if (caa_unlikely(ft_bulk_active(ft))) {
+		/* See ft_iter_redescend_node: the gate is set, so re-derive. */
+		s = ft_iter_redescend_node(ft, iter, node);
+		if (s != CDS_FT_STATUS_OK)
+			return s;
+	}
 	/*
 	 * FT-owned per-op read-side bracket + retry identity (doc §11): on a
 	 * concurrent trie the body's position derivation, parked records, and
@@ -9653,6 +9659,14 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	bool need_retry;
 
 	CDS_FT_SCOPED_WRITER(ft);
+	/*
+	 * Same rule as cds_ft_remove (ft_iter_redescend_node): with a bulk op live
+	 * the cached position may predate its flip.  Dropping it is enough here
+	 * -- the locked body already re-seeds by a fresh lookup from the root
+	 * when the cache is not valid.
+	 */
+	if (caa_unlikely(ft_bulk_active(ft)))
+		ft_iter_drop_position_keep_key(iter);
 	ft_op_retry_init(&op_retry, FT_OP_REMOVE_ALL, NULL, 0);
 	ft_txn_op_init(ft, &optxn);
 	for (;;) {

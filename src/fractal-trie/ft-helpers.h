@@ -634,7 +634,17 @@ void ft_iter_drop_position_keep_key(struct cds_ft_iter *iter)
 static inline
 void iter_auto_invalidate_cache(struct cds_ft_iter *iter)
 {
-	if (iter->cache_mode == CDS_FT_ITER_UNCACHED) {
+	/*
+	 * ☞ AND UNCACHED FOR EVERYONE WHILE A MOVE IS IN FLIGHT (MATHIEU).  In the
+	 * rekey-coherent double-descent mode (ft_move_active) a cached position
+	 * can straddle the move and name a place its key no longer is; the key is
+	 * the absolute truth of the iterator's position, so keep the key and drop
+	 * the position, and the next op re-descends by key -- coherently.  The
+	 * gate's grace period drained every section older than the flag, so no
+	 * cache older than the move survives into it.
+	 */
+	if (iter->cache_mode == CDS_FT_ITER_UNCACHED ||
+			ft_move_active(iter->ft)) {
 		/*
 		 * Materialize a live leaf-referenced key BEFORE clearing, so the
 		 * next uncached re-descent reads the saved key, not a stale leaf.
