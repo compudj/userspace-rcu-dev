@@ -230,6 +230,17 @@ extern unsigned long urcu_txn_abort_lost_write;
 #endif
 
 /*
+ * URCU_TXN_PARK_CLOBBER_NOTE(r, prev) is the debug park-clobber report's
+ * offer to the embedder: @r is about to blindly overwrite @prev, which is not
+ * what @r expects to be there.  An embedder holding a per-slot write history
+ * replays it here, which names the WRITER of @prev -- the backtrace only ever
+ * names the parker.
+ */
+#ifndef URCU_TXN_PARK_CLOBBER_NOTE
+#define URCU_TXN_PARK_CLOBBER_NOTE(r, prev)	do { } while (0)
+#endif
+
+/*
  * URCU_TXN_REC_LOST(r, seen) hands the embedder the value the losing CAS
  * OBSERVED, at the instant of the loss.  The CAS instruction returns that
  * value and the engine has always thrown it away -- an embedder reconstructing
@@ -558,6 +569,16 @@ static unsigned long urcu_txn_dbg_park_clobber_validate;
 static void urcu_txn_dbg_park_report(void) __attribute__((destructor));
 static void urcu_txn_dbg_park_report(void)
 {
+	/*
+	 * ☠ THESE COUNTERS ARE STATIC PER TU: every unit that includes this
+	 * header has its own pair, so the units that parked nothing used to
+	 * print "total=0" lines around the one line that counted -- and a
+	 * reader who greps the first match reads a WRONG ZERO.  Silence the
+	 * empty ones; a TU that did no work has nothing to report.
+	 */
+	if (!uatomic_read(&urcu_txn_dbg_park_total) &&
+			!uatomic_read(&urcu_txn_dbg_park_clobber))
+		return;
 	fprintf(stderr, "URCU-TXN PARK total=%lu clobber=%lu (erased validates %lu)\n",
 		uatomic_read(&urcu_txn_dbg_park_total),
 		uatomic_read(&urcu_txn_dbg_park_clobber),
@@ -567,6 +588,15 @@ static
 void urcu_txn_dbg_park_clobbered(struct urcu_txn_record *r, void *prev)
 {
 	unsigned long n = uatomic_add_return(&urcu_txn_dbg_park_clobber, 1);
+
+	/*
+	 * One compact, uncapped line per clobber.  The summary below is a
+	 * per-TU static and a TU that parked nothing prints a zero, so COUNTING
+	 * THE EVENTS is the only reading that cannot be a wrong zero: the
+	 * highest #n in the log is the count.
+	 */
+	fprintf(stderr, "URCU-TXN PARK-CLOBBER-EVT #%lu slot=%p\n", n,
+		(void *) r->slot);
 
 	/*
 	 * ☠ A TAGGED VALUE IS NOT A PROXY.  A list word carries its own tag bits
@@ -611,6 +641,15 @@ void urcu_txn_dbg_park_clobbered(struct urcu_txn_record *r, void *prev)
 				o->old_ptr == o->new_ptr ? " VALIDATE" : "");
 		}
 		backtrace_symbols_fd(bt, nbt, 2);
+		/*
+		 * WHO WROTE THE VALUE THE PARK FOUND?  The backtrace names the
+		 * PARKER; an embedder that keeps a per-slot write history (the
+		 * FT's -DFT_DEBUG_SLOT_HIST) answers the other half by replaying
+		 * this word.  Capped tighter than the report itself: a replay is
+		 * 32 lines.
+		 */
+		if (n <= 4)
+			URCU_TXN_PARK_CLOBBER_NOTE(r, prev);
 	}
 }
 #endif

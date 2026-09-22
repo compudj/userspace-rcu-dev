@@ -288,7 +288,9 @@ static void ft_win_lost(const struct urcu_txn_record *rec, void *seen);
  */
 struct urcu_txn_record;
 static void ft_sh_note(const struct urcu_txn_record *r, void *v);
+static void ft_sh_clobber(const struct urcu_txn_record *r, void *prev);
 # define URCU_TXN_REC_WROTE(r, v)	ft_sh_note((r), (void *) (v))
+# define URCU_TXN_PARK_CLOBBER_NOTE(r, prev)	ft_sh_clobber((r), (prev))
 #endif
 
 #endif /* _FT_TXN_REC_DBG_H */

@@ -1532,6 +1532,41 @@ static void ft_sh_replay(const char *name, void *const *slot)
 }
 
 /*
+ * URCU_TXN_PARK_CLOBBER_NOTE: the engine is about to blindly park over a value
+ * its record did not expect.  Its backtrace names the PARKER; this names the
+ * WRITER -- the word's engine-store history, and, when the lock-leak ring is
+ * built too, its take/release history, which is where a cleared LOCK shows up
+ * (a plain CAS, invisible to the engine's ring).
+ */
+#ifdef FT_DEBUG_LOCK_LEAK
+/* Defined with the lock-leak ring, further down this file. */
+static void ft_ll_replay(const struct cds_ft_metadata *lock, const char *why);
+#endif
+static void ft_sh_clobber(const struct urcu_txn_record *r, void *prev)
+{
+	fprintf(stderr, "FT SLOT HIST CLOBBER: record %p slot %p expected %p, found %p (writing %p)\n",
+		(const void *) r, (void *) r->slot, r->old_ptr, prev,
+		r->new_ptr);
+	ft_sh_replay("clobbered slot", r->slot);
+#ifdef FT_DEBUG_LOCK_LEAK
+	/*
+	 * ☠ @state is NOT the first member, and not every clobbered slot is a
+	 * state word: back out by offsetof, and only for a slot whose values
+	 * look like STATE FLAGS rather than addresses.  (The lock ring is keyed
+	 * on the METADATA, and its replay filters by that key, so a wrong guess
+	 * would print another word's history as if it were this one.)
+	 */
+	if ((uintptr_t) r->old_ptr < 0x100000000UL &&
+			(uintptr_t) prev < 0x100000000UL)
+		ft_ll_replay((const struct cds_ft_metadata *)
+			((const char *) (const void *) r->slot -
+				offsetof(struct cds_ft_metadata, state)),
+			"park clobber");
+#endif
+	fflush(stderr);
+}
+
+/*
  * A point writer that has retried for 2 s on an ordered trie: dump the list
  * head -- the sentinel, its first cell and that cell's successor -- with each
  * word's store history, then stop.  The measured stall (seam test, W=2, no
@@ -1796,6 +1831,44 @@ void ft_ll_refused(const struct cds_ft_metadata *lock, uintptr_t s,
 	(void) system("lttng snapshot record 1>&2");
 # endif
 	abort();
+}
+
+/*
+ * The same history, replayed on demand rather than at a stuck streak: another
+ * instrument (the park-clobber report) has found a word in a state its own
+ * record did not expect, and what it needs is the take/release sequence that
+ * got it there.  Never aborts -- the caller decides.
+ */
+#include <dlfcn.h>
+
+static __attribute__((unused))
+void ft_ll_replay(const struct cds_ft_metadata *lock, const char *why)
+{
+	static const char *const kn[] = { "?", "TAKE", "CLEAR", "CLEAR_IF",
+		"SKIP_IF", "REG", "REC_SW", "REC_MW", "COMMIT", "DESTROY",
+		"REFUSED" };
+	struct ft_ll_slot *sl = ft_ll_slot_of(lock);
+	unsigned long h = uatomic_read(&sl->head);
+	unsigned long i = h > FT_LL_HIST ? h - FT_LL_HIST : 0;
+	Dl_info di;
+
+	fprintf(stderr, "FT LOCK HIST (%s) word %p state %#lx now\n", why,
+		(const void *) lock, (unsigned long) CMM_LOAD_SHARED(lock->state));
+	for (; i < h; i++) {
+		const struct ft_ll_ev *e = &sl->ev[i % FT_LL_HIST];
+
+		if (e->lock != lock)
+			continue;	/* another word hashed to this ring */
+		fprintf(stderr, "  #%lu ts=%llu tid=%u %s a=%#lx b=%#lx txn %p pc %p\n",
+			i, (unsigned long long) e->ts_ns, e->tid,
+			e->kind < (sizeof(kn) / sizeof(kn[0])) ?
+				kn[e->kind] : "?",
+			(unsigned long) e->a, (unsigned long) e->b, e->txn,
+			e->pc);
+	}
+	if (dladdr((void *) ft_ll_log, &di))
+		fprintf(stderr, "FT LOCK HIST BASE %s %p\n", di.dli_fname,
+			di.dli_fbase);
 }
 
 # define FT_LL_LOG(k, lock, txn, a, b)					\
