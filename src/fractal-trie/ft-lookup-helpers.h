@@ -65,6 +65,14 @@ struct ft_ord_cell *ft_ord_cell_ptr(const void *prev)
  * capture -- and the routing it derives is re-validated under the lock
  * (ft_unchain_kind), since a stale-but-valid value is the other half of the
  * same window.
+ *
+ * ☞ WHICH HOLDER, WHEN THE RE-HOME IS INTO A FRESH ONE.  A recompact re-homes
+ * the holder's heads from the old copy into a FRESH copy, and a head's back edge
+ * (cell->parent with the list on, the prev itself with it off) then names the
+ * fresh one from the decide on, while it stays parked until the settle.  The
+ * fresh copy is therefore PUBLISHED LOCKED by its re-homer and released in the
+ * late pass (ft_flip_txn_lock_born), so this rule holds for it too: whoever
+ * acquires it finds every adopted back edge already settled.
  */
 static inline_lookup
 void *ft_dereference_prev_resolved(struct cds_ft_node *node)
@@ -257,6 +265,47 @@ bool ft_ord_empty(const struct cds_ft *ft)
  */
 
 /*
+ * A FRESH CELL HANDED A PARKED PROXY AS ITS PARENT.  The copiers (a head
+ * promote, a head replace) load the old cell's parent PLAIN under the chain
+ * holder's lock, which is sound only while no re-home into that holder is still
+ * settling -- what publishing a fresh parent LOCKED guarantees
+ * (ft_flip_txn_lock_born).  Copied, the proxy names a record of ANOTHER slot that
+ * no settle rewrites: the new cell's parent stays a proxy for ever
+ * (inv_concurrent_same_key_removes, before the born lock).  Armed on every
+ * --enable-rcu-debug build and by -DFT_DEBUG_CELL_PARENT_COPY, which adds a
+ * backtrace (glibc <execinfo.h>, hence not on the portable arm).  Names the
+ * record's slot and its descriptor's status: the commit the value came from.
+ */
+#if defined(FT_DEBUG_CELL_PARENT_COPY) || defined(DEBUG_RCU) || \
+		defined(CONFIG_RCU_DEBUG)
+# define FT_CELL_PARENT_COPY_CHECK
+# ifdef FT_DEBUG_CELL_PARENT_COPY
+#  include <execinfo.h>
+# endif
+static __attribute__((noinline, cold, noreturn))
+void ft_cell_parent_copy_fail(struct cds_ft_inode_flag *parent, const void *site)
+{
+	struct urcu_txn_record *r = ft_flip_proxy_ptr(parent);
+
+	fprintf(stderr, "FT CELL PARENT COPY: fresh cell built with a parked "
+		"proxy %p (record slot %p old %p new %p, desc %p status %lu) "
+		"by %p\n", (void *) parent, (void *) r->slot, r->old_ptr,
+		r->new_ptr, (void *) r->desc,
+		r->desc ? uatomic_load(&r->desc->status, CMM_RELAXED) : 99UL,
+		site);
+	fflush(stderr);
+# ifdef FT_DEBUG_CELL_PARENT_COPY
+	{
+		void *bt[16];
+
+		backtrace_symbols_fd(bt, backtrace(bt, 16), 2);
+	}
+# endif
+	abort();
+}
+#endif
+
+/*
  * Allocate a head's cell and wire it to @node with parent @parent (which
  * may be NULL -- a root head -- or set later via ft_ord_cell_set_parent).
  * The ord_prev / ord_next list links start empty; the ordered-list splice
@@ -268,9 +317,14 @@ static
 void *ft_ord_cell_alloc(struct cds_ft *ft, struct cds_ft_node *node,
 		struct cds_ft_inode_flag *parent)
 {
-	struct cds_ft_metadata *meta = cds_ft_alloc_cell_item(ft);
+	struct cds_ft_metadata *meta;
 	struct ft_ord_cell *cell;
 
+#ifdef FT_CELL_PARENT_COPY_CHECK
+	if (caa_unlikely(ft_node_flip_proxy(parent)))
+		ft_cell_parent_copy_fail(parent, __builtin_return_address(0));
+#endif
+	meta = cds_ft_alloc_cell_item(ft);
 	if (!meta)
 		return NULL;
 	cell = (struct ft_ord_cell *) cds_ft_metadata_to_item(meta);

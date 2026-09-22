@@ -1762,6 +1762,15 @@ struct ft_flip_txn {
 		 * tombstone and skip a scrub that is owed.
 		 */
 		bool tombstone_terminal;
+		/*
+		 * A FRESH node's lock, taken by BUILDING it locked while hidden
+		 * (ft_flip_txn_lock_born), not by an acquire.  Its only terminal
+		 * is this txn's COMMIT: on any other one (ABORT, a pre-commit
+		 * destroy) the node never escaped and is discarded, and callers
+		 * may already have freed it, so ft_flip_txn_lock_release_all
+		 * must not write its word.
+		 */
+		bool born;
 	} *locks;			/* @locks_floor, or a heap growth */
 	unsigned int nr_locks;
 	unsigned int cap_locks;
@@ -5360,6 +5369,7 @@ void ft_flip_txn_lock_register_member(struct ft_flip_txn *t,
 	t->locks[t->nr_locks].snap = snap;
 	t->locks[t->nr_locks].src_shared = NULL;
 	t->locks[t->nr_locks].tombstone_terminal = false;
+	t->locks[t->nr_locks].born = false;
 	t->nr_locks++;
 	FT_LL_LOG(FT_LL_REG, meta, t, snap, 0);
 #ifdef FT_RED_OWNER_CLAIM_ON_LOCK
@@ -6456,8 +6466,11 @@ void ft_flip_txn_lock_release_all(struct ft_flip_txn *t)
 	 * entry still answering then is finding B.
 	 */
 	ft_flip_txn_scrub_owned(t, true);
-	for (i = 0; i < t->nr_locks; i++)
+	for (i = 0; i < t->nr_locks; i++) {
+		if (t->locks[i].born)
+			continue;	/* a discarded fresh node: see @born */
 		ft_meta_lock_release(t->locks[i].meta);
+	}
 	t->nr_locks = 0;
 }
 
@@ -13853,6 +13866,132 @@ void ft_flip_txn_record_anchor_release_held(struct ft_flip_txn *t,
 	ft_flip_txn_record_state(t, lock,
 			(void *) pending,
 			(void *) (pending & ~FT_STATE_LOCK));
+}
+
+/*
+ * ☞ A FRESH PARENT IS PUBLISHED WITH ITS LOCK HELD, when its publishing commit
+ * RE-HOMES LIVE CHILDREN into it (MATHIEU, 2026-09-22).
+ *
+ * A child's back edge is owned by the parent whose slot names it (FT-SLOT-3).
+ * A re-home into a fresh parent changes that owner INSIDE the commit: before
+ * it, the old parent the re-homer holds; from the decide on, the fresh one.
+ * The fresh node's OWN content needs no lock -- it is prepared while hidden --
+ * but the adopted children's back edges are LIVE words, recorded into the
+ * publishing commit so they flip atomically with the forward edge, and they
+ * stay PARKED until that commit's settle.  Published unlocked, the fresh parent
+ * is lockable from the decide on, so a peer takes it and touches a back edge
+ * it now owns while the re-homer's proxy still sits there
+ * (inv_concurrent_same_key_removes: a promote copied the proxy into a fresh
+ * cell -- a proxy of ANOTHER slot's record, which no settle rewrites).
+ *
+ * Holding the fresh parent's lock until the late pass is what makes "a plain
+ * load under the lock is fine" true for those words again: registered lock
+ * words settle LAST (ft_flip_txn_late_last), after every back edge.
+ *
+ * Built locked -- a plain store, the node is hidden -- then registered (as
+ * @born: its only terminal is this txn's commit) and its release recorded NOW,
+ * read-your-writes, so it precedes any later guard on the word (the ordering
+ * rule at ft_flip_txn_record_release_lock) and later records on it chain.
+ * @meta must be the fresh node's lock word as a peer computes it: its own,
+ * unless the spacing anchors it on an ancestor the re-homer already holds.
+ */
+#ifdef FT_DEBUG_BORN_COUNT
+/*
+ * -DFT_DEBUG_BORN_COUNT: born locks taken, per site class -- the arm-yield
+ * witness that each publish-locked arm is reached at all.  [0] recompact,
+ * [1] spine: the fresh parent itself, [2] spine: another spine node (a
+ * compressed one covering the child's lock level, or a coarse anchor).
+ */
+static unsigned long ft_born_n[3];
+static __attribute__((destructor)) void ft_born_report(void)
+{
+	fprintf(stderr, "FT BORN: recompact %lu spine-parent %lu spine-other %lu\n",
+		ft_born_n[0], ft_born_n[1], ft_born_n[2]);
+}
+# define FT_BORN_COUNT(i)	uatomic_inc(&ft_born_n[i])
+#else
+# define FT_BORN_COUNT(i)	do { } while (0)
+#endif
+
+static inline
+void ft_flip_txn_lock_born(struct ft_flip_txn *t, struct cds_ft_metadata *meta)
+{
+	uintptr_t s = (uintptr_t) CMM_LOAD_SHARED(meta->state);
+
+	assert(!(s & (FT_STATE_LOCK | FT_STATE_TOMBSTONE)));
+#ifdef FT_RED_FRESH_UNLOCKED
+	/* RED CONTROL, never shipping: publish the fresh parent unlocked. */
+	(void) t;
+	return;
+#endif
+	CMM_STORE_SHARED(meta->state, s | FT_STATE_LOCK);
+	ft_flip_txn_lock_register(t, meta, s);
+	t->locks[t->nr_locks - 1].born = true;
+	ft_flip_txn_record_anchor_release_held(t, meta);
+}
+
+/* One fresh node of a re-home's spine: its lock word, start depth and span. */
+#define FT_BORN_SPINE_MAX	3
+struct ft_born_spine_node {
+	struct cds_ft_metadata *meta;
+	unsigned int start, span;
+};
+
+/*
+ * The byte depth whose COVERING node holds the lock word of a node starting at
+ * @depth (ft_anchor_meta): the node itself under per-node, the root under
+ * root-only, the node covering its lock level under exponential.
+ */
+static inline
+unsigned int ft_lock_word_level(const struct cds_ft *ft, unsigned int depth)
+{
+	switch (ft->lock_spacing) {
+	case CDS_FT_LOCK_SPACING_PER_NODE:
+		return depth;
+	case CDS_FT_LOCK_SPACING_ROOT_ONLY:
+		return 0;
+	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
+	default:
+		return ft_lock_level(depth);
+	}
+}
+
+/*
+ * ft_flip_txn_lock_born for a FRESH SPINE: @sp[0 .. n) runs from the cluster top
+ * down to the fresh parent @sp[n - 1] a live child is re-homed under, in one
+ * commit (a split, an attach, a fuse).  Two live words that commit parks need
+ * their lock held until it settles: the child's back edge, owned by the fresh
+ * parent, and the child's own state word, which carries its slot offset.  Their
+ * lock words are the nodes COVERING ft_lock_word_level() of the parent's and of
+ * the child's start depth.  A fresh spine node covering either is published
+ * locked; a level above the spine belongs to an existing ancestor the re-homer
+ * already holds (the cluster occupies the span of the node it replaces, or hangs
+ * below the node it publishes into, so that level is the one those nodes' own
+ * locks mapped to).  Per-node picks the parent alone.  A compressed fresh node
+ * can cover the CHILD's level from inside its span, which makes it the lock word
+ * of a node it is not -- the case a recompact, whose copy spans one byte, never
+ * meets (ft_node_recompact decides it from C's own lock word instead).
+ */
+static inline
+void ft_flip_txn_lock_born_spine(struct cds_ft *ft, struct ft_flip_txn *t,
+		const struct ft_born_spine_node *sp, unsigned int n)
+{
+	unsigned int lv[2], i, j;
+
+	if (!t || !n)
+		return;
+	lv[0] = ft_lock_word_level(ft, sp[n - 1].start);
+	lv[1] = ft_lock_word_level(ft, sp[n - 1].start + sp[n - 1].span);
+	for (i = 0; i < n; i++) {
+		for (j = 0; j < 2; j++) {
+			if (sp[i].start <= lv[j] &&
+					lv[j] < sp[i].start + sp[i].span) {
+				ft_flip_txn_lock_born(t, sp[i].meta);
+				FT_BORN_COUNT(i == n - 1 ? 1 : 2);
+				break;
+			}
+		}
+	}
 }
 
 /*

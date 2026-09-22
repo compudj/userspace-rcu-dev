@@ -1985,7 +1985,8 @@ int ft_node_recompact(enum ft_recompact mode,
 		if (retire_txn && !cluster_leaf && metadata &&
 				!ft_flip_txn_reserve_extra(retire_txn,
 					3 * (ft_meta_nr_child_load(metadata) + 1)
-					+ 1 + (ft->lock_fine ? 2 : 0))) {
+					+ 1 + (ft->lock_fine ? 2 : 0)
+					+ 1 /* the fresh copy's born-lock release */)) {
 			/* Release the WHOLE lock set, not just C: the up-front
 			 * acquire took P (and GP) into @rel_held, and this bail is
 			 * before the txn registry takes ownership of them, so they
@@ -3660,6 +3661,19 @@ skip_copy:
 		ft_flip_txn_lock_register_held(retire_txn, &rel_held[ri]);
 		ft_flip_txn_record_release_lock(retire_txn, rel_held[ri].lock,
 				rel_held[ri].lock_snap);
+	}
+	/*
+	 * ☞ AND THE FRESH COPY IS PUBLISHED LOCKED (ft_flip_txn_lock_born).
+	 * The sweep above re-homed every surviving child into it, and those
+	 * back edges settle only after this commit's decide: the fresh copy
+	 * must not be lockable before then.  Its lock word is its OWN exactly
+	 * when C's was (same position, same depth); under a coarser spacing it
+	 * is the ancestor anchor C already shares, held above until the late
+	 * pass.
+	 */
+	if (fenced && new_node_flag && c_held.lock == metadata) {
+		ft_flip_txn_lock_born(retire_txn, new_metadata);
+		FT_BORN_COUNT(0);
 	}
 
 	ret = 0;

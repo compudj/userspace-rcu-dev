@@ -1523,7 +1523,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				+ ft_freeze_reserve(ft, (unsigned int) nr_orphans
 					+ (trailing_orphan ? 1 : 0))
 				+ freeze_len * FT_HLIST_FREEZE_MAX_EDGES
-				+ count_reserve /* nr_keys walk from publish_parent (R3 fold) */);
+				+ count_reserve /* nr_keys walk from publish_parent (R3 fold) */
+				+ 1 /* @new_cn's born-lock release */);
 	}
 	if (!txn)
 		return -ENOMEM;	/* nothing touched: caller aborts */
@@ -2305,6 +2306,24 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			 */
 			ft_record_child_back_edge(ft, txn, new_cn->child,
 				new_cn_flag, &new_cn->child, ctx);
+			/*
+			 * ...so @new_cn, the fresh parent that edge now names, is
+			 * published LOCKED (ft_flip_txn_lock_born_spine): the
+			 * edge settles after the decide.  It starts where the
+			 * node it replaces started.  Not on the FOLD
+			 * (@record_only): that is the rekey's bulk writer, whose
+			 * FT-wide lock keeps every point writer out of the commit.
+			 */
+			if (!record_only && ft->lock_fine && !ft->exclusive) {
+				struct ft_born_spine_node sp = {
+					.meta = new_cn_meta,
+					.start = parent_cn ? parent_depth :
+						iter_depth,
+					.span = merged_len,
+				};
+
+				ft_flip_txn_lock_born_spine(ft, txn, &sp, 1);
+			}
 		}
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
 		/* VALIDATE (§4.B): lock (or guard-fallback) the LIVE

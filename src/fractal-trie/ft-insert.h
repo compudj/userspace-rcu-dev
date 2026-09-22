@@ -135,6 +135,14 @@ struct ft_insert_commit {
 	struct cds_ft_inode_flag *live_child;
 	struct cds_ft_inode_flag *live_parent;
 	struct cds_ft_inode_flag **live_slot;
+	/*
+	 * ☞ THE FRESH SPINE @live_child is re-homed under: the cluster top down
+	 * to @live_parent, whose lock words are published LOCKED
+	 * (ft_flip_txn_lock_born_spine).  Set by the producer that sets
+	 * @live_parent -- only it knows the fresh nodes' depths and spans.
+	 */
+	struct ft_born_spine_node born[FT_BORN_SPINE_MAX];
+	unsigned int nr_born;
 	bool publish_to_parent;			/* settle via ft_publish_to_parent */
 	/*
 	 * Concurrent-writer commit-outcome scope (see the deferred-action model
@@ -190,6 +198,18 @@ struct ft_insert_commit {
 	struct cds_ft_metadata *child_locked_member;
 	uintptr_t child_locked_snap;
 };
+
+/* Append a fresh spine node (top first) for ft_flip_txn_lock_born_spine. */
+static inline
+void ft_ic_born_add(struct ft_insert_commit *ic, struct cds_ft_metadata *meta,
+		unsigned int start, unsigned int span)
+{
+	assert(ic->nr_born < FT_BORN_SPINE_MAX);
+	ic->born[ic->nr_born].meta = meta;
+	ic->born[ic->nr_born].start = start;
+	ic->born[ic->nr_born].span = span;
+	ic->nr_born++;
+}
 
 static void ft_free_unpublished_split_cluster(struct cds_ft *ft,
 		struct cds_ft_inode_flag *const *created, int nr_created);
@@ -510,6 +530,16 @@ spliced:;
 		ft_park_live_parent_edge(ft, ic->live_child,
 			ic->live_parent, ic->live_slot, ic->txn,
 			ic->ctx FT_BE_SRC_ARG(ic));
+	/*
+	 * ...and the fresh parent it now names is published LOCKED, with the
+	 * spine node that is the child's own lock word if that is fresh too
+	 * (ft_flip_txn_lock_born): the edge just parked settles after the
+	 * decide, and nobody may lock its owner before then.  After the park, so
+	 * its records keep the kinds they had; before any guard on those words.
+	 */
+	if (ic->live_child && ft->lock_fine && !ft->exclusive)
+		ft_flip_txn_lock_born_spine(ft, ic->txn, ic->born,
+			ic->nr_born);
 
 	/*
 	 * Freeze-on-free (doc §4.B): the old compressed/internal node this
@@ -1209,7 +1239,10 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * the op acquires GP -- ft_insert_lock_skip_dual_gp -- and its release rides
 	 * this commit);
 	 * + FT_ROOT_LOCK_MAX_RECORDS for @root_lock's release terminal when the
-	 * publish lands in &ft->root (ft_flip_txn_lock_root).
+	 * publish lands in &ft->root (ft_flip_txn_lock_root);
+	 * + 2 for the fresh spine's born-lock releases -- the lock words of the
+	 * live re-home's new parent and of the child itself, at most two nodes
+	 * (ft_flip_txn_lock_born_spine).
 	 */
 	unsigned int anchored = ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE ?
 			0 : 1;
@@ -1223,7 +1256,7 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * through it.
 	 */
 	ic->txn = ft_flip_txn_create_bounded(ft, 15 + anchored + count_edges
-			+ FT_ROOT_LOCK_MAX_RECORDS);
+			+ FT_ROOT_LOCK_MAX_RECORDS + 2);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
@@ -1445,6 +1478,8 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	struct cds_ft_inode_flag *sfx_skip_flag = NULL;
 	struct cds_ft_inode_flag *deferred_child = NULL;
 	struct cds_ft_inode_flag *deferred_parent = NULL;
+	/* The fresh prefix / suffix metadata, for the born-lock spine. */
+	struct cds_ft_metadata *spine_pfx_meta = NULL, *spine_sfx_meta = NULL;
 	struct cds_ft_inode_flag **deferred_slot = NULL;
 	struct cds_ft_inode_flag *deferred_child2 = NULL;
 	struct cds_ft_inode_flag **deferred_slot2 = NULL;
@@ -1483,6 +1518,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 
 		sfx = alloc_compressed_node(ft, suffix_len, &sfx_meta);
 		if (!sfx) goto error;
+		spine_sfx_meta = sfx_meta;
 		sfx->child = old_child_flag;
 		sfx->len = suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1], suffix_len);
@@ -1619,6 +1655,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 
 		pfx = alloc_compressed_node(ft, diverge_pos, &pfx_meta);
 		if (!pfx) goto error;
+		spine_pfx_meta = pfx_meta;
 		pfx->child = branch_flag;
 		pfx->len = diverge_pos;
 		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
@@ -1776,6 +1813,17 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ic->live_child = deferred_child;
 		ic->live_parent = deferred_parent;
 		ic->live_slot = deferred_slot;
+		/* The fresh spine, top first: [prefix] branch [suffix]. */
+		ic->nr_born = 0;
+		if (spine_pfx_meta)
+			ft_ic_born_add(ic, spine_pfx_meta, node_depth,
+				diverge_pos);
+		ft_ic_born_add(ic, cds_ft_item_to_metadata(
+				ft_node_ptr(branch_flag)),
+			node_depth + diverge_pos, 1);
+		if (deferred_parent == old_suffix_flag && spine_sfx_meta)
+			ft_ic_born_add(ic, spine_sfx_meta,
+				node_depth + diverge_pos + 1, suffix_len);
 		FT_BE_SRC_SET(ic, FT_BE_PARK_SPLIT);
 	}
 #ifdef FEATURE_FT_PROBE_EMPTY_INSERT
@@ -1863,6 +1911,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		struct cds_ft_inode_flag **live_child_ret,
 		struct cds_ft_inode_flag **live_parent_ret,
 		struct cds_ft_inode_flag ***live_slot_ret,
+		struct ft_born_spine_node *born_ret,
+		unsigned int *nr_born_ret,
 		/*
 		 * Out: the freshly-built (still-unpublished) cluster nodes, so the
 		 * caller can tear it down on a post-return abort.  Optional (NULL).
@@ -1899,6 +1949,10 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	struct cds_ft_inode_flag *sfx_skip_flag = NULL;
 	struct cds_ft_inode_flag *deferred_child = NULL;
 	struct cds_ft_inode_flag *deferred_parent = NULL;
+	/* The fresh spine's metadata and spans, top first on return. */
+	struct cds_ft_metadata *sp_pfx_meta = NULL, *sp_jct_meta = NULL,
+		*sp_sfx_meta = NULL;
+	unsigned int sp_pfx_span = 0, sp_sfx_span = 1;
 	struct cds_ft_inode_flag **deferred_slot = NULL;
 
 	/*
@@ -1945,6 +1999,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		sfx->len = suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[remaining + 1],
 			suffix_len);
+		sp_sfx_meta = sfx_meta;
+		sp_sfx_span = suffix_len;
 		ft_meta_nr_child_set(sfx_meta, 1);
 		ft_nr_keys_store(ft,sfx_meta, child_nr_keys,
 			CMM_RELAXED);
@@ -1982,6 +2038,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		}
 		suffix_flag = dest;
 		created[nr_created++] = dest;
+		sp_sfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
+		sp_sfx_span = 1;
 		deferred_child = old_child_flag;
 		deferred_parent = dest;
 		ft_node_get_nth_skip(dest, &deferred_slot,
@@ -2001,6 +2059,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			node_depth + remaining, jct_cluster_leaf);
 		if (ret) goto error;
 		jct_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
+		sp_jct_meta = jct_meta;
 		/*
 		 * I4 count fold: the junction holds the NEW key as its
 		 * external_nodes (attached by the caller before publish), so
@@ -2050,6 +2109,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 
 		pfx = alloc_compressed_node(ft, remaining, &pfx_meta);
 		if (!pfx) goto error;
+		sp_pfx_meta = pfx_meta;
+		sp_pfx_span = remaining;
 		pfx->child = jct_flag;
 		pfx->len = remaining;
 		memcpy(pfx->key_bytes, cn->key_bytes, remaining);
@@ -2075,6 +2136,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 
 			pfx = alloc_compressed_node(ft, 1, &pfx_meta);
 			if (!pfx) goto error;
+			sp_pfx_meta = pfx_meta;
+			sp_pfx_span = 1;
 			pfx->child = jct_flag;
 			pfx->len = 1;
 			pfx->key_bytes[0] = cn->key_bytes[0];
@@ -2097,6 +2160,8 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 				jct_flag, NULL, NULL, node_depth, false);
 			if (ret) goto error;
 			pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
+			sp_pfx_meta = pfx_meta;
+			sp_pfx_span = 1;
 			ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta) + 1,
 				CMM_RELAXED);
 			top_flag = dest;
@@ -2141,6 +2206,24 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	*live_child_ret = deferred_child;
 	*live_parent_ret = deferred_parent;
 	*live_slot_ret = deferred_slot;
+	/* The fresh spine, top first: [prefix] junction [suffix]. */
+	*nr_born_ret = 0;
+	if (deferred_child) {
+		if (sp_pfx_meta) {
+			born_ret[*nr_born_ret] = (struct ft_born_spine_node){
+				sp_pfx_meta, node_depth, sp_pfx_span };
+			(*nr_born_ret)++;
+		}
+		born_ret[*nr_born_ret] = (struct ft_born_spine_node){
+			sp_jct_meta, node_depth + remaining, 1 };
+		(*nr_born_ret)++;
+		if (deferred_parent != jct_flag) {
+			born_ret[*nr_born_ret] = (struct ft_born_spine_node){
+				sp_sfx_meta, node_depth + remaining + 1,
+				sp_sfx_span };
+			(*nr_born_ret)++;
+		}
+	}
 	/*
 	 * Hand the built (still-unpublished) cluster back so the caller can tear
 	 * it down if it must abort after we return (a one-commit arm -ENOMEM):
@@ -2704,6 +2787,10 @@ int ft_attach_node(struct cds_ft *ft,
 				(struct cds_ft_inode_flag *) external_nodes;
 			ic->live_parent = iter_node_flag;
 			ic->live_slot = NULL;
+			/* Fresh spine: the cluster top alone, at @level. */
+			ic->nr_born = 0;
+			ft_ic_born_add(ic, cds_ft_item_to_metadata(
+					ft_node_ptr(iter_node_flag)), level, 1);
 			FT_BE_SRC_SET(ic, FT_BE_PARK_ATTACH);
 		}
 		/* Attach branch (unlink the old node from the trie).
@@ -3178,6 +3265,9 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	FT_BE_SRC_SET(ic, FT_BE_PARK_PAST);
 	ic->live_parent = branch;
 	ic->live_slot = NULL;
+	/* Fresh spine: @branch alone, just below @cn's run. */
+	ic->nr_born = 0;
+	ft_ic_born_add(ic, br_meta, d->depth + cn->len, 1);
 	/* &cn->child's plan-snapshot old is the displaced child == ic->live_child. */
 	{
 		struct ft_lock_ctx pctx;
@@ -3317,6 +3407,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	sret = ft_split_compressed_key_shorter(ft,
 		d->nf, d->nfp, remaining, &top_flag, &jct_flag, d->depth,
 		&live_child, &live_parent, &live_slot,
+		ic->born, &ic->nr_born,
 		split_created, &split_nr_created);
 	if (sret) {
 		ft_meta_lock_release(held.lock);
