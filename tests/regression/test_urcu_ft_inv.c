@@ -83,7 +83,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(131 + NR_TESTS_REKEY_DLM)	/* +1: inv_graft_swap_whole_seam_points */
+#define NR_TESTS	(132 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -26157,6 +26157,328 @@ static int inv_concurrent_remove_all_list(void)
 		"inv_concurrent_remove_all_list");
 }
 
+
+/* ================================================================== */
+/*                                                                    */
+/*   INVARIANT: the two §4.B GUARD sites, driven on a FINE trie       */
+/*              (coverage for the 2026-09-22 guard audit)             */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * ☞ WHY THIS SHAPE.  Two publish sites still GUARD their parent instead of
+ * locking it: _cds_ft_replace_locked's head-swap arm, whose publish parent is
+ * the COMPRESSED node when the head is that node's single external child
+ * (`parent_nf = cn ? ft_compressed_node_flag(cn) : holder_flag`), and
+ * ft_detach_node's grandparent guard on the arm where no recompaction ran.  A
+ * §4.B guard is an MW VALIDATE -- a record -- and every record's settle is a
+ * BLIND store, so a guard on a word a PEER parks SW under its lock is the shape
+ * that tore the ordered list's head (ft_txn_list_insert_between_prepare).
+ *
+ * The audit measured both sites at ZERO on FINE concurrent tries; this test
+ * drives the shape they need, so that zero is a measurement of an EXERCISED
+ * window rather than of an absent one:
+ *
+ *   key A alone under prefix P -> its head is the single external child of P's
+ *   COMPRESSED node, which is what makes the replace publish into @cn;
+ *   key B = P|other, inserted and removed by a PEER -> every insert SPLITS that
+ *   compressed node and every remove COLLAPSES it again (chain compress), so
+ *   the peer writes the very state word the replacer would guard, under that
+ *   node's own lock, and its remove drives the detach arm as well.
+ *
+ * Green means the two interleave without losing a key or a node.  The AUDIT is
+ * what answers the guard question: -DFT_DEBUG_GUARD_AUDIT counts the plants per
+ * site (FINE / unheld), -DURCU_TXN_DEBUG_PARK_CLOBBER fires if a park ever
+ * erases a validate's proxy.
+ */
+#define GCP_KLEN	8
+#define GCP_MS		1500		/* FT_INV_GCP_MS overrides */
+#define GCP_ROUNDS	4
+
+struct gcp_ctx {
+	struct cds_ft *ft;
+	int run, stop, parked;
+	unsigned long repl, repl_fail, ins, rm, miss;
+	/* The head at key A: written by the REPLACER alone. */
+	struct ft_test_node *a_cur;
+};
+
+/*
+ * The key layout, and why it is shaped like this.
+ *
+ * Bytes 0..2 are a fixed spine {0xA7, 0xB3, 0xC1}; byte 3 discriminates; the
+ * tail is zero.  Three SIBLING keys (below) branch at depths 0, 1 and 2, so the
+ * trie really carries internal nodes there -- which puts the chain's holder at
+ * DEPTH 3.  That is the point: under the exponential spacing 3 is not a lock
+ * level (ft_lock_level(3) == 2), so the holder's ANCHOR is the node at depth 2
+ * and the op's lock word is NOT the holder's own metadata.  That inequality is
+ * exactly the `ft_flag_to_metadata(ft, parent_nf) != hm` the replace's §4.B
+ * guard is planted on.  A shallower key (holder at depth 0 or 1, its own
+ * anchor) skips the guard, which is why the first version of this test drove
+ * the shape and measured ZERO plants.
+ */
+static void gcp_key(uint8_t *key, uint8_t last)
+{
+	memset(key, 0, GCP_KLEN);
+	key[0] = 0xA7;
+	key[1] = 0xB3;
+	key[2] = 0xC1;
+	key[3] = last;
+}
+
+/* The siblings that force a branch at depths 0, 1 and 2.  Never removed. */
+static void gcp_sibling_key(uint8_t *key, unsigned int which)
+{
+	gcp_key(key, 0x7F);
+	switch (which) {
+	case 0: key[0] = 0xA8; break;		/* branch at depth 0 */
+	case 1: key[1] = 0xB4; break;		/* branch at depth 1 */
+	default: key[2] = 0xC2; break;		/* branch at depth 2 */
+	}
+}
+
+static struct ft_test_node *gcp_node(uint8_t last, uint64_t tag)
+{
+	struct ft_test_node *n = node_alloc(tag);
+
+	gcp_key(n->okey, last);
+	n->value = GCP_KLEN;
+	return n;
+}
+
+/* Park with a quiescent state: a spinning QSBR thread holds back every GP. */
+static void gcp_park(struct gcp_ctx *c)
+{
+	uatomic_inc(&c->parked);
+	while (!uatomic_load(&c->run, CMM_ACQUIRE) &&
+			!uatomic_load(&c->stop, CMM_RELAXED)) {
+		caa_cpu_relax();
+		rcu_quiescent_state();
+	}
+	uatomic_dec(&c->parked);
+}
+
+static void *gcp_replacer(void *arg)
+{
+	struct gcp_ctx *c = (struct gcp_ctx *) arg;
+	struct cds_ft_iter *iter;
+	uint8_t key[GCP_KLEN];
+
+	rcu_register_thread();
+	rcu_thread_online();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	gcp_key(key, 0x01);
+	while (!uatomic_load(&c->stop, CMM_RELAXED)) {
+		struct ft_test_node *nw, *old;
+
+		if (!uatomic_load(&c->run, CMM_ACQUIRE)) {
+			gcp_park(c);
+			continue;
+		}
+		nw = gcp_node(0x01, 1);
+		old = c->a_cur;		/* this thread owns it */
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, key, GCP_KLEN);
+		if (cds_ft_lookup(c->ft, iter) == CDS_FT_STATUS_OK &&
+				cds_ft_replace(c->ft, iter, &old->node,
+					&nw->node) == CDS_FT_STATUS_OK) {
+			c->a_cur = nw;
+			nw = NULL;
+			node_free_rcu(old);	/* displaced: out of the trie */
+			uatomic_inc(&c->repl);
+		} else {
+			uatomic_inc(&c->repl_fail);
+		}
+		rcu_read_unlock();
+		if (nw)
+			node_free(nw);		/* refused: never published */
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * The PEER: insert and remove key B under the same prefix.  Each insert splits
+ * the compressed node the replacer publishes into; each remove collapses it
+ * back through the detach / chain-compress path.
+ */
+static void *gcp_churner(void *arg)
+{
+	struct gcp_ctx *c = (struct gcp_ctx *) arg;
+	struct cds_ft_iter *iter;
+	uint8_t key[GCP_KLEN];
+
+	rcu_register_thread();
+	rcu_thread_online();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	gcp_key(key, 0x02);
+	while (!uatomic_load(&c->stop, CMM_RELAXED)) {
+		struct ft_test_node *n;
+		struct cds_ft_node *found;
+
+		if (!uatomic_load(&c->run, CMM_ACQUIRE)) {
+			gcp_park(c);		/* parked with B ABSENT */
+			continue;
+		}
+		n = gcp_node(0x02, 2);
+		rcu_read_lock();
+		if (cds_ft_insert(c->ft, key, GCP_KLEN, &n->node) ==
+				CDS_FT_STATUS_OK) {
+			uatomic_inc(&c->ins);
+			n = NULL;
+		}
+		rcu_read_unlock();
+		if (n)
+			node_free(n);		/* never published */
+		rcu_quiescent_state();
+
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, key, GCP_KLEN);
+		if (cds_ft_lookup(c->ft, iter) == CDS_FT_STATUS_OK &&
+				(found = cds_ft_iter_node(iter)) &&
+				cds_ft_remove(c->ft, iter, found) ==
+					CDS_FT_STATUS_OK) {
+			node_free_rcu(to_test_node(found));
+			uatomic_inc(&c->rm);
+		} else {
+			uatomic_inc(&c->miss);
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_guard_compressed_publish(void)
+{
+	struct cds_ft_group *group;
+	struct gcp_ctx c;
+	pthread_t th[2];
+	struct cds_ft_iter *iter;
+	const char *env = getenv("FT_INV_GCP_MS");
+	unsigned long long ms = env ? strtoull(env, NULL, 10) : GCP_MS;
+	uint8_t key[GCP_KLEN];
+	unsigned int round;
+	int ret = 0;
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+
+	memset(&c, 0, sizeof(c));
+	c.ft = create_varlen_ord_ft_ws(&group, &ws);
+	cds_ft_make_shared(c.ft);
+	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	/*
+	 * The spine siblings first: they are what make the holder sit at depth
+	 * 3 (see gcp_key).  Held for the whole test and drained at the end.
+	 */
+	{
+		unsigned int i;
+
+		for (i = 0; i < 3; i++) {
+			struct ft_test_node *sn = node_alloc(0x70 + i);
+
+			gcp_sibling_key(sn->okey, i);
+			sn->value = GCP_KLEN;
+			if (cds_ft_insert(c.ft, sn->okey, GCP_KLEN,
+					&sn->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+	}
+	/* Key A alone below depth 3: its head is the compressed node's single
+	 * external child, so the replace publishes into @cn. */
+	c.a_cur = gcp_node(0x01, 1);
+	gcp_key(key, 0x01);
+	if (cds_ft_insert(c.ft, key, GCP_KLEN, &c.a_cur->node) !=
+			CDS_FT_STATUS_OK)
+		abort();
+	if (pthread_create(&th[0], NULL, gcp_replacer, &c) ||
+			pthread_create(&th[1], NULL, gcp_churner, &c))
+		abort();
+
+	for (round = 0; round < GCP_ROUNDS; round++) {
+		struct timespec t0;
+		struct cds_ft_node *head;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		uatomic_store(&c.run, 1, CMM_RELEASE);
+		while (elapsed_ms(&t0) < ms / GCP_ROUNDS) {
+			caa_cpu_relax();
+			rcu_quiescent_state();
+		}
+		uatomic_store(&c.run, 0, CMM_RELEASE);
+		while (uatomic_load(&c.parked, CMM_ACQUIRE) != 2) {
+			caa_cpu_relax();
+			rcu_quiescent_state();
+		}
+		/* Both writers parked: the trie is at rest. */
+		if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "inv_guard_compressed_publish: round %u: verify RED\n",
+				round);
+			ret = -1;
+		}
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, key, GCP_KLEN);
+		if (cds_ft_lookup(c.ft, iter) != CDS_FT_STATUS_OK ||
+				!(head = cds_ft_iter_node(iter)) ||
+				to_test_node(head) != c.a_cur) {
+			fprintf(stderr, "inv_guard_compressed_publish: round %u: key A lost or not the replacer's node\n",
+				round);
+			ret = -1;
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		/* B is absent at the park point: A plus the three siblings. */
+		if (cds_ft_count_keys(c.ft) != 4) {
+			fprintf(stderr, "inv_guard_compressed_publish: round %u: count_keys %lu != 4\n",
+				round, cds_ft_count_keys(c.ft));
+			ret = -1;
+		}
+	}
+	uatomic_store(&c.stop, 1, CMM_RELEASE);
+	uatomic_store(&c.run, 1, CMM_RELEASE);	/* release the parked loop */
+	rcu_thread_offline();			/* never block a GP in join */
+	pthread_join(th[0], NULL);
+	pthread_join(th[1], NULL);
+	rcu_thread_online();
+
+	/* Drain: whatever is left is this thread's to free. */
+	{
+		struct cds_ft_node *n;
+		uint8_t bk[GCP_KLEN];
+		unsigned int i;
+
+		for (i = 0; i < 5; i++) {
+			if (i < 2)
+				gcp_key(bk, (uint8_t) (i + 1));
+			else
+				gcp_sibling_key(bk, i - 2);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, bk, GCP_KLEN);
+			if (cds_ft_lookup(c.ft, iter) == CDS_FT_STATUS_OK &&
+					(n = cds_ft_iter_node(iter)) &&
+					cds_ft_remove(c.ft, iter, n) ==
+						CDS_FT_STATUS_OK)
+				node_free_rcu(to_test_node(n));
+			rcu_read_unlock();
+			rcu_quiescent_state();
+		}
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_barrier();
+	cds_ft_destroy(c.ft);
+	cds_ft_group_destroy(group);
+	fprintf(stderr, "# inv_guard_compressed_publish: %u rounds, %lu replaces (%lu refused), %lu inserts, %lu removes (%lu missed) -> %s\n",
+		GCP_ROUNDS, c.repl, c.repl_fail, c.ins, c.rm, c.miss,
+		ret ? "RED" : "ok");
+	return ret;
+}
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
@@ -26297,6 +26619,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_swap_shared_dst_delegate_nolist);
 	RUN_TEST(inv_graft_swap_shared_dst_delegate_solo);
 	RUN_TEST(inv_graft_swap_whole_seam_points);
+	RUN_TEST(inv_guard_compressed_publish);
 	RUN_TEST(inv_writer_progress_chainmerge);
 	RUN_TEST(inv_graft_swap_shared_dst_kshort_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_deep_solo);
