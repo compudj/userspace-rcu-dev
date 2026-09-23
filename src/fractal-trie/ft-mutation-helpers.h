@@ -10398,7 +10398,40 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 		{ FT_LANE(holds_something); return; }		/* see ft_lock_ctx_holds_nothing: lane cycle */
 	FT_LANE(engaged);
 	flavor = ft->group->flavor;
+	(void) flavor;
+#ifdef FT_RED_ACQ_LANE_OFFLINE
+	/*
+	 * RED CONTROL, never a shipped configuration: park the lane OFFLINE as
+	 * it did before 2026-09-23.  Kept so the cost of the rule can be
+	 * measured -- an online waiter delays grace periods -- without
+	 * reintroducing the exposure by accident.
+	 */
 	flavor->thread_offline();
+#endif
+	/*
+	 * ☠ THE LANE WAITS ONLINE.  A POINT OP IS NOT A QUIESCENT STATE
+	 * (MATHIEU, 2026-09-23), and this lane runs inside a point op's retry
+	 * loop: its caller may be inside its own RCU read-side section and may
+	 * hold reader-derived references across the call -- cds_ft_remove and
+	 * cds_ft_replace dereference the caller's @node through @node->prev
+	 * with NO re-descent, and ft_iter_read_key may hand back a pointer INTO
+	 * that node.  Under QSBR thread_offline() REPORTS A QUIESCENT STATE, so
+	 * parking offline here ends that section and exposes exactly what it
+	 * protects; the op's own scope-entry gate sample goes stale with it.
+	 *
+	 * This is the same rule the two-waits comment states for the FT-wide
+	 * lock (fractal-trie-internal.h): the SCOPE ENTRY wait stays online and
+	 * only the gp_wait RE-ACQUIRE -- which has already waited out a full
+	 * grace period, so it exposes nothing new -- may park offline.  This
+	 * lane is a scope-entry wait in every respect, and it was parking
+	 * offline.
+	 *
+	 * The cost is the one accepted there: an online waiter delays grace
+	 * periods for its wait.  It is a DELAY, NOT A WEDGE, for the same
+	 * reason -- nothing holds this mutex across a grace period, and the
+	 * lane releases it immediately (the point is the QUEUE, not the
+	 * critical section).
+	 */
 	cds_fair_mutex_lock(&dom->lock, &ft_acq_lane_waiter);
 	/*
 	 * Released immediately: the point is the QUEUE, not the critical
@@ -10409,7 +10442,9 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 	 * op and put a lock holder in the lane, which is the cycle above.
 	 */
 	(void) cds_fair_mutex_unlock(&dom->lock, &ft_acq_lane_waiter);
+#ifdef FT_RED_ACQ_LANE_OFFLINE
 	flavor->thread_online();
+#endif
 }
 
 /* Every guard still holds?  Checked once, after the last take succeeded. */
