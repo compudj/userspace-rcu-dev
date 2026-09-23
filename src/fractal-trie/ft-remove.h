@@ -669,9 +669,27 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * ordering rule), the node tombstoned below.  A no-op
 			 * where the two words coincide.
 			 */
-			ft_flip_txn_lock_register_held(txn, &src_held);
-			ft_flip_txn_record_anchor_release(txn, &src_held,
-				src_cn_meta_a);
+			/*
+			 * ☠ NOT FOR A SHARED HOLD.  set[0] dedupes onto a word
+			 * this op already holds -- at root-only, an orphan whose
+			 * anchor is the root, which on this arm IS src_cn -- and
+			 * ft_detach_freeze_one has then already registered that
+			 * word in the orphan txn.  Registering it again here had
+			 * every pre-commit terminal release ONE word TWICE
+			 * (ft_flip_txn_lock_release_all does not dedupe): the
+			 * second release clears a peer's fence if the root was
+			 * re-taken in between.  The helper's own contract says
+			 * callers gate on @shared (its assert), exactly as set[1]
+			 * below does; the retire below handles @shared itself.
+			 * Found by the adversarial review of an under-lock plan
+			 * check for this arm's freeze, whose -EAGAIN bail reaches
+			 * this terminal on every stale plan.
+			 */
+			if (!src_held.shared) {
+				ft_flip_txn_lock_register_held(txn, &src_held);
+				ft_flip_txn_record_anchor_release(txn, &src_held,
+					src_cn_meta_a);
+			}
 			if (pub_parent && !set[1].held.shared) {
 				ft_flip_txn_lock_register_held(txn, &set[1].held);
 				ft_flip_txn_record_release_lock(txn,
