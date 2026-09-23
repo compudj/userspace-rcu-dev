@@ -13973,10 +13973,28 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
  */
 #define FT_ROOT_FENCE_REREAD_MAX	4
 static inline
+/*
+ * @shared_out: did this call DEDUPE onto a fence an outer frame already holds,
+ * rather than take one?
+ *
+ * ☠ IT USED NOT TO SAY.  ft_acquire_member answers it in @held.shared and this
+ * helper read only @held.lock_snap, so a deduped fence came back looking
+ * exactly like a fresh take -- and every caller then released it on its bail
+ * paths, dropping the OUTER frame's fence.  One owner per fence: the acquire
+ * that first took the word owns its release.
+ *
+ * Worst under root-only spacing, where every word's anchor IS the root, so an
+ * op already holding any anchor holds this one -- which is the spacing that
+ * carries several times the stolen locks of the others.
+ *
+ * Reported rather than detected: a release that must not happen is better NOT
+ * ISSUED than issued and audited.  The caller either took the fence or it did
+ * not, and it now knows which.
+ */
 int ft_root_attach_fence_empty(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag **root_out,
 		struct cds_ft_metadata **meta_out, uintptr_t *snap_out,
-		struct urcu_txn *op)
+		bool *shared_out, struct urcu_txn *op)
 {
 	unsigned int attempt;
 
@@ -14038,6 +14056,7 @@ int ft_root_attach_fence_empty(struct cds_ft *dst_ft,
 		*root_out = root;
 		*meta_out = rmeta;
 		*snap_out = snap;
+		*shared_out = held.shared;
 		return 0;
 	}
 	return -EAGAIN;

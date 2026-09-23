@@ -2005,6 +2005,12 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	if (key_len == 0) {
 		struct cds_ft_metadata *dst_rmeta;
 		struct cds_ft_inode_flag *dst_root_fenced;
+		/*
+		 * DEDUPED, not taken: an outer frame owns this fence and
+		 * owns its release.  Clearing it here drops a fence the op
+		 * still writes under.  One owner per fence.
+		 */
+		bool dst_root_shared = false;
 		uintptr_t dst_root_snap;
 		struct cds_ft_inode *fresh_root;
 		struct cds_ft_metadata *fresh_meta;
@@ -2020,7 +2026,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 */
 		ft_txn_op_init(dst_ft, &optxn);
 		fence_ret = ft_root_attach_fence_empty(dst_ft, &dst_root_fenced,
-			&dst_rmeta, &dst_root_snap, &optxn);
+			&dst_rmeta, &dst_root_snap, &dst_root_shared,
+			&optxn);
 		if (fence_ret == -EEXIST)
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		if (fence_ret)
@@ -2032,7 +2039,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 */
 		fresh_root = alloc_cds_ft_node(dst_ft, &ft_types[0], &fresh_meta);
 		if (!fresh_root) {
-			ft_meta_lock_release(dst_rmeta);
+			if (!dst_root_shared)
+				ft_meta_lock_release(dst_rmeta);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		/* Fresh root for @dst_ft: name its owner while still invisible. */
@@ -2066,7 +2074,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			dual_txn = ft_flip_txn_create_bounded(dst_ft,
 				FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES + 1);
 			if (!dual_txn) {
-				ft_meta_lock_release(dst_rmeta);
+				if (!dst_root_shared)
+					ft_meta_lock_release(dst_rmeta);
 				free_cds_ft_node_unpublished(dst_ft, fresh_root);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}

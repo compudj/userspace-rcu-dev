@@ -10746,6 +10746,12 @@ merge_spine_retry:
 		struct cds_ft_metadata *fresh_meta;
 		struct cds_ft_metadata *dst_rmeta;
 		struct cds_ft_inode_flag *dst_root_fenced;
+		/*
+		 * DEDUPED, not taken: an outer frame owns this fence and
+		 * owns its release.  Clearing it here drops a fence the op
+		 * still writes under.  One owner per fence.
+		 */
+		bool dst_root_shared = false;
 		uintptr_t dst_root_snap;
 		struct cds_ft_inode *old_dst_root;
 		struct ft_flip_txn *appear_txn = NULL;
@@ -10763,7 +10769,8 @@ merge_spine_retry:
 		 * cnt_dst != 0 would have; on a held root, report BUSY.
 		 */
 		fence_ret = ft_root_attach_fence_empty(dst_ft, &dst_root_fenced,
-			&dst_rmeta, &dst_root_snap, &optxn);
+			&dst_rmeta, &dst_root_snap, &dst_root_shared,
+			&optxn);
 		if (fence_ret == -EEXIST)
 			goto diverged;
 		if (fence_ret) {
@@ -10773,7 +10780,8 @@ merge_spine_retry:
 
 		fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
 		if (!fresh_root) {
-			ft_meta_lock_release(dst_rmeta);
+			if (!dst_root_shared)
+				ft_meta_lock_release(dst_rmeta);
 			status = CDS_FT_STATUS_MEMORY_ERROR;
 			goto out;
 		}
@@ -10795,7 +10803,8 @@ merge_spine_retry:
 		else
 			appear_txn = ft_flip_txn_create_bounded(dst_ft, 2);
 		if (!appear_txn) {
-			ft_meta_lock_release(dst_rmeta);
+			if (!dst_root_shared)
+				ft_meta_lock_release(dst_rmeta);
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
 			status = CDS_FT_STATUS_MEMORY_ERROR;
 			goto out;
@@ -10804,7 +10813,8 @@ merge_spine_retry:
 		status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
 		if (status < 0) {
 			/* NOT_FOUND impossible: @src_ft had content. */
-			ft_meta_lock_release(dst_rmeta);
+			if (!dst_root_shared)
+				ft_meta_lock_release(dst_rmeta);
 			if (appear_txn)
 				ft_flip_txn_destroy(appear_txn);
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
