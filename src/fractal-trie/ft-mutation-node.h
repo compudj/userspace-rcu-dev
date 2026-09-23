@@ -3677,6 +3677,19 @@ skip_copy:
 	}
 
 	ret = 0;
+#ifdef FT_DEBUG_HIDDEN_FILL
+	/*
+	 * ITEM 4, MEASURED FIRST.  A fresh node is built while HIDDEN, so its
+	 * own slots want PLAIN stores; a slot filled by a RECORD in the
+	 * publishing commit is the acceptable-but-not-preferred form (MATHIEU,
+	 * 09-22) and costs a descriptor entry per fill.  Register the body and
+	 * let the COMMIT do the counting: a fill added after this function
+	 * returns, by the caller that owns the commit, is exactly the record-0
+	 * shape, and a scan here would miss it.
+	 */
+	if (new_node && new_type)
+		ft_hidden_fill_register(retire_txn, new_node, new_type->order);
+#endif
 #ifdef FT_DEBUG_DEL_TOMB
 	ft_dt_check_node("rc-exit", ((mode == FT_RECOMPACT_ADD_NEXT ||
 			mode == FT_RECOMPACT_ADD_SAME) && !child_node_flag) ? 1 : 0,

@@ -278,6 +278,30 @@ static void ft_win_lost(const struct urcu_txn_record *rec, void *seen);
 #define FT_WIN_NOTE_RAW(slot_, val_, k_)	do { } while (0)
 #endif
 
+#if defined(FT_DEBUG_HIDDEN_FILL) && !defined(URCU_TXN_REC_DBG_STAMP)
+/*
+ * ITEM 4: WHO CREATED THIS RECORD?  The hidden-fill scan runs at COMMIT, so its
+ * backtrace names the committer, never the producer of the one record that
+ * fills a hidden body.  The engine stamps every record as it is created, which
+ * is the right moment: park the creating pc in a small table keyed by the
+ * record's own address, and let the scan look it up.  Records are reused across
+ * transactions, but a stamp is overwritten on every reuse and read within the
+ * SAME commit, so the answer belongs to this record.
+ */
+struct urcu_txn_record;
+static void ft_hf_pc_note(const struct urcu_txn_record *r, const void *pc);
+/*
+ * ☠ THE STAMP IS INSIDE THE ENGINE, so return_address(0) is always
+ * urcu_txn_store_mw and every producer looks the same (measured: 673468 fills,
+ * ONE "site").  return_address(1) is not the answer either -- the add is
+ * inlined into the store, so level 1 walks off the end and SEGVs, with and
+ * without -fno-omit-frame-pointer (measured twice).  The note itself unwinds
+ * instead, and only for the records that can BE a fill.
+ */
+# define URCU_TXN_REC_DBG_STAMP(r)					\
+	ft_hf_pc_note((r), NULL)
+#endif
+
 #if defined(FT_DEBUG_SLOT_HIST) && !defined(URCU_TXN_REC_WROTE)
 /*
  * -DFT_DEBUG_SLOT_HIST: a per-SLOT history of every engine store -- plant,

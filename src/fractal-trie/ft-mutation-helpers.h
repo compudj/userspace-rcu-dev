@@ -2026,6 +2026,18 @@ struct ft_flip_txn {
 	 * slot whose owner it does not hold, so the commit must ABORT rather
 	 * than publish: an all-or-none lock-set, with the miss re-descending.
 	 */
+#ifdef FT_DEBUG_HIDDEN_FILL
+	/*
+	 * Fresh, still-HIDDEN bodies this txn built (item 4): registered by
+	 * their producer, scanned against the record set at commit.  Scanning
+	 * at the producer's own exit is NOT the same question -- a fill made
+	 * after it returns, by the caller that owns the commit, is exactly the
+	 * record-0 shape this is looking for.
+	 */
+	const void *hidden[8];
+	unsigned short hidden_order[8];
+	unsigned int nr_hidden;
+#endif
 	bool acquire_miss;
 	/*
 	 * The miss above was an ALLOCATION failure, not a peer.  The acquire
@@ -2713,6 +2725,9 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	if (!t)
 		return NULL;
 	FT_TXN_OPEN_INC();
+#ifdef FT_DEBUG_HIDDEN_FILL
+	t->nr_hidden = 0;	/* ☠ a REUSED struct is the PREVIOUS op */
+#endif
 	t->mtxn = &t->own;
 	urcu_txn_init(t->mtxn, NULL);	/* flavor-agnostic: the caller brackets the
 					 * RCU read side; no escalation domain
@@ -2991,6 +3006,9 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	if (!t)
 		return NULL;
 	FT_TXN_OPEN_INC();
+#ifdef FT_DEBUG_HIDDEN_FILL
+	t->nr_hidden = 0;	/* ☠ a REUSED struct is the PREVIOUS op */
+#endif
 	t->mtxn = op;
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
@@ -3091,6 +3109,9 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	if (!t)
 		return NULL;
 	FT_TXN_OPEN_INC();
+#ifdef FT_DEBUG_HIDDEN_FILL
+	t->nr_hidden = 0;	/* ☠ a REUSED struct is the PREVIOUS op */
+#endif
 	t->mtxn = op;
 	if (urcu_txn_reserve(op, cap) < 0) {
 		ft_flip_txn_free(t);
@@ -7591,6 +7612,129 @@ static bool ft_flip_txn_late_last(void *arg, void **slot)
  * ABORT return is what tells it to.  Under the retained single-writer exclusion
  * ABORT never occurs, so this is behaviour-identical there.  @t is consumed.
  */
+#ifdef FT_DEBUG_HIDDEN_FILL
+#include <execinfo.h>
+#include <dlfcn.h>
+/*
+ * ITEM 4, ASKED AT THE RIGHT MOMENT.  Count the records that land inside a
+ * body this txn built and has not published: those are the fills a plain store
+ * before publish would replace.  Items are (1 << order) bytes and
+ * (1 << order)-aligned, so sharing the aligned base IS the test.
+ */
+static unsigned long ft_hf_commits, ft_hf_seen, ft_hf_hidden, ft_hf_max,
+	ft_hf_regs;
+/* Creating-pc table, filled by the engine's record stamp (ft-txn-rec-dbg.h). */
+#define FT_HF_PC_SLOTS	8192
+static struct ft_hf_pc { const void *rec, *pc; } ft_hf_pc_tab[FT_HF_PC_SLOTS];
+static void ft_hf_pc_note(const struct urcu_txn_record *r, const void *pc)
+{
+	struct ft_hf_pc *e = &ft_hf_pc_tab[(((uintptr_t) r) >> 4) &
+		(FT_HF_PC_SLOTS - 1)];
+	void *bt[6];
+
+	/*
+	 * Only a record that WRITES INTO NOTHING can be a fill of a hidden
+	 * body, so unwind for those alone -- the whole record stream is 187M
+	 * per run and backtrace() on each would measure the instrument.
+	 */
+	if (!pc && !r->old_ptr && backtrace(bt, 6) >= 4)
+		pc = bt[3];
+	e->rec = r;
+	e->pc = pc;
+}
+static const void *ft_hf_pc_of(const struct urcu_txn_record *r)
+{
+	const struct ft_hf_pc *e = &ft_hf_pc_tab[(((uintptr_t) r) >> 4) &
+		(FT_HF_PC_SLOTS - 1)];
+
+	return e->rec == r ? e->pc : NULL;
+}
+/* Per-producer tally, printed as file offsets (ASLR moves absolutes). */
+#define FT_HF_SITES	16
+static struct ft_hf_site { const void *pc; unsigned long n; }
+	ft_hf_site[FT_HF_SITES];
+static void ft_hf_site_note(const void *pc)
+{
+	unsigned int i;
+
+	for (i = 0; i < FT_HF_SITES; i++) {
+		if (uatomic_read(&ft_hf_site[i].pc) == pc) {
+			uatomic_inc(&ft_hf_site[i].n);
+			return;
+		}
+		if (!uatomic_read(&ft_hf_site[i].pc) &&
+				uatomic_cmpxchg(&ft_hf_site[i].pc, NULL,
+					(void *) pc) == NULL) {
+			uatomic_inc(&ft_hf_site[i].n);
+			return;
+		}
+	}
+}
+static void ft_hidden_fill_at_commit(struct ft_flip_txn *t)
+{
+	struct urcu_txn_desc *d = t && t->mtxn ? t->mtxn->desc : NULL;
+	unsigned long n = 0;
+	unsigned int i, j;
+
+	if (!d || d == URCU_TXN_ENOMEM)
+		return;
+	uatomic_inc(&ft_hf_commits);
+	for (i = 0; i < d->nr; i++) {
+		uatomic_inc(&ft_hf_seen);
+		for (j = 0; j < t->nr_hidden; j++) {
+			uintptr_t mask = ~(((uintptr_t) 1 <<
+				t->hidden_order[j]) - 1);
+
+			if ((((uintptr_t) d->recs[i].slot) & mask) ==
+					(((uintptr_t) t->hidden[j]) & mask)) {
+				ft_hf_site_note(ft_hf_pc_of(&d->recs[i]));
+				n++;
+				break;
+			}
+		}
+	}
+	uatomic_add(&ft_hf_hidden, n);
+	if (n > uatomic_read(&ft_hf_max))
+		uatomic_set(&ft_hf_max, n);
+}
+static inline
+void ft_hidden_fill_register(struct ft_flip_txn *t, const void *node,
+		unsigned short order)
+{
+	if (!t || !node || t->nr_hidden >= 8)
+		return;
+	uatomic_inc(&ft_hf_regs);
+	t->hidden_order[t->nr_hidden] = order;
+	t->hidden[t->nr_hidden++] = node;
+}
+static __attribute__((destructor)) void ft_hidden_fill_report(void)
+{
+	if (!uatomic_read(&ft_hf_seen) && !uatomic_read(&ft_hf_regs))
+		return;			/* per-TU static: never a wrong zero */
+	fprintf(stderr, "FT HIDDEN FILL: %lu commits, %lu fresh bodies registered, %lu records seen, %lu INTO A HIDDEN BODY (worst single %lu)\n",
+		uatomic_read(&ft_hf_commits), uatomic_read(&ft_hf_regs),
+		uatomic_read(&ft_hf_seen), uatomic_read(&ft_hf_hidden),
+		uatomic_read(&ft_hf_max));
+	{
+		unsigned int i;
+		Dl_info di;
+
+		for (i = 0; i < FT_HF_SITES; i++) {
+			const void *pc = uatomic_read(&ft_hf_site[i].pc);
+
+			if (!uatomic_read(&ft_hf_site[i].n))
+				continue;
+			fprintf(stderr, "FT HIDDEN FILL:   producer +0x%lx  %lu\n",
+				pc && dladdr((void *) pc, &di) && di.dli_fbase ?
+					(unsigned long) ((const char *) pc -
+						(const char *) di.dli_fbase) :
+					(unsigned long) (uintptr_t) pc,
+				uatomic_read(&ft_hf_site[i].n));
+		}
+	}
+}
+#endif
+
 static inline
 
 enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
@@ -7609,6 +7753,9 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	 * while our SW parks are still parked, and our own settle overwrites
 	 * what it then publishes.
 	 */
+#ifdef FT_DEBUG_HIDDEN_FILL
+	ft_hidden_fill_at_commit(t);
+#endif
 	urcu_txn_desc_set_late_tag(t->mtxn->desc, FT_STATE_PROXY);
 	/*
 	 * ☠ AND FT_STATE_PROXY IS NOT ONLY THE STATE WORDS' TAG: the duplicate
