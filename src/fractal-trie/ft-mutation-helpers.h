@@ -2027,7 +2027,8 @@ static struct ft_sws_bucket {
 	uintptr_t old, cur;
 } ft_sws_tab[FT_SWS_BUCKETS];
 static unsigned long ft_sws_checked, ft_sws_stale, ft_sws_proxy,
-	ft_sws_overflow, ft_sws_doomed_stale, ft_sws_doomed_proxy;
+	ft_sws_overflow, ft_sws_doomed_stale, ft_sws_doomed_proxy,
+	ft_sws_release_shaped, ft_sws_release_foreign;
 /*
  * Set by a producer around records it makes in a txn it KNOWS is doomed
  * (@acquire_miss: ft_flip_txn_commit discards it unplanted).  Such a record
@@ -2055,6 +2056,38 @@ static void ft_sw_stale_check(const struct urcu_txn_record *r)
 	}
 	if (cur == r->old_ptr)
 		return;
+	/*
+	 * ☞ THE RELEASE-SHAPED RECORD IS NOT STALE.  A state word the op has
+	 * marked is handed its release as an SW {s -> s} with LOCK masked out
+	 * of both values (ft_reparent_record_meta's @child_marked arm, "the
+	 * release-shaped SW form"): the SW record does not validate, so it
+	 * writes s on commit AND on abort -- a release either way.  Its s was
+	 * loaded under the lock, so nothing about it is stale.  Recognised
+	 * EXACTLY: the live word differs by LOCK alone and the record writes
+	 * back its own old.  A TOMBSTONE difference still counts -- writing it
+	 * back would resurrect a retired node.
+	 */
+	if (r->proxy_tag == FT_STATE_PROXY && r->new_ptr == r->old_ptr &&
+			((uintptr_t) cur & ~(uintptr_t) FT_STATE_LOCK) ==
+				(uintptr_t) r->old_ptr &&
+			((uintptr_t) cur & FT_STATE_LOCK)) {
+		/* ...over the RECORDING thread's own fence, checked: a
+		 * release-shaped record over a peer's fence is a steal. */
+		const struct cds_ft_metadata *m = (const struct cds_ft_metadata *)
+			((const char *) (const void *) r->slot -
+			 offsetof(struct cds_ft_metadata, state));
+		struct ft_dt_ent *e = ft_dt_slot(m);
+		unsigned int owner = 0;
+
+		ft_dt_ent_lock(e);
+		if (uatomic_read(&e->word) == m)
+			owner = uatomic_read(&e->tid);
+		ft_dt_ent_unlock(e);
+		if (owner && owner != ft_ll_violation_tid())
+			uatomic_inc(&ft_sws_release_foreign);
+		uatomic_inc(&ft_sws_release_shaped);
+		return;
+	}
 	if (ft_sws_doomed) {
 		uatomic_inc(&ft_sws_doomed_stale);
 		if (urcu_txn_is_proxy(cur, r->proxy_tag)) {
@@ -2100,6 +2133,8 @@ static __attribute__((destructor)) void ft_sw_stale_report(void)
 	fprintf(stderr, "FT SW STALE-OLD: %lu of %lu SW records created with an expected-old != the live word (%lu with a peer proxy parked on it; %lu past the table) | in DOOMED txns (acquire_miss, discarded unplanted): %lu stale, %lu proxy\n",
 		ft_sws_stale, ft_sws_checked, ft_sws_proxy, ft_sws_overflow,
 		ft_sws_doomed_stale, ft_sws_doomed_proxy);
+	fprintf(stderr, "FT SW STALE-OLD: %lu release-shaped {s -> s} records over LOCK|s (by design, not counted above); %lu of them over a fence ANOTHER thread took\n",
+		ft_sws_release_shaped, ft_sws_release_foreign);
 	for (i = 0; i < FT_SWS_BUCKETS; i++) {
 		struct ft_sws_bucket *b = &ft_sws_tab[i];
 
