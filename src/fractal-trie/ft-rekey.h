@@ -2108,17 +2108,34 @@ refuse:
  * fresh one on a still-lockable word.
  */
 static inline
-void ft_rekey_fold_sweep_orphan_marks(struct ft_held_anchor *held, int *nr_held)
+void ft_rekey_fold_sweep_orphan_marks(struct ft_held_anchor *held, int *nr_held,
+		bool committed)
 {
 	int i;
 
 	/*
-	 * STRICT: the committed path sweeps these itself and leaves
-	 * @nr_held at zero (see the caller), so reaching the body at all
-	 * proves the op bailed and still holds the mark.
+	 * @committed: this sweep has TWO callers and they are on opposite sides
+	 * of the commit -- the bail exit, whose marks are provably still ours,
+	 * and the post-commit reclaim, whose fences the commit's fenced
+	 * tombstones may already have taken.  Converting it to the strict
+	 * release for BOTH is what made ft_unit abort in the rekey family
+	 * (assertion `s & FT_STATE_LOCK'): clear-if-held used to no-op on the
+	 * consumed word, and the strict one asserts on it.
+	 *
+	 * ☐ THE COMMITTED ARM IS NOT CONVERTED YET.  Doing it properly means
+	 * sampling ft_lock_terminal_drops_lock for each mark BEFORE the commit
+	 * -- the txn wrapper is gone afterwards -- which is a change to the
+	 * caller, not to this helper.  Until then do not clear a word the op
+	 * cannot prove is its own: leave it and COUNT it.  A leak is bounded
+	 * and local; a theft corrupts a peer's exclusion.
 	 */
 	for (i = 0; i < *nr_held; i++)
 		if (!held[i].shared && !held[i].txn_owned) {
+			if (committed) {
+				FT_ORPHAN_CONSUMED();
+				FT_ORPHAN_PREMISE_CHECK(held[i].lock);
+				continue;
+			}
 			ft_meta_lock_release(held[i].lock);
 			/*
 			 * SCRUB only RELEASED-LIVE: a TOMBSTONED word is a
@@ -8087,7 +8104,8 @@ cells_done:
 		 * FOLD's, which this op collected itself.  ☠ Its plan-locks live
 		 * ON those nodes, so they are released FIRST: see the helper.
 		 */
-		ft_rekey_fold_sweep_orphan_marks(fold_held, &nr_fold_held);
+		ft_rekey_fold_sweep_orphan_marks(fold_held, &nr_fold_held,
+			/*committed=*/ true);
 		ft_rekey_detach_free_orphans(ft, &detach_rc);
 		/*
 		 * REPLACE's retired body.  Not an orphan -- the resting node
@@ -8323,7 +8341,8 @@ sweep:
 	 * orphan's OWN word, whose terminal is its fenced tombstone, so a release
 	 * cannot steal a peer's fence off it.
 	 */
-	ft_rekey_fold_sweep_orphan_marks(fold_held, &nr_fold_held);
+	ft_rekey_fold_sweep_orphan_marks(fold_held, &nr_fold_held,
+		/*committed=*/ false);
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
 			if (!marks[i].shared && !marks[i].txn_owned) {
