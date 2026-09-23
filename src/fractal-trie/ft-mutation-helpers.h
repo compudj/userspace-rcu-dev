@@ -2349,7 +2349,18 @@ static inline unsigned int ft_ll_trace_self(void)
 #  define FT_LL_LOG(k, lock, txn, a, b)	do { } while (0)
 # endif
 # define FT_LL_REFUSED(lock, s)		do { } while (0)
-# define FT_LL_INLINE	inline
+# if FT_DT_ARMED
+/*
+ * Out of line for the non-owner-clear detector, for the same reason the ring
+ * does it above: inlined, the release primitives' __builtin_return_address(0)
+ * is whatever frame survived inlining, so a report named a CALLEE'S CALLER --
+ * once even a function in the TEST binary -- and the site could not be read off
+ * it.  The detector exists to NAME the site; out of line is what lets it.
+ */
+#  define FT_LL_INLINE	__attribute__((noinline, unused))
+# else
+#  define FT_LL_INLINE	inline
+# endif
 #endif
 
 struct ft_flip_txn {
@@ -2362,6 +2373,17 @@ struct ft_flip_txn {
 					 * §11) */
 	struct urcu_txn own;	/* backing handle for standalone txns */
 	bool reserved;			/* @mtxn pre-reserved (bounded) => infallible commit */
+	/*
+	 * ☠ DID THIS TXN COMMIT?  ft_flip_txn_destroy documents itself as
+	 * "a flip-txn that was NOT committed" and then CAS-clears every
+	 * registered fence -- a contract carried by convention, where a
+	 * committed terminal has already given those words back, LIVE and
+	 * re-lockable, so the clear lands on whatever holds them by then.  The
+	 * txn knows; record it rather than trusting the caller or the word.
+	 * Set field-by-field at every init: this struct is REUSED, and an
+	 * uninitialised flag here is the PREVIOUS op's answer.
+	 */
+	bool committed;
 	/*
 	 * FT_STATE_LOCK registry (MW F2, CORE_682870 fix plan): the
 	 * nodes this commit's op MARKED with the reversible per-node lock.  On
@@ -3203,6 +3225,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	 * ft_flip_txn_create_bounded).  The exact age-1+ reconcile has no Bloom. */
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
+	t->committed = false;
 	t->nr_locks = 0;
 #ifdef FT_DEBUG_LOCK_LEAK
 	t->ll_nrec = 0;
@@ -3476,6 +3499,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->mtxn = op;
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
+	t->committed = false;
 	t->nr_locks = 0;
 #ifdef FT_DEBUG_LOCK_LEAK
 	t->ll_nrec = 0;
@@ -3582,6 +3606,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 		return NULL;
 	}
 	t->reserved = true;
+	t->committed = false;
 	t->nr_locks = 0;
 #ifdef FT_DEBUG_LOCK_LEAK
 	t->ll_nrec = 0;
@@ -3713,6 +3738,7 @@ bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
 	if (urcu_txn_reserve(t->mtxn, cap) < 0)
 		return false;
 	t->reserved = true;
+	t->committed = false;
 	return true;
 }
 
@@ -6493,6 +6519,29 @@ enum ft_lock_terminal_state ft_lock_terminal_query(const struct ft_flip_txn *t,
 }
 
 /*
+ * WILL A SUCCESSFUL COMMIT OF @t TAKE OUR FENCE OFF @lock?  Asked BEFORE the
+ * commit, because a commit consumes the flip-txn wrapper and reading
+ * ->mtxn->desc afterwards is a use-after-free.
+ *
+ * This is how a post-commit release learns what it may touch.  The op files a
+ * record; the record says what the terminal will DO to the word; combined with
+ * the commit's own status that is a complete answer, and it never reads the
+ * live word -- which by then may carry a PEER's fence and cannot be told from
+ * ours.  Pair it as: sample here, commit, then release only if the commit
+ * failed or no LOCK-dropping record existed.
+ */
+static inline
+bool ft_lock_terminal_drops_lock(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *lock)
+{
+	struct urcu_txn_record *r = NULL;
+
+	(void) ft_lock_terminal_query(t, lock, &r);
+	return r && (((uintptr_t) r->old_ptr & FT_STATE_LOCK) &&
+			!((uintptr_t) r->new_ptr & FT_STATE_LOCK));
+}
+
+/*
  * Hand @lock over to @t: register it AND link the handing-over entry's
  * silencer, so the commit's terminal can scrub an entry that would otherwise
  * outlive the hold.  One owner per mark, and from here it is the txn (see
@@ -7509,6 +7558,15 @@ int ft_acquire_member_at(const char *fn, int line,
  * bail path of the above, for a member set not yet handed to a txn.  Once the
  * members ARE registered (ft_flip_txn_lock_register, on the success path),
  * the txn's registry owns the unlock instead and this must not run.
+ *
+ * ☠ THAT LAST SENTENCE WAS A CONTRACT NOTHING CHECKED.  The entry itself
+ * records the hand-over in @txn_owned -- every other sweep in this file tests
+ * it -- and only this one trusted its callers instead.  A set swept here after
+ * any member was registered is released TWICE: once here and once by
+ * ft_flip_txn_lock_release_all, and the second clear lands on whatever the word
+ * holds by then, which after a peer's fresh take is the PEER's fence.  One
+ * owner per mark, decided by the op's own bookkeeping and never by re-reading
+ * the word.
  */
 static inline
 void ft_unlock_held(const struct ft_held_anchor *set, unsigned int n)
@@ -7516,7 +7574,7 @@ void ft_unlock_held(const struct ft_held_anchor *set, unsigned int n)
 	unsigned int i;
 
 	for (i = 0; i < n; i++)
-		if (!set[i].shared)
+		if (!set[i].shared && !set[i].txn_owned)
 			ft_meta_lock_release(set[i].lock);
 }
 
@@ -7559,7 +7617,21 @@ void ft_flip_txn_destroy(struct ft_flip_txn *t)
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	ft_sa_pend_bailed(t);
 #endif
-	ft_flip_txn_lock_release_all(t);
+	/*
+	 * ☠ ONLY IF IT REALLY WAS NOT COMMITTED.  The comment above states
+	 * that as this function's contract, and nothing checked it: a caller
+	 * that destroys a txn whose commit already ran would CAS-clear every
+	 * registered fence, and those words were handed back LIVE and
+	 * re-lockable by the release terminals -- so the clear takes whatever
+	 * holds them now, which after a peer's take is the PEER's fence.
+	 * @committed is the op's own answer; the word cannot give one.
+	 */
+	if (!t->committed) {
+		ft_flip_txn_lock_release_all(t);
+	} else {
+		FT_ORPHAN_CONSUMED();
+		t->nr_locks = 0;
+	}
 	if (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM) {
 		urcu_txn_destroy(t->mtxn->desc);
 		/*
@@ -8797,6 +8869,12 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	if (caa_unlikely(st != URCU_TXN_STATUS_OK)) {
 		ft_flip_txn_lock_release_all(t);
 	} else {
+		/*
+		 * The op's own record that its terminals RAN, for any later
+		 * cleanup -- ft_flip_txn_destroy above all, which otherwise
+		 * re-clears fences this commit already gave back.
+		 */
+		t->committed = true;
 		unsigned int bs_i;
 
 		/*

@@ -6349,6 +6349,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 */
 			struct ft_flip_txn *txn;
 			enum urcu_txn_status cst;
+			bool hm_consumed;
 
 			/*
 			 * {L}: a duplicate chain is owned by its HEAD-HOLDER's node
@@ -6373,6 +6374,13 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			(void) ft_hlist_replace_prepare(ft, ft_flip_txn_handle(txn),
 				old_node, new_node);
 			FT_DBG_HELD_AT(hm);
+			/*
+			 * ☠ SAMPLED BEFORE THE COMMIT, because the commit
+			 * consumes the txn wrapper and the question cannot be
+			 * asked afterwards -- and because after a SUCCESSFUL
+			 * commit the word may already belong to a peer.
+			 */
+			hm_consumed = hm && ft_lock_terminal_drops_lock(txn, hm);
 			cst = ft_flip_txn_commit(ft, txn);
 			FT_DBG_HELD_AT(hm);
 			/*
@@ -6381,9 +6389,22 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * next chain op may have the word back without waiting
 			 * for the status plumbing below.  ft_replace_exit then
 			 * finds @hm NULL and releases nothing.
+			 *
+			 * ...BUT ONLY IF THE FENCE IS STILL OURS.  "The commit
+			 * settled every link this arm writes" says nothing about
+			 * OUR LOCK: where a committed terminal drops it, the
+			 * word is free from that instant, a peer takes it, and
+			 * this release clears the PEER's fence.  Measured as the
+			 * largest single source of stolen locks left after the
+			 * clear-if-held removal.  Ask the record, never the word.
 			 */
 			if (hm) {
-				ft_meta_lock_release(hm);
+				if (cst == URCU_TXN_STATUS_OK && hm_consumed) {
+					FT_ORPHAN_CONSUMED();
+					FT_ORPHAN_PREMISE_CHECK(hm);
+				} else {
+					ft_meta_lock_release(hm);
+				}
 				hm = NULL;
 			}
 			FT_DBG_HELD_AT(hm);
