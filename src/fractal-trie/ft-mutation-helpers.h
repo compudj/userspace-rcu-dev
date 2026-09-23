@@ -1537,6 +1537,39 @@ static struct ft_dt_ent {
 	const void *cpc;
 	unsigned int ctid;
 	int cengine;		/* 1 = an engine settle, 0 = a plain release */
+	uintptr_t cold, cnew;	/* an engine clear's record: old -> new */
+	/*
+	 * THE TAKE/RELEASE BALANCE for @word, +1 per take and -1 per clear.
+	 * Kept HERE and not in the item: struct cds_ft_metadata is embedded in
+	 * several item kinds whose allocation is sized per kind, and a field
+	 * added to it writes past the smaller ones (measured: an instant SEGV
+	 * on every leg).  Reset when the slot is claimed for a new word, and
+	 * only touched while the slot still names that word, so a hash
+	 * collision LOSES events rather than inventing a negative one.
+	 */
+	int bal;
+	/*
+	 * ☠ ONE ENTRY, SEVERAL FIELDS, MANY WORDS.  16384 entries keyed on the
+	 * address serve every state word in the process, so two words share an
+	 * entry routinely, and a take of X landing between a clear of W's
+	 * `word == W' check and its decrement moved W's -1 onto X's balance --
+	 * X's own release then "underflowed".  Every access to an entry holds
+	 * this, so an entry always describes exactly one word.
+	 */
+	int lk;
+	/*
+	 * THE WORD'S LAST EVENTS, so an underflow names its own history rather
+	 * than one previous clear: 'T' take, 'R' plain release (entry), 'E'
+	 * engine settle.  Written under @lk, reset when the entry changes word.
+	 */
+#define FT_DT_HIST	16
+	struct { char op; unsigned int tid; const void *pc; int bal;
+		uintptr_t v; } h[FT_DT_HIST];
+	unsigned int nh;
+	/* The last release RECORD's producer, for an engine-steal report. */
+	void *rbt[16];
+	int rnbt;
+	unsigned int rtid;
 } ft_dt_tab[FT_DT_SLOTS];
 /*
  * ☞ AN ARM YIELD, not just a violation count.  "0 stolen locks" is a claim
@@ -1553,6 +1586,71 @@ static struct ft_dt_ent {
  *   @ft_dt_double	THE DEFECT: cleared by a thread that did not take it.
  */
 static unsigned long ft_dt_sets, ft_dt_double, ft_dt_matched, ft_dt_unowned;
+static unsigned long ft_dt_underflow, ft_dt_engine_steal;
+
+/*
+ * ☞ EVERY STEAL'S SITE, not the first eight.
+ *
+ * The per-event report is capped (a backtrace each, into stderr), which is the
+ * right shape for reading a mechanism but the wrong one for ATTRIBUTION: eight
+ * samples out of a couple of thousand cannot say which site dominates, and a
+ * site that fires once looks the same as one that fires a thousand times.  So
+ * count them all, keyed on the THIEF's pc -- the caller of the release, which
+ * is a real call site now that the primitives are out of line under this arm.
+ * @opc keeps one sample of the owner for context.
+ *
+ * Lock-free and approximate by design: a lost claim race can split one site
+ * across two rows, which costs a duplicate line in the report and nothing else.
+ */
+#define FT_DT_SITES	128
+static struct ft_dt_site {
+	const void *pc;
+	const void *opc;
+	unsigned long n;
+} ft_dt_sites[FT_DT_SITES];
+static unsigned long ft_dt_site_overflow;
+
+/*
+ * Underflow sites, so each one can be TRIAGED: a release that should never
+ * have been issued (a word this op never took) or a genuine race.
+ *
+ * ☠ AN ENGINE ROW HAS NO RELEASE SITE: the settle runs inside the engine, on
+ * whichever thread drives the descriptor, so a return address names the
+ * engine for every producer and r->desc names a heap object (127 of 128 rows
+ * were unique descriptors).  Engine rows are keyed on the TAKE site instead,
+ * with @pc NULL, which is the one real call site the event carries.
+ */
+static struct ft_dt_site ft_dt_ufsites[FT_DT_SITES];
+static unsigned long ft_dt_ufsite_overflow;
+
+static inline void ft_dt_site_note_tab(struct ft_dt_site *tab,
+		unsigned long *ovf, const void *pc, const void *opc)
+{
+	unsigned int i;
+
+	for (i = 0; i < FT_DT_SITES; i++) {
+		const void *p = uatomic_read(&tab[i].pc);
+
+		if (p == pc) {
+			uatomic_inc(&tab[i].n);
+			return;
+		}
+		if (!p) {
+			if (uatomic_cmpxchg(&tab[i].pc, NULL,
+					(void *) (uintptr_t) pc) != NULL)
+				continue;	/* lost it; try the next slot */
+			uatomic_set(&tab[i].opc, opc);
+			uatomic_inc(&tab[i].n);
+			return;
+		}
+	}
+	uatomic_inc(ovf);
+}
+
+static inline void ft_dt_site_note(const void *pc, const void *opc)
+{
+	ft_dt_site_note_tab(ft_dt_sites, &ft_dt_site_overflow, pc, opc);
+}
 #ifdef FT_RED_DT_STEAL
 /* Set only by the constructor self-test below; see it for why. */
 static int ft_dt_in_selftest;
@@ -1565,6 +1663,31 @@ static inline struct ft_dt_ent *ft_dt_slot(const void *w)
 	return &ft_dt_tab[(((uintptr_t) w) >> 6) & (FT_DT_SLOTS - 1)];
 }
 
+static inline void ft_dt_ent_lock(struct ft_dt_ent *e)
+{
+	while (uatomic_xchg(&e->lk, 1))
+		caa_cpu_relax();
+	cmm_smp_mb();
+}
+
+static inline void ft_dt_hist(struct ft_dt_ent *e, char op, const void *pc,
+		uintptr_t v)
+{
+	unsigned int k = e->nh++ % FT_DT_HIST;
+
+	e->h[k].op = op;
+	e->h[k].tid = ft_ll_violation_tid();
+	e->h[k].pc = pc;
+	e->h[k].bal = e->bal;
+	e->h[k].v = v;
+}
+
+static inline void ft_dt_ent_unlock(struct ft_dt_ent *e)
+{
+	cmm_smp_mb();
+	uatomic_set(&e->lk, 0);
+}
+
 /*
  * @newval is the value now in the word.  @pc names the setter for the report;
  * it is ignored when the bit is being cleared.
@@ -1575,9 +1698,23 @@ static inline void ft_dt_note_take(const void *w, const void *pc)
 	struct ft_dt_ent *e = ft_dt_slot(w);
 
 	uatomic_inc(&ft_dt_sets);
+	ft_dt_ent_lock(e);
+	/*
+	 * +1 for this take.  A slot claimed for a DIFFERENT word starts the
+	 * balance over: the previous word's history is gone, and continuing to
+	 * count against it would manufacture an underflow.
+	 */
+	if (uatomic_read(&e->word) == w) {
+		uatomic_inc(&e->bal);
+	} else {
+		uatomic_set(&e->bal, 1);
+		e->nh = 0;
+	}
+	ft_dt_hist(e, 'T', pc, 0);
 	uatomic_set(&e->word, w);
 	uatomic_set(&e->pc, pc);
 	uatomic_set(&e->tid, ft_ll_violation_tid());
+	ft_dt_ent_unlock(e);
 }
 
 /*
@@ -1603,6 +1740,22 @@ static inline const char *ft_dt_pc_str(const void *pc, char *buf, size_t len)
 	return buf;
 }
 
+static inline void ft_dt_hist_dump(const struct ft_dt_ent *e)
+{
+	unsigned int n = e->nh < FT_DT_HIST ? e->nh : FT_DT_HIST, i;
+	char b[160];
+
+	for (i = 0; i < n; i++) {
+		unsigned int k = (e->nh - n + i) % FT_DT_HIST;
+
+		fprintf(stderr, "    hist[-%u] %c tid %u bal->%d v %#lx %s\n",
+			n - i, e->h[k].op, e->h[k].tid, e->h[k].bal,
+			(unsigned long) e->h[k].v,
+			e->h[k].op == 'E' ? "(desc)" :
+				ft_dt_pc_str(e->h[k].pc, b, sizeof(b)));
+	}
+}
+
 /* A plain release: whoever clears it should be the owner. */
 static inline void ft_dt_note_clear(const void *w, const void *pc, bool report,
 		int engine)
@@ -1611,11 +1764,57 @@ static inline void ft_dt_note_clear(const void *w, const void *pc, bool report,
 	unsigned int self = ft_ll_violation_tid();
 	unsigned int owner;
 	const void *opc;
+	int bal;
 
-	if (uatomic_read(&e->word) != w)
+	ft_dt_ent_lock(e);
+	if (uatomic_read(&e->word) != w) {
+		ft_dt_ent_unlock(e);
 		return;				/* never seen, or a collision */
+	}
 	owner = uatomic_read(&e->tid);
 	opc = uatomic_read(&e->pc);
+	/*
+	 * ☠ THE BALANCE, CHECKED AT THE RELEASE THAT BREAKS IT.  Every clear
+	 * is -1 -- this one, and the engine settles that consume a fence
+	 * through a recorded terminal.  Below zero means the word has been
+	 * released more often than taken: the defect itself rather than its
+	 * downstream symptom, caught in the releasing frame and whether or not
+	 * a peer re-took the word in between.  FT_TP + ft_trace_capture() end
+	 * the flight recorder ON this event, so the trace's last records are
+	 * that word's own take/clear history.
+	 */
+	bal = uatomic_add_return(&e->bal, -1);
+	ft_dt_hist(e, engine ? 'E' : 'R', pc, engine ? 0 :
+		(uintptr_t) CMM_LOAD_SHARED(
+			((const struct cds_ft_metadata *) w)->state));
+	if (caa_unlikely(bal < 0))
+		ft_dt_site_note_tab(ft_dt_ufsites, &ft_dt_ufsite_overflow,
+			engine ? opc : pc, engine ? NULL : opc);
+	if (caa_unlikely(bal < 0) &&
+			uatomic_add_return(&ft_dt_underflow, 1) <= 8) {
+		char ubuf[160];
+		void *ubt[16];
+		int unbt = backtrace(ubt, 16);
+
+		FT_TP(lock_stolen, w, self, pc, 0u, (const void *) NULL);
+		if (!ft_dt_in_selftest)
+			ft_trace_capture();
+		char pvbuf[160], tkbuf[160];
+
+		fprintf(stderr, "FT LOCK UNDERFLOW: word %p to %d by tid %u from %s (%s) -- releases exceed takes; last take tid %u from %s; PREVIOUS clear tid %u %s %s (rec %#lx -> %#lx):\n",
+			w, bal, self, ft_dt_pc_str(pc, ubuf, sizeof(ubuf)),
+			engine ? "ENGINE settle" : "plain release",
+			owner, ft_dt_pc_str(opc, tkbuf, sizeof(tkbuf)),
+			uatomic_read(&e->ctid),
+			uatomic_read(&e->cengine) ? "ENGINE desc" : "plain",
+			uatomic_read(&e->cengine) ?
+				"" : ft_dt_pc_str(uatomic_read(&e->cpc),
+					pvbuf, sizeof(pvbuf)),
+			(unsigned long) uatomic_read(&e->cold),
+			(unsigned long) uatomic_read(&e->cnew));
+		ft_dt_hist_dump(e);
+		backtrace_symbols_fd(ubt, unbt, 2);
+	}
 	if (report) {
 		if (!owner)
 			uatomic_inc(&ft_dt_unowned);
@@ -1624,7 +1823,14 @@ static inline void ft_dt_note_clear(const void *w, const void *pc, bool report,
 	}
 	if (report && owner && owner != self &&
 			uatomic_read(&e->word) == w &&
-			uatomic_add_return(&ft_dt_double, 1) <= 8) {
+			/*
+			 * COUNT AND ATTRIBUTE EVERY ONE; only the PRINTING is
+			 * capped.  A cap that swallows the measurement is how
+			 * the engine's park-clobber note once reported zero on
+			 * a run with millions of parks.
+			 */
+			(ft_dt_site_note(pc, opc),
+			 uatomic_add_return(&ft_dt_double, 1) <= 8)) {
 		char cbuf[160], obuf[160], pbuf[160];
 		int cengine = uatomic_read(&e->cengine);
 		const void *cpc = uatomic_read(&e->cpc);
@@ -1660,10 +1866,39 @@ static inline void ft_dt_note_clear(const void *w, const void *pc, bool report,
 	uatomic_set(&e->ctid, self);
 	uatomic_set(&e->cengine, engine);
 	uatomic_set(&e->tid, 0);
+	ft_dt_ent_unlock(e);
+}
+
+static void ft_dt_engine_clear(const struct urcu_txn_record *r, void *v);
+
+/*
+ * The record a plain store was already noted for, BEFORE it landed, so the
+ * post-store hook that follows does not count it twice.  Per thread: the note
+ * and the store run on the committing thread, back to back.
+ */
+static __thread const struct urcu_txn_record *ft_dt_prenoted;
+
+static unsigned long ft_dt_prenote_n, ft_dt_postnote_n;
+
+static void ft_dt_will_write(const struct urcu_txn_record *r, void *v)
+{
+	uatomic_inc(&ft_dt_prenote_n);
+	ft_dt_prenoted = r;
+	ft_dt_engine_clear(r, v);
 }
 
 /* The engine's half: every store it makes, including the settles. */
 static inline void ft_dt_wrote(const struct urcu_txn_record *r, void *v)
+{
+	if (ft_dt_prenoted == r) {
+		ft_dt_prenoted = NULL;	/* noted before the store */
+		return;
+	}
+	uatomic_inc(&ft_dt_postnote_n);
+	ft_dt_engine_clear(r, v);	/* a CAS store: noted after it landed */
+}
+
+static void ft_dt_engine_clear(const struct urcu_txn_record *r, void *v)
 {
 	const struct cds_ft_metadata *m;
 
@@ -1673,15 +1908,28 @@ static inline void ft_dt_wrote(const struct urcu_txn_record *r, void *v)
 		return;				/* a parked proxy says nothing yet */
 	/*
 	 * ☠ THE ENGINE CAN ONLY END OWNERSHIP, NEVER ESTABLISH IT.  A settle
-	 * that writes LOCK|s back is an ABORT-RESTORE on behalf of the original
-	 * owner -- and in this engine a PEER may drive that settle (helping),
-	 * so the writing thread is routinely not the owner.  Treating such a
-	 * write as a take reported 644-12,644 phantom double takes per run.
+	 * that writes LOCK|s back is an ABORT-RESTORE of a take the op already
+	 * made with its own CAS -- not a new take.  (The commit is single-
+	 * driver, rcu-txn-mcas.h "no helping": the settling thread IS the
+	 * committing op.)  Treating such a write as a take reported 644-12,644
+	 * phantom double takes per run.
 	 * Only the FT's own acquire CASes and the born store take a word; the
 	 * engine's contribution is the CLEARING half, which an intent-based
 	 * detector could never see.
 	 */
 	if ((uintptr_t) v & FT_STATE_LOCK)
+		return;
+	/*
+	 * ☠ A WRITE THAT LEAVES LOCK CLEAR DID NOT NECESSARILY *CLEAR* IT.
+	 * Most state edges (nr_child, parent_slot, a tombstone on an unlocked
+	 * word) never touch the bit; counting each as a release drove the
+	 * balance negative 4.4M times in one leg -- an instrument reporting on
+	 * itself.  A record BUILT to drop the fence declares it in its own
+	 * expected-old, which is the op's intent at record time and not a
+	 * re-reading of the live word -- so this does NOT mask a double
+	 * release, whose second clear is counted at the release entry below.
+	 */
+	if (!((uintptr_t) r->old_ptr & FT_STATE_LOCK))
 		return;
 	m = (const struct cds_ft_metadata *) ((const char *) (const void *)
 		r->slot - offsetof(struct cds_ft_metadata, state));
@@ -1697,16 +1945,167 @@ static inline void ft_dt_wrote(const struct urcu_txn_record *r, void *v)
 			(unsigned long) (uintptr_t) v, (const void *) r->desc,
 			(const void *) r->slot, ft_ll_violation_tid(),
 			(uint64_t) 0);
+	/*
+	 * ☠ AN ENGINE SETTLE THAT CLEARS ANOTHER THREAD'S FENCE.  The commit
+	 * is single-driver (rcu-txn-mcas.h: "no helping"), so this thread IS
+	 * the committing op, and a release-shaped record it settles on a word
+	 * a DIFFERENT tid took is a steal through a record -- invisible to the
+	 * plain-release check, whose report is off for the engine.  This hook
+	 * runs AFTER the store, so a peer may legitimately have re-taken the
+	 * word already and filed itself as owner: count it only while the live
+	 * word still reads unlocked, which a re-take would have changed.
+	 */
+	{
+		struct ft_dt_ent *e = ft_dt_slot(m);
+		unsigned int self = ft_ll_violation_tid(), owner = 0;
+		uintptr_t live;
+
+		ft_dt_ent_lock(e);
+		if (uatomic_read(&e->word) == m)
+			owner = uatomic_read(&e->tid);
+		ft_dt_ent_unlock(e);
+		live = (uintptr_t) CMM_LOAD_SHARED(*r->slot);
+		/*
+		 * ☠ NOT filtered on the live word.  A first cut counted only
+		 * while it read unlocked, to exclude a peer's legitimate
+		 * re-take -- and measured 0 on a run where the history showed
+		 * T(A) E(B) R(A) with A's release finding LOCK set again: the
+		 * owner's own stale SW value had re-written the bit, and the
+		 * filter hid the very steal it was built to catch.  A re-take
+		 * shows up in the backtrace; a hidden steal shows up nowhere.
+		 */
+		(void) live;
+		if (owner && owner != self &&
+				uatomic_add_return(&ft_dt_engine_steal, 1) <= 8) {
+			void *sbt[20];
+			int snbt = backtrace(sbt, 20);
+
+			fprintf(stderr, "FT ENGINE STEAL: word %p record %#lx -> %#lx settled by tid %u, but the fence was taken by tid %u -- committer's path:\n",
+				(const void *) m, (unsigned long) (uintptr_t)
+				r->old_ptr, (unsigned long) (uintptr_t) v,
+				self, owner);
+			backtrace_symbols_fd(sbt, snbt, 2);
+			ft_dt_ent_lock(e);
+			if (uatomic_read(&e->word) == m) {
+				fprintf(stderr, "  last release RECORD on this word made by tid %u at:\n",
+					e->rtid);
+				backtrace_symbols_fd(e->rbt, e->rnbt, 2);
+				ft_dt_hist_dump(e);
+			}
+			ft_dt_ent_unlock(e);
+		}
+	}
 	ft_dt_note_clear(m, (const void *) r->desc, /*report=*/ false,
 		/*engine=*/ 1);
+	{
+		struct ft_dt_ent *e = ft_dt_slot(m);
+
+		ft_dt_ent_lock(e);
+		if (uatomic_read(&e->word) == m) {
+			uatomic_set(&e->cold, (uintptr_t) r->old_ptr);
+			uatomic_set(&e->cnew, (uintptr_t) v);
+		}
+		ft_dt_ent_unlock(e);
+	}
+}
+
+static unsigned long ft_dt_rec_foreign, ft_dt_rec_unowned, ft_dt_rec_swblind;
+
+static void ft_dt_rec_check(const struct urcu_txn_record *r)
+{
+	const struct cds_ft_metadata *m;
+	struct ft_dt_ent *e;
+	unsigned int self, owner = 0;
+
+	/*
+	 * ☠ AN SW RECORD WHOSE VALUES CARRY NO LOCK, ON A WORD A PEER HOLDS.
+	 * An SW park and settle are plain stores: nothing compares them with
+	 * the live word, so a clean expected-old never fails -- it WRITES the
+	 * clean value over the holder's fence.  The release check below never
+	 * sees it (no LOCK in old), and neither does the engine-settle one.
+	 */
+	if (r->proxy_tag == FT_STATE_PROXY && r->kind == URCU_TXN_KIND_SW &&
+			!((uintptr_t) r->old_ptr & FT_STATE_LOCK) &&
+			!((uintptr_t) r->new_ptr & FT_STATE_LOCK)) {
+		m = (const struct cds_ft_metadata *) ((const char *)
+			(const void *) r->slot -
+			offsetof(struct cds_ft_metadata, state));
+		e = ft_dt_slot(m);
+		self = ft_ll_violation_tid();
+		ft_dt_ent_lock(e);
+		if (uatomic_read(&e->word) == m)
+			owner = uatomic_read(&e->tid);
+		ft_dt_ent_unlock(e);
+		if (owner && owner != self &&
+				(CMM_LOAD_SHARED(m->state) & FT_STATE_LOCK) &&
+				uatomic_add_return(&ft_dt_rec_swblind, 1) <= 8) {
+			void *bt[20];
+			int nbt = backtrace(bt, 20);
+
+			fprintf(stderr, "FT SW BLIND RECORD: word %p {%#lx -> %#lx} SW, recorded by tid %u while tid %u holds the fence -- producer's path:\n",
+				(const void *) m,
+				(unsigned long) (uintptr_t) r->old_ptr,
+				(unsigned long) (uintptr_t) r->new_ptr,
+				self, owner);
+			backtrace_symbols_fd(bt, nbt, 2);
+		}
+		return;
+	}
+	if (r->proxy_tag != FT_STATE_PROXY ||
+			!((uintptr_t) r->old_ptr & FT_STATE_LOCK) ||
+			((uintptr_t) r->new_ptr & FT_STATE_LOCK))
+		return;		/* not a release of the fence */
+	m = (const struct cds_ft_metadata *) ((const char *) (const void *)
+		r->slot - offsetof(struct cds_ft_metadata, state));
+	e = ft_dt_slot(m);
+	self = ft_ll_violation_tid();
+	ft_dt_ent_lock(e);
+	if (uatomic_read(&e->word) == m) {
+		owner = uatomic_read(&e->tid);
+		ft_dt_hist(e, 'r', __builtin_return_address(0),
+			(uintptr_t) r->new_ptr);
+		e->rnbt = backtrace(e->rbt, 16);
+		e->rtid = self;
+	}
+	ft_dt_ent_unlock(e);
+	if (!owner) {
+		uatomic_inc(&ft_dt_rec_unowned);
+		return;
+	}
+	if (owner == self)
+		return;
+	if (uatomic_add_return(&ft_dt_rec_foreign, 1) <= 8) {
+		void *bt[20];
+		int nbt = backtrace(bt, 20);
+
+		fprintf(stderr, "FT FOREIGN RELEASE RECORD: word %p {%#lx -> %#lx} recorded by tid %u, but the fence was taken by tid %u -- producer's path:\n",
+			(const void *) m,
+			(unsigned long) (uintptr_t) r->old_ptr,
+			(unsigned long) (uintptr_t) r->new_ptr, self, owner);
+		backtrace_symbols_fd(bt, nbt, 2);
+	}
+}
+
+static __attribute__((destructor)) void ft_dt_rec_report(void)
+{
+	fprintf(stderr, "FT FOREIGN RELEASE RECORD: %lu release records made on a word another thread took (%lu on a word nobody holds)\n",
+		uatomic_read(&ft_dt_rec_foreign),
+		uatomic_read(&ft_dt_rec_unowned));
+	fprintf(stderr, "FT SW BLIND RECORD: %lu SW records with a clean expected-old made on a word another thread held LOCKED\n",
+		uatomic_read(&ft_dt_rec_swblind));
 }
 
 void ft_dt_note_freed(const struct cds_ft_metadata *m)
 {
 	struct ft_dt_ent *e = ft_dt_slot(m);
 
-	if (uatomic_read(&e->word) == m)
+	ft_dt_ent_lock(e);
+	/* A recycled chunk starts from a clean balance, not the last op's. */
+	if (uatomic_read(&e->word) == m) {
+		uatomic_set(&e->bal, 0);
 		uatomic_set(&e->tid, 0);
+	}
+	ft_dt_ent_unlock(e);
 }
 
 static __attribute__((destructor)) void ft_dt_report(void)
@@ -1716,6 +2115,55 @@ static __attribute__((destructor)) void ft_dt_report(void)
 	fprintf(stderr, "FT STOLEN LOCK: %lu takes, %lu released by their owner, %lu released with the owner already gone, %lu STOLEN (cleared by a thread that did not take them)\n",
 		uatomic_read(&ft_dt_sets), uatomic_read(&ft_dt_matched),
 		uatomic_read(&ft_dt_unowned), uatomic_read(&ft_dt_double));
+	fprintf(stderr, "FT ENGINE STEAL: %lu engine settles cleared a fence another thread took (engine stores noted: %lu BEFORE the store, %lu after a CAS)\n",
+		uatomic_read(&ft_dt_engine_steal),
+		uatomic_read(&ft_dt_prenote_n),
+		uatomic_read(&ft_dt_postnote_n));
+	if (uatomic_read(&ft_dt_underflow))
+		fprintf(stderr, "FT LOCK UNDERFLOW: %lu releases drove a word's take/release balance NEGATIVE\n",
+			uatomic_read(&ft_dt_underflow));
+	if (uatomic_read(&ft_dt_underflow)) {
+		unsigned int k;
+		char kbuf[160], jbuf[160];
+
+		for (k = 0; k < FT_DT_SITES; k++) {
+			if (!ft_dt_ufsites[k].pc)
+				continue;
+			if (!ft_dt_ufsites[k].opc)
+				fprintf(stderr, "FT UNDERFLOW SITE: %8lu  ENGINE settle  <- taken at %s\n",
+					uatomic_read(&ft_dt_ufsites[k].n),
+					ft_dt_pc_str(ft_dt_ufsites[k].pc,
+						kbuf, sizeof(kbuf)));
+			else
+				fprintf(stderr, "FT UNDERFLOW SITE: %8lu  %s  <- taken at %s\n",
+					uatomic_read(&ft_dt_ufsites[k].n),
+					ft_dt_pc_str(ft_dt_ufsites[k].pc,
+						kbuf, sizeof(kbuf)),
+					ft_dt_pc_str(ft_dt_ufsites[k].opc,
+						jbuf, sizeof(jbuf)));
+		}
+		if (uatomic_read(&ft_dt_ufsite_overflow))
+			fprintf(stderr, "FT UNDERFLOW SITE: %lu more from sites past the table\n",
+				uatomic_read(&ft_dt_ufsite_overflow));
+	}
+	if (uatomic_read(&ft_dt_double)) {
+		unsigned int i;
+		char cbuf[160], obuf[160];
+
+		for (i = 0; i < FT_DT_SITES; i++) {
+			if (!ft_dt_sites[i].pc)
+				continue;
+			fprintf(stderr, "FT STOLEN SITE: %8lu  %s  <- owner %s\n",
+				uatomic_read(&ft_dt_sites[i].n),
+				ft_dt_pc_str(ft_dt_sites[i].pc,
+					cbuf, sizeof(cbuf)),
+				ft_dt_pc_str(ft_dt_sites[i].opc,
+					obuf, sizeof(obuf)));
+		}
+		if (uatomic_read(&ft_dt_site_overflow))
+			fprintf(stderr, "FT STOLEN SITE: %lu more from sites past the table\n",
+				uatomic_read(&ft_dt_site_overflow));
+	}
 }
 
 #ifdef FT_RED_DT_STEAL
@@ -1759,6 +2207,53 @@ static __attribute__((constructor)) void ft_dt_selftest(void)
 	uatomic_set(&e->tid, 0);
 	uatomic_set(&ft_dt_double, before);
 	uatomic_set(&ft_dt_sets, 0);
+}
+
+/*
+ * THE SAME CONTROL FOR THE ENGINE HALF.  Suites rarely build the shape (a
+ * peer must take the word between an op's early release and its commit), so
+ * a zero from FT ENGINE STEAL / FT LOCK UNDERFLOW is only evidence once this
+ * says "reported": a forged settle of a release record on a word a forged
+ * peer holds, then that peer's own release, which the settle already paid.
+ */
+static struct cds_ft_metadata ft_dt_selftest_meta;
+
+static __attribute__((constructor)) void ft_dt_selftest_engine(void)
+{
+	struct cds_ft_metadata *m = &ft_dt_selftest_meta;
+	struct ft_dt_ent *e = ft_dt_slot(m);
+	struct urcu_txn_record rec = { 0 };
+	unsigned long st0 = uatomic_read(&ft_dt_engine_steal);
+	unsigned long uf0 = uatomic_read(&ft_dt_underflow);
+	unsigned long st1, uf1;
+
+	m->state = FT_STATE_LOCK | 8;
+	ft_dt_note_take(m, (const void *) &ft_dt_selftest_engine);
+	uatomic_set(&e->tid, ft_ll_violation_tid() ^ 1u);
+	rec.slot = (void **) &m->state;
+	rec.old_ptr = (void *) (FT_STATE_LOCK | 8);
+	rec.new_ptr = (void *) (uintptr_t) 8;
+	rec.proxy_tag = FT_STATE_PROXY;
+	ft_dt_in_selftest = 1;
+	ft_dt_will_write(&rec, rec.new_ptr);
+	ft_dt_prenoted = NULL;
+	st1 = uatomic_read(&ft_dt_engine_steal);
+	ft_dt_note_clear(m, (const void *) &ft_dt_selftest_engine, true, 0);
+	uf1 = uatomic_read(&ft_dt_underflow);
+	ft_dt_in_selftest = 0;
+	fprintf(stderr, "FT ENGINE STEAL SELF-TEST: %s (%lu -> %lu); FT LOCK UNDERFLOW SELF-TEST: %s (%lu -> %lu)\n",
+		st1 > st0 ? "reported" : "BLIND", st0, st1,
+		uf1 > uf0 ? "reported" : "BLIND", uf0, uf1);
+	uatomic_set(&e->word, NULL);
+	uatomic_set(&e->tid, 0);
+	uatomic_set(&ft_dt_engine_steal, st0);
+	uatomic_set(&ft_dt_underflow, uf0);
+	uatomic_set(&ft_dt_sets, 0);
+	uatomic_set(&ft_dt_double, 0);
+	uatomic_set(&ft_dt_matched, 0);
+	uatomic_set(&ft_dt_unowned, 0);
+	memset(ft_dt_ufsites, 0, sizeof(ft_dt_ufsites));
+	memset(ft_dt_sites, 0, sizeof(ft_dt_sites));
 }
 #endif
 # define FT_DT_TAKE(w)		ft_dt_note_take((w), __builtin_return_address(0))
@@ -6042,6 +6537,17 @@ static FT_LL_INLINE
 void ft_meta_lock_release(struct cds_ft_metadata *meta)
 {
 	ft_hold_trace_drop(meta);
+	/*
+	 * ☠ THE RELEASE IS NOTED AT ENTRY -- ITS INTENT -- NOT AFTER THE CAS.
+	 * Noted after, a peer could take the word in the gap and record
+	 * itself as owner, and this legitimate release then read "cleared by
+	 * a thread that did not take it": a steal manufactured by the
+	 * detector's own ordering.  At entry the releaser still holds the
+	 * word (if it is the owner at all), so the owner it reads is stable.
+	 * It also counts a release whose bit is already clear, which is
+	 * exactly the double release the balance exists to catch.
+	 */
+	FT_DT_CLEAR(meta);
 	for (;;) {
 		uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
@@ -6144,7 +6650,6 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 		assert(s & FT_STATE_LOCK);
 		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
 				s & ~FT_STATE_LOCK) == s)) {
-			FT_DT_CLEAR(meta);
 			FT_LL_LOG(FT_LL_CLEAR, meta, NULL, s, 0);
 			return;
 		}
@@ -6361,14 +6866,6 @@ void ft_flip_txn_lock_register(struct ft_flip_txn *t,
 	ft_flip_txn_lock_register_member(t, meta, snap, NULL);
 }
 
-/* An acquire's own answer: the anchor word, and the member it was taken for. */
-static inline
-void ft_flip_txn_lock_register_held(struct ft_flip_txn *t,
-		const struct ft_held_anchor *h)
-{
-	ft_flip_txn_lock_register_member(t, h->lock, h->lock_snap, h->member);
-}
-
 #if defined(FT_DEBUG_ORPHAN_RELEASE) || FT_DT_ARMED
 /*
  * ARM YIELD for the orphan sweep's outcomes: released by plain CAS here, HANDED
@@ -6387,9 +6884,11 @@ void ft_flip_txn_lock_register_held(struct ft_flip_txn *t,
  */
 static unsigned long ft_orphan_rel_released, ft_orphan_rel_handed;
 static unsigned long ft_orphan_rel_consumed, ft_orphan_premise_broken;
+static unsigned long ft_orphan_shared_reg;
 # define FT_ORPHAN_RELEASED()	uatomic_inc(&ft_orphan_rel_released)
 # define FT_ORPHAN_HANDED()	uatomic_inc(&ft_orphan_rel_handed)
 # define FT_ORPHAN_CONSUMED()	uatomic_inc(&ft_orphan_rel_consumed)
+# define FT_ORPHAN_SHARED_REG()	uatomic_inc(&ft_orphan_shared_reg)
 # define FT_ORPHAN_PREMISE_CHECK(lock_)					\
 	do {								\
 		uintptr_t s__ = CMM_LOAD_SHARED((lock_)->state);	\
@@ -6409,13 +6908,39 @@ static __attribute__((destructor)) void ft_orphan_release_report(void)
 		uatomic_read(&ft_orphan_rel_handed),
 		uatomic_read(&ft_orphan_rel_consumed),
 		uatomic_read(&ft_orphan_premise_broken));
+	if (uatomic_read(&ft_orphan_shared_reg))
+		fprintf(stderr, "FT SHARED REG: %lu deduped (shared) holds registered -- the op owes no release on those\n",
+			uatomic_read(&ft_orphan_shared_reg));
+
 }
 #else
 # define FT_ORPHAN_RELEASED()	do { } while (0)
 # define FT_ORPHAN_HANDED()	do { } while (0)
 # define FT_ORPHAN_CONSUMED()	do { } while (0)
+# define FT_ORPHAN_SHARED_REG()	do { } while (0)
 # define FT_ORPHAN_PREMISE_CHECK(lock_)	do { } while (0)
 #endif
+
+/* An acquire's own answer: the anchor word, and the member it was taken for. */
+static inline
+void ft_flip_txn_lock_register_held(struct ft_flip_txn *t,
+		const struct ft_held_anchor *h)
+{
+	/*
+	 * ☞ PROBE: IS A *SHARED* HOLD EVER REGISTERED?  A shared entry is a
+	 * DEDUPE onto a word an outer frame already took -- this op owes no
+	 * release on it ("one owner per fence").  Registering one hands the
+	 * registry a word the op never took, and ft_flip_txn_lock_release_all
+	 * then clears the OUTER owner's fence.  Several call sites skip shared
+	 * entries explicitly (ft-compact.h, ft-remove.h, ft-mutation-node.h)
+	 * and several do not; this counts what actually reaches here rather
+	 * than deciding from a four-line grep around each call.
+	 */
+	if (h->shared)
+		FT_ORPHAN_SHARED_REG();
+	ft_flip_txn_lock_register_member(t, h->lock, h->lock_snap, h->member);
+}
+
 
 /*
  * IS THIS WORD'S TERMINAL STILL PENDING IN @t?
@@ -7592,6 +8117,16 @@ void ft_flip_txn_lock_release_all(struct ft_flip_txn *t)
 	for (i = 0; i < t->nr_locks; i++) {
 		if (t->locks[i].born)
 			continue;	/* a discarded fresh node: see @born */
+		/*
+		 * ☑ REFUTED, do not re-chase: a duplicate registration here
+		 * would double-release one fence (a take wins only on a clear
+		 * bit, so one word means one fence), which would produce both
+		 * the stolen locks and the `s & FT_STATE_LOCK' assert.  The
+		 * registrar does append without deduping, so the shape is
+		 * possible -- but a counted dedupe measured ZERO duplicates
+		 * over three ft_inv legs, and the steal counts did not move.
+		 * The words this loop releases are distinct.
+		 */
 		ft_meta_lock_release(t->locks[i].meta);
 	}
 	t->nr_locks = 0;
@@ -15358,6 +15893,31 @@ int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		ft_flip_txn_lock_register_held(txn, &set[i].held);
 		ft_flip_txn_record_release_lock(txn, set[i].held.lock,
 			set[i].held.lock_snap);
+#ifdef FT_RED_DT_DOUBLE
+		/*
+		 * ☠ THE RED CONTROL for the lock-balance detectors, never a
+		 * shipping configuration: every 256th hold is ALSO released
+		 * plainly while its recorded release is pending, so the commit
+		 * later settles a release of a word a peer may hold.  Under it
+		 * FT LOCK UNDERFLOW must be NONZERO (measured 17k-98k on the
+		 * root-only compressed-publish test, -DNDEBUG so the release
+		 * assert does not stop it first).  FT ENGINE STEAL needs a peer
+		 * to take the word in the gap, which that test never does: its
+		 * positive control is the FT_RED_DT_STEAL self-test.
+		 */
+		{
+			static unsigned long red_n;
+
+			if (!(uatomic_add_return(&red_n, 1) & 255)) {
+				unsigned long spin = 200000;
+
+				ft_meta_lock_release(set[i].held.lock);
+				/* widen the gap so a peer takes the word */
+				while (spin--)
+					caa_cpu_relax();
+			}
+		}
+#endif
 	}
 	if (!ft_cell_plan_still_valid(ft, p))
 		return -EAGAIN;		/* held, and owned by @txn: see above */

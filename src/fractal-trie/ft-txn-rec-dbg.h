@@ -339,6 +339,30 @@ static void ft_sh_clobber(const struct urcu_txn_record *r, void *prev);
 # define URCU_TXN_PARK_CLOBBER_NOTE(r, prev)	ft_sh_clobber((r), (prev))
 #endif
 
+#if FT_DT_ARMED
+/*
+ * ☠ A RELEASE-SHAPED RECORD ON A WORD ANOTHER THREAD TOOK.  Checked where the
+ * record is CREATED (or chained onto), which runs on the producer's own stack,
+ * so the report names the recording site -- the commit-time settle can only
+ * name the committer.  Defined in ft-mutation-helpers.h.
+ */
+struct urcu_txn_record;
+static void ft_dt_rec_check(const struct urcu_txn_record *r);
+# if defined(URCU_TXN_REC_DBG_STAMP) || defined(URCU_TXN_REC_DBG_CHAIN)
+#  warning "FT_DT_ARMED: record hooks already claimed; the record-time release check is BLIND in this build"
+# else
+#  define URCU_TXN_REC_DBG_STAMP(r)	ft_dt_rec_check(r)
+#  define URCU_TXN_REC_DBG_CHAIN(r)	ft_dt_rec_check(r)
+# endif
+/*
+ * The detector's engine half runs BEFORE a plain store (the owner it reads is
+ * still the one the store displaces) and after a CAS store only; see
+ * URCU_TXN_REC_WILL_WRITE.
+ */
+static void ft_dt_will_write(const struct urcu_txn_record *r, void *v);
+# define URCU_TXN_REC_WILL_WRITE(r, v)	ft_dt_will_write((r), (void *) (v))
+#endif
+
 #ifndef URCU_TXN_REC_WROTE
 # if FT_DT_ARMED && defined(FT_DEBUG_SLOT_HIST)
 #  define URCU_TXN_REC_WROTE(r, v)					\
