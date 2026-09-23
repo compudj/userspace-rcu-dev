@@ -206,6 +206,18 @@ extern unsigned long urcu_txn_abort_lost_write;
 #ifndef URCU_TXN_REC_DBG_CHAIN
 #define URCU_TXN_REC_DBG_CHAIN(r)	do { } while (0)
 #endif
+/*
+ * URCU_TXN_REC_WILL_WRITE(r, v) fires immediately BEFORE a plain store of @v
+ * into r->slot (a settle, or a lone SW edge).  URCU_TXN_REC_WROTE fires after
+ * it, which is too late for an embedder tracking OWNERSHIP of the word: once
+ * the store lands a peer may take the word, and a post-store note then reads
+ * that peer as the owner the store displaced.  Only the plain-store sites
+ * carry it; a CAS store is noted after the fact, because before it nobody
+ * knows whether it will land.
+ */
+#ifndef URCU_TXN_REC_WILL_WRITE
+#define URCU_TXN_REC_WILL_WRITE(r, v)	do { } while (0)
+#endif
 
 /*
  * URCU_TXN_REC_WROTE(r, v) is the WINNER's half of the same attribution
@@ -1012,6 +1024,7 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 			continue;		/* second pass, below */
 		urcu_txn_dbg_parked_check(t, r, i);
 		urcu_txn_settle_delay();
+		URCU_TXN_REC_WILL_WRITE(r, want);
 		uatomic_store(r->slot, want, CMM_RELEASE);
 		URCU_TXN_REC_WROTE(r, want);
 	}
@@ -1031,6 +1044,9 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 					continue;
 				urcu_txn_dbg_parked_check(t, r, i);
 				urcu_txn_settle_delay();
+				URCU_TXN_REC_WILL_WRITE(r,
+					st == URCU_TXN_DESC_SUCCEEDED ?
+						r->new_ptr : r->old_ptr);
 				uatomic_store(r->slot,
 					st == URCU_TXN_DESC_SUCCEEDED ?
 						r->new_ptr : r->old_ptr,
@@ -1473,6 +1489,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			 * store IS the atomic commit -- no proxy, no grace
 			 * period (as <urcu/rcu-txn-sw.h>).
 			 */
+			URCU_TXN_REC_WILL_WRITE(r, r->new_ptr);
 			uatomic_store(r->slot, r->new_ptr, CMM_RELEASE);
 			URCU_TXN_REC_WROTE(r, r->new_ptr);
 			urcu_txn_destroy(t);
@@ -1593,6 +1610,7 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 
 		urcu_assert_debug(r->kind == URCU_TXN_KIND_SW);
 		/* Lone SW edge: caller-exclusive plain store, no proxy, no GP. */
+		URCU_TXN_REC_WILL_WRITE(r, r->new_ptr);
 		uatomic_store(r->slot, r->new_ptr, CMM_RELEASE);
 		URCU_TXN_REC_WROTE(r, r->new_ptr);
 		urcu_txn_destroy(t);
