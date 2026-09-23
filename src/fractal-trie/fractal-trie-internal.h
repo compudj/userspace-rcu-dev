@@ -5450,7 +5450,18 @@ enum ft_delay_site {
 	 */
 	FT_DELAY_SITE_STATEREC  = (1 << 4),
 	FT_DELAY_SITE_HELD      = (1 << 5),
-	FT_DELAY_SITE_ALL       = 0x3f,
+	/*
+	 * THE ACQUIRE LANE'S PARK.  Armed with -DFT_RED_ACQ_LANE_OFFLINE (the
+	 * pre-2026-09-23 behaviour, which parked the point op OFFLINE) this
+	 * widens the window in which the op is QUIESCENT mid-operation, so a
+	 * peer's call_rcu-deferred frees can reclaim the very @node its retry
+	 * re-derives from.  Armed WITHOUT it, the same delay lengthens an
+	 * ONLINE park and nothing is exposed -- which is exactly the A/B.
+	 * Use the usleep form (FT_DELAY_SPIN=0 FT_DELAY_US=...) with a small
+	 * FT_DELAY_PCT: a grace period has to fit inside the park.
+	 */
+	FT_DELAY_SITE_LANE      = (1 << 6),
+	FT_DELAY_SITE_ALL       = 0x7f,
 };
 
 #ifdef FT_DELAY_INJECT
@@ -5508,7 +5519,7 @@ unsigned int ft_delay_rand(void)
 static unsigned long ft_delay_fired[8];
 static const char *const ft_delay_site_name[8] = {
 	"acquire", "recompact", "insert", "postlock", "staterec", "held",
-	"?6", "?7"
+	"lane", "?7"
 };
 static __attribute__((destructor)) void ft_delay_fired_report(void)
 {

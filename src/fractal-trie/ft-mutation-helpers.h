@@ -10385,6 +10385,31 @@ static __thread struct cds_fair_mutex_node ft_acq_lane_waiter;
  * difference between "ordered takes livelock" and "the arbitration the design
  * assumed is not reachable from these sites".
  */
+#ifdef FT_DEBUG_LANE_GP
+struct ft_lane_canary {
+	struct rcu_head head;
+	int done;
+};
+static unsigned long ft_lane_gp_parks, ft_lane_gp_spanned;
+static __thread struct ft_lane_canary *ft_lane_canary_pending;
+static void ft_lane_canary_cb(struct rcu_head *h)
+{
+	struct ft_lane_canary *c = caa_container_of(h, struct ft_lane_canary,
+			head);
+
+	uatomic_set(&c->done, 1);
+	/* leaked on purpose: the park that queued it may still be reading it */
+}
+static __attribute__((destructor)) void ft_lane_gp_report(void)
+{
+	if (!uatomic_read(&ft_lane_gp_parks))
+		return;
+	fprintf(stderr, "FT LANE GP: parks %lu, of them SPANNING a grace period %lu\n",
+		uatomic_read(&ft_lane_gp_parks),
+		uatomic_read(&ft_lane_gp_spanned));
+}
+#endif
+
 #ifdef FT_DEBUG_LANE
 __attribute__((weak)) unsigned long ft_lane_calls, ft_lane_no_ctx,
 	ft_lane_no_dom, ft_lane_too_young, ft_lane_in_fallback,
@@ -10480,6 +10505,23 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 	FT_LANE(engaged);
 	flavor = ft->group->flavor;
 	(void) flavor;
+#ifdef FT_DEBUG_LANE_GP
+	/*
+	 * ☠ QUEUED WHILE STILL ONLINE, deliberately.  Queued after the offline
+	 * park below, the canary's own call_rcu runs on an OFFLINE thread and
+	 * trips urcu's "read lock while offline" assert -- the instrument
+	 * aborting instead of the code (measured, once).
+	 */
+	{
+		struct ft_lane_canary *c = (struct ft_lane_canary *)
+			calloc(1, sizeof(*c));
+
+		ft_lane_canary_pending = c;
+		if (c)
+			ft->group->flavor->update_call_rcu(&c->head,
+				ft_lane_canary_cb);
+	}
+#endif
 #ifdef FT_RED_ACQ_LANE_OFFLINE
 	/*
 	 * RED CONTROL, never a shipped configuration: park the lane OFFLINE as
@@ -10513,7 +10555,26 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 	 * lane releases it immediately (the point is the QUEUE, not the
 	 * critical section).
 	 */
+	/* The park itself, widened for the offline/online A/B (see the site). */
+	ft_delay_seam(FT_DELAY_SITE_LANE);
 	cds_fair_mutex_lock(&dom->lock, &ft_acq_lane_waiter);
+#ifdef FT_DEBUG_LANE_GP
+	/*
+	 * DID A GRACE PERIOD COMPLETE INSIDE THIS PARK?  That is the whole
+	 * question behind the lane's offline park: a quiescent op lets a peer's
+	 * call_rcu-deferred frees reclaim the very @node its retry re-derives
+	 * from.  The canary queued above, inspected here, answers it directly
+	 * -- "parks that spanned a GP" -- and separates "the exposure never
+	 * opened" from "it opened and the rest of the chain did not follow".
+	 * Those are opposite conclusions about the same green run.
+	 */
+	if (ft_lane_canary_pending) {
+		uatomic_inc(&ft_lane_gp_parks);
+		if (uatomic_read(&ft_lane_canary_pending->done))
+			uatomic_inc(&ft_lane_gp_spanned);
+		ft_lane_canary_pending = NULL;
+	}
+#endif
 	/*
 	 * Released immediately: the point is the QUEUE, not the critical
 	 * section.  Passing through a FIFO once per aged refusal gives the

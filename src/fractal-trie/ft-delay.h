@@ -72,6 +72,8 @@ ft_delay_init(void)
 			m |= FT_DELAY_SITE_STATEREC;
 		if (strstr(sites, "held"))
 			m |= FT_DELAY_SITE_HELD;
+		if (strstr(sites, "lane"))
+			m |= FT_DELAY_SITE_LANE;
 		if (strstr(sites, "all"))
 			m = FT_DELAY_SITE_ALL;
 		if (m)
