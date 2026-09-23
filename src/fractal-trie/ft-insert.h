@@ -2744,10 +2744,34 @@ int ft_attach_node(struct cds_ft *ft,
 			 * @iter_dest_node_flag, whose @metadata is the node the
 			 * two lines above lock-or-guard and count against.
 			 */
-			ft_flip_txn_record_reserved(ic->txn,
-				/*owner=*/ metadata, (void **) slot_ptr,
-				(void *) old_node_flag,
-				(void *) iter_node_flag);
+			if (iter_dest_node_flag != attach_node_flag) {
+				/*
+				 * ☞ A HIDDEN BODY IS WRITTEN PLAIN (item 4).
+				 * The destination is the copy this op just built
+				 * by relocation: no reader can reach it until
+				 * the forward publish below flips
+				 * @attach_node_flag_ptr onto it -- that publish
+				 * IS this slot's release -- and no peer can
+				 * write it, because no peer has its address.
+				 * An abort frees the body unpublished, so there
+				 * is nothing to roll back either.  Recording it
+				 * cost one descriptor entry per relocating
+				 * insert and bought nothing: MEASURED at 673468
+				 * of ft_unit's fills and 98% of them
+				 * (-DFT_DEBUG_HIDDEN_FILL).
+				 *
+				 * The IN-PLACE arm below is the opposite case --
+				 * a slot in the LIVE node, where the record's
+				 * expected-old is what rejects a peer -- and it
+				 * keeps its record.
+				 */
+				*slot_ptr = iter_node_flag;
+			} else {
+				ft_flip_txn_record_reserved(ic->txn,
+					/*owner=*/ metadata, (void **) slot_ptr,
+					(void *) old_node_flag,
+					(void *) iter_node_flag);
+			}
 			ic->slot = slot_ptr;
 #ifdef FT_DEBUG_DEL_TOMB
 			if (iter_dest_node_flag == attach_node_flag)

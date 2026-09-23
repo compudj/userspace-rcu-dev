@@ -7625,7 +7625,8 @@ static unsigned long ft_hf_commits, ft_hf_seen, ft_hf_hidden, ft_hf_max,
 	ft_hf_regs;
 /* Creating-pc table, filled by the engine's record stamp (ft-txn-rec-dbg.h). */
 #define FT_HF_PC_SLOTS	8192
-static struct ft_hf_pc { const void *rec, *pc; } ft_hf_pc_tab[FT_HF_PC_SLOTS];
+static struct ft_hf_pc { const void *rec, *pc, *pc2, *pc3; }
+	ft_hf_pc_tab[FT_HF_PC_SLOTS];
 static void ft_hf_pc_note(const struct urcu_txn_record *r, const void *pc)
 {
 	struct ft_hf_pc *e = &ft_hf_pc_tab[(((uintptr_t) r) >> 4) &
@@ -7637,8 +7638,11 @@ static void ft_hf_pc_note(const struct urcu_txn_record *r, const void *pc)
 	 * body, so unwind for those alone -- the whole record stream is 187M
 	 * per run and backtrace() on each would measure the instrument.
 	 */
-	if (!pc && !r->old_ptr && backtrace(bt, 6) >= 4)
+	if (!pc && !r->old_ptr && backtrace(bt, 6) >= 5) {
 		pc = bt[3];
+		e->pc2 = bt[4];
+		e->pc3 = bt[5];
+	}
 	e->rec = r;
 	e->pc = pc;
 }
@@ -7688,6 +7692,32 @@ static void ft_hidden_fill_at_commit(struct ft_flip_txn *t)
 			if ((((uintptr_t) d->recs[i].slot) & mask) ==
 					(((uintptr_t) t->hidden[j]) & mask)) {
 				ft_hf_site_note(ft_hf_pc_of(&d->recs[i]));
+				if (uatomic_read(&ft_hf_hidden) + n < 4) {
+					const struct ft_hf_pc *e =
+						&ft_hf_pc_tab[(((uintptr_t)
+							&d->recs[i]) >> 4) &
+						(FT_HF_PC_SLOTS - 1)];
+					Dl_info di2;
+					const char *fb = dladdr((void *)
+						ft_hf_pc_note, &di2) ?
+						(const char *) di2.dli_fbase :
+						NULL;
+
+					fprintf(stderr, "FT HIDDEN FILL: base+0x%lx old %p new %p %s chain +0x%lx +0x%lx +0x%lx\n",
+						(unsigned long) (((uintptr_t)
+							d->recs[i].slot) -
+						 (((uintptr_t) t->hidden[j]) &
+						  mask)),
+						d->recs[i].old_ptr,
+						d->recs[i].new_ptr,
+						d->recs[i].kind ? "MW" : "SW",
+						(unsigned long) ((const char *)
+							e->pc - fb),
+						(unsigned long) ((const char *)
+							e->pc2 - fb),
+						(unsigned long) ((const char *)
+							e->pc3 - fb));
+				}
 				n++;
 				break;
 			}
