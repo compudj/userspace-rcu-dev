@@ -1541,13 +1541,31 @@ static void ft_sh_replay(const char *name, void *const *slot)
 #ifdef FT_DEBUG_LOCK_LEAK
 /* Defined with the lock-leak ring, further down this file. */
 static void ft_ll_replay(const struct cds_ft_metadata *lock, const char *why);
+static uint32_t ft_ll_last_taker(const struct cds_ft_metadata *lock);
+extern __thread uint32_t ft_ll_tid;
 #endif
+#ifdef FT_DEBUG_LOCK_LEAK
+static unsigned long ft_fc_lockclear, ft_fc_foreign;
+static __attribute__((destructor)) void ft_fc_report(void)
+{
+	if (!uatomic_read(&ft_fc_lockclear))
+		return;
+	fprintf(stderr, "FT FOREIGN CLEAR: parks that ERASED a LOCK bit %lu, of them held by ANOTHER THREAD %lu\n",
+		uatomic_read(&ft_fc_lockclear), uatomic_read(&ft_fc_foreign));
+}
+#endif
+
 static void ft_sh_clobber(const struct urcu_txn_record *r, void *prev)
 {
-	fprintf(stderr, "FT SLOT HIST CLOBBER: record %p slot %p expected %p, found %p (writing %p)\n",
-		(const void *) r, (void *) r->slot, r->old_ptr, prev,
-		r->new_ptr);
-	ft_sh_replay("clobbered slot", r->slot);
+	static unsigned long printed;
+	bool loud = uatomic_add_return(&printed, 1) <= 4;
+
+	if (loud) {
+		fprintf(stderr, "FT SLOT HIST CLOBBER: record %p slot %p expected %p, found %p (writing %p)\n",
+			(const void *) r, (void *) r->slot, r->old_ptr, prev,
+			r->new_ptr);
+		ft_sh_replay("clobbered slot", r->slot);
+	}
 #ifdef FT_DEBUG_LOCK_LEAK
 	/*
 	 * ☠ @state is NOT the first member, and not every clobbered slot is a
@@ -1557,11 +1575,36 @@ static void ft_sh_clobber(const struct urcu_txn_record *r, void *prev)
 	 * would print another word's history as if it were this one.)
 	 */
 	if ((uintptr_t) r->old_ptr < 0x100000000UL &&
-			(uintptr_t) prev < 0x100000000UL)
-		ft_ll_replay((const struct cds_ft_metadata *)
+			(uintptr_t) prev < 0x100000000UL) {
+		const struct cds_ft_metadata *m =
+			(const struct cds_ft_metadata *)
 			((const char *) (const void *) r->slot -
-				offsetof(struct cds_ft_metadata, state)),
-			"park clobber");
+				offsetof(struct cds_ft_metadata, state));
+
+		if (loud)
+			ft_ll_replay(m, "park clobber");
+		/*
+		 * ☞ THE PRECURSOR, WITHOUT WAITING FOR THE ASSERT.  A park that
+		 * erases a LOCK bit is ordinary when the parker IS the holder
+		 * (its release recorded as an edge).  It is the defect --
+		 * whose symptom is the holder's later
+		 * "ft_meta_lock_release: s & FT_STATE_LOCK" -- when the bit
+		 * belongs to ANOTHER THREAD.  The ring knows which, so say so
+		 * here rather than hoping the rare assert fires.
+		 */
+		if (((uintptr_t) prev & FT_STATE_LOCK) &&
+				!((uintptr_t) r->new_ptr & FT_STATE_LOCK)) {
+			uint32_t holder = ft_ll_last_taker(m);
+
+			uatomic_inc(&ft_fc_lockclear);
+			if (holder && holder != ft_ll_tid) {
+				if (uatomic_add_return(&ft_fc_foreign, 1) <= 8)
+					fprintf(stderr, "FT FOREIGN CLEAR: tid %u parks %p -> %p over a LOCK held by tid %u (word %p)\n",
+						ft_ll_tid, prev, r->new_ptr,
+						holder, (const void *) m);
+			}
+		}
+	}
 #endif
 	fflush(stderr);
 }
@@ -1680,7 +1723,7 @@ struct ft_ll_slot {
 	struct ft_ll_ev ev[FT_LL_HIST];
 };
 static struct ft_ll_slot ft_ll_map[FT_LL_NSLOT];
-static __thread uint32_t ft_ll_tid;
+__thread uint32_t ft_ll_tid;
 
 /* A refused take's streak: same word, same state, since @t0. */
 static __thread const struct cds_ft_metadata *ft_ll_ref_lock;
@@ -1869,6 +1912,33 @@ void ft_ll_replay(const struct cds_ft_metadata *lock, const char *why)
 	if (dladdr((void *) ft_ll_log, &di))
 		fprintf(stderr, "FT LOCK HIST BASE %s %p\n", di.dli_fname,
 			di.dli_fbase);
+}
+
+/*
+ * WHO LAST TOOK THIS WORD?  The ring carries the TAKE events with their tid,
+ * which is the half the engine cannot know: a park that CLEARS a LOCK bit is
+ * ordinary when the parker is the holder (a release recorded as an edge) and is
+ * the defect when it is not.  Returns 0 when the ring has no TAKE for it.
+ */
+static __attribute__((unused))
+uint32_t ft_ll_last_taker(const struct cds_ft_metadata *lock)
+{
+	struct ft_ll_slot *sl = ft_ll_slot_of(lock);
+	unsigned long h = uatomic_read(&sl->head);
+	unsigned long i = h > FT_LL_HIST ? h - FT_LL_HIST : 0;
+	uint32_t tid = 0;
+
+	for (; i < h; i++) {
+		const struct ft_ll_ev *e = &sl->ev[i % FT_LL_HIST];
+
+		if (e->lock != lock)
+			continue;
+		if (e->kind == FT_LL_TAKE)
+			tid = e->tid;		/* most recent wins */
+		else if (e->kind == FT_LL_CLEAR || e->kind == FT_LL_CLEAR_IF)
+			tid = 0;		/* released again */
+	}
+	return tid;
 }
 
 # define FT_LL_LOG(k, lock, txn, a, b)					\
@@ -5475,6 +5545,8 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 		return -EAGAIN;
 	*state_snapshot = s;
 	FT_LL_LOG(FT_LL_TAKE, meta, NULL, s, 0);
+	/* Hold longer, so a peer's already-sampled record settles inside it. */
+	ft_delay_seam(FT_DELAY_SITE_HELD);
 	ft_hold_trace_note(meta, meta, false, "ft_meta_lock_acquire", 0);
 	return 0;
 }
@@ -10011,6 +10083,13 @@ void ft_flip_txn_record_state_kind_ctx(struct ft_flip_txn *t,
 		ft_flip_txn_record_tag_mw(t, (void **) &meta->state,
 			old_ptr, new_ptr, FT_STATE_PROXY
 			FT_TK_MWA(FT_TK_MWA_STATE));
+	/*
+	 * The record now carries a SAMPLE of this word; its settle will write
+	 * that sample back.  Everything that can go wrong between the two --
+	 * a peer taking the lock this sample says is not held -- lives in this
+	 * gap, so this is where it is widened.
+	 */
+	ft_delay_seam(FT_DELAY_SITE_STATEREC);
 }
 
 static inline
@@ -10087,6 +10166,8 @@ int ft_dlm_lock_now(struct cds_ft_metadata *meta, uintptr_t *snap)
 		return -EAGAIN;		/* a peer won it between load and CAS */
 	*snap = s;
 	FT_LL_LOG(FT_LL_TAKE, meta, NULL, s, 0);
+	ft_delay_seam(FT_DELAY_SITE_HELD);
+
 	return 0;
 }
 

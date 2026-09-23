@@ -641,16 +641,19 @@ void urcu_txn_dbg_park_clobbered(struct urcu_txn_record *r, void *prev)
 				o->old_ptr == o->new_ptr ? " VALIDATE" : "");
 		}
 		backtrace_symbols_fd(bt, nbt, 2);
-		/*
-		 * WHO WROTE THE VALUE THE PARK FOUND?  The backtrace names the
-		 * PARKER; an embedder that keeps a per-slot write history (the
-		 * FT's -DFT_DEBUG_SLOT_HIST) answers the other half by replaying
-		 * this word.  Capped tighter than the report itself: a replay is
-		 * 32 lines.
-		 */
-		if (n <= 4)
-			URCU_TXN_PARK_CLOBBER_NOTE(r, prev);
 	}
+	/*
+	 * WHO WROTE THE VALUE THE PARK FOUND?  The backtrace names the PARKER;
+	 * an embedder that keeps a per-slot write history (the FT's
+	 * -DFT_DEBUG_SLOT_HIST) answers the other half by replaying this word.
+	 *
+	 * ☠ OUTSIDE the report cap, and that is the whole point.  Capped with
+	 * it, the embedder saw only the first handful of clobbers in the
+	 * process and its own counters read ZERO on a run with millions --
+	 * measured, while hunting a LOCK bit erased by the wrong thread.  The
+	 * embedder caps its own printing; what it must not lose is the EVENT.
+	 */
+	URCU_TXN_PARK_CLOBBER_NOTE(r, prev);
 }
 #endif
 

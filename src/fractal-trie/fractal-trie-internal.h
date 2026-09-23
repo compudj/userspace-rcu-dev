@@ -5434,7 +5434,23 @@ enum ft_delay_site {
 	 * study an op's OWN ordering, never to reproduce a lost race.
 	 */
 	FT_DELAY_SITE_POSTLOCK  = (1 << 3),
-	FT_DELAY_SITE_ALL       = 0xf,
+	/*
+	 * THE STALE-EXPECTED-OLD SEAM, for the class where an acquire does NOT
+	 * exclude the writer: a STATE-word record samples the word when it is
+	 * built and its settle writes that sample back -- blind, if the record
+	 * is SW.  A peer that TAKES the lock between the two has its LOCK bit
+	 * erased by that settle and asserts at its own release
+	 * (ft_meta_lock_release: s & FT_STATE_LOCK).  Widening THIS gap is what
+	 * a POSTLOCK delay cannot do (its comment assumes the acquire excludes
+	 * everyone, which is exactly the assumption under test).
+	 *
+	 *   STATEREC  after a state-word record is filed, before its commit.
+	 *   HELD      after a lock take succeeds, before the op's own records,
+	 *             so a peer's already-built record settles inside the hold.
+	 */
+	FT_DELAY_SITE_STATEREC  = (1 << 4),
+	FT_DELAY_SITE_HELD      = (1 << 5),
+	FT_DELAY_SITE_ALL       = 0x3f,
 };
 
 #ifdef FT_DELAY_INJECT
@@ -5489,6 +5505,22 @@ unsigned int ft_delay_rand(void)
  * pauses at the seam while another runs through at full speed -- so each call
  * tosses its own coin (FT_DELAY_PCT, default 50).
  */
+static unsigned long ft_delay_fired[8];
+static const char *const ft_delay_site_name[8] = {
+	"acquire", "recompact", "insert", "postlock", "staterec", "held",
+	"?6", "?7"
+};
+static __attribute__((destructor)) void ft_delay_fired_report(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < 8; i++)
+		if (uatomic_read(&ft_delay_fired[i]))
+			fprintf(stderr, "FT DELAY: site %s fired %lu times\n",
+				ft_delay_site_name[i],
+				uatomic_read(&ft_delay_fired[i]));
+}
+
 static inline
 void ft_delay_seam(enum ft_delay_site site)
 {
@@ -5498,6 +5530,14 @@ void ft_delay_seam(enum ft_delay_site site)
 		return;
 	if (ft_delay_pct < 100 && (ft_delay_rand() % 100u) >= ft_delay_pct)
 		return;
+	/*
+	 * ☠ COUNT THE FIRINGS.  A quiet run under injection is only evidence
+	 * about the code if the injection HAPPENED; without this, a site that
+	 * is never reached and a race that does not exist read identically --
+	 * and this file already warns that a quieter run under injection is
+	 * evidence the injection is wrong.
+	 */
+	uatomic_inc(&ft_delay_fired[__builtin_ctz((unsigned int) site) & 7]);
 	/*
 	 * ☠ A SLEEP IS THE WRONG SHAPE FOR A NANOSECOND WINDOW.  usleep() cannot
 	 * resolve below the scheduler's granularity (~50us however small the

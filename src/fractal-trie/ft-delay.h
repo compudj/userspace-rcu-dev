@@ -68,6 +68,10 @@ ft_delay_init(void)
 			m |= FT_DELAY_SITE_INSERT;
 		if (strstr(sites, "postlock"))
 			m |= FT_DELAY_SITE_POSTLOCK;
+		if (strstr(sites, "staterec"))
+			m |= FT_DELAY_SITE_STATEREC;
+		if (strstr(sites, "held"))
+			m |= FT_DELAY_SITE_HELD;
 		if (strstr(sites, "all"))
 			m = FT_DELAY_SITE_ALL;
 		if (m)
