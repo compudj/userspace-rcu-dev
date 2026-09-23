@@ -1553,6 +1553,12 @@ static struct ft_dt_ent {
  *   @ft_dt_double	THE DEFECT: cleared by a thread that did not take it.
  */
 static unsigned long ft_dt_sets, ft_dt_double, ft_dt_matched, ft_dt_unowned;
+#ifdef FT_RED_DT_STEAL
+/* Set only by the constructor self-test below; see it for why. */
+static int ft_dt_in_selftest;
+#else
+# define ft_dt_in_selftest	0
+#endif
 
 static inline struct ft_dt_ent *ft_dt_slot(const void *w)
 {
@@ -1641,7 +1647,8 @@ static inline void ft_dt_note_clear(const void *w, const void *pc, bool report,
 		 * lapsed.
 		 */
 		FT_TP(lock_stolen, w, self, pc, owner, opc);
-		ft_trace_capture();
+		if (!ft_dt_in_selftest)
+			ft_trace_capture();	/* a forged steal has no history */
 		fprintf(stderr, "FT STOLEN LOCK: word %p cleared by tid %u from %s, but the bit was taken by tid %u from %s; BEFORE that the bit was cleared by tid %u from %s (%s) -- clearer's path:\n",
 			w, self, ft_dt_pc_str(pc, cbuf, sizeof(cbuf)),
 			owner, ft_dt_pc_str(opc, obuf, sizeof(obuf)),
@@ -1710,6 +1717,50 @@ static __attribute__((destructor)) void ft_dt_report(void)
 		uatomic_read(&ft_dt_sets), uatomic_read(&ft_dt_matched),
 		uatomic_read(&ft_dt_unowned), uatomic_read(&ft_dt_double));
 }
+
+#ifdef FT_RED_DT_STEAL
+/*
+ * ☞ THE POSITIVE CONTROL FOR THE DETECTOR ITSELF.
+ *
+ * Whether the FT steals a lock is the open question, so it cannot also be the
+ * control -- demanding a real steal as proof that the steal detector works is
+ * circular, and a build where nothing fires is exactly what a BLIND instrument
+ * looks like (measured the hard way: 114 clean runs whose red control was also
+ * clean, because the test drove no such path).  What can be controlled is the
+ * reporting path end to end in THIS binary: forge an owner on a word the FT
+ * never sees, clear it from another tid, and require the count to move.
+ *
+ * Pass = one "SELF-TEST" line and a trailing report whose STOLEN count is >= 1.
+ * Not armed / mis-gated = no line at all, which is the point.
+ */
+static unsigned long ft_dt_selftest_word;
+
+static __attribute__((constructor)) void ft_dt_selftest(void)
+{
+	const void *w = (const void *) &ft_dt_selftest_word;
+	struct ft_dt_ent *e = ft_dt_slot(w);
+	unsigned long before;
+
+	ft_dt_note_take(w, (const void *) &ft_dt_selftest);
+	/*
+	 * Forge a DIFFERENT owner rather than spawn a thread: the detector's
+	 * predicate is `owner != self`, and a second tid is all that takes.
+	 */
+	uatomic_set(&e->tid, ft_ll_violation_tid() ^ 1u);
+	before = uatomic_read(&ft_dt_double);
+	ft_dt_in_selftest = 1;
+	ft_dt_note_clear(w, (const void *) &ft_dt_selftest, true, 0);
+	ft_dt_in_selftest = 0;
+	fprintf(stderr, "FT STOLEN LOCK SELF-TEST: %s (%lu -> %lu)\n",
+		uatomic_read(&ft_dt_double) > before ? "reported" : "BLIND",
+		before, uatomic_read(&ft_dt_double));
+	/* Leave no residue: the FT must start from a table it did not write. */
+	uatomic_set(&e->word, NULL);
+	uatomic_set(&e->tid, 0);
+	uatomic_set(&ft_dt_double, before);
+	uatomic_set(&ft_dt_sets, 0);
+}
+#endif
 # define FT_DT_TAKE(w)		ft_dt_note_take((w), __builtin_return_address(0))
 # define FT_DT_CLEAR(w)		ft_dt_note_clear((w),			\
 					__builtin_return_address(0), true, 0)
