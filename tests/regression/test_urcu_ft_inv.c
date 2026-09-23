@@ -23840,6 +23840,13 @@ struct ski_ctx {
 	struct ft_test_node **ret_v[2];
 	size_t ret_n[2], ret_cap[2];
 	unsigned char *in[2];		/* [2][SKI_K]: MY node is currently in. */
+	/*
+	 * FT_INV_SKI_ONLINE: per (worker, key) seqcount, ODD while that worker
+	 * operates on that key.  Lets the PEER check "your node is still in"
+	 * right after its OWN op, knowing the owner was not mid-op -- so a
+	 * loss is caught in the thread whose op caused it.
+	 */
+	unsigned long seq[2][SKI_K];
 };
 
 struct ski_arg {
@@ -23850,12 +23857,147 @@ struct ski_arg {
 static unsigned long ski_dup_appends, ski_solo_appends;
 #endif
 
+/*
+ * FT_INV_SKI_ONLINE=1: check EACH op instead of the end state.  Only the owner
+ * removes its node, so "my node is not in the chain" right after my insert
+ * (a LOST INSERT) or right before my remove (a PHANTOM REMOVE by the peer) is
+ * the defect itself, caught within one op of it happening -- and, under
+ * FT_INV_ABORT_ON_VIOLATION, with the flight recorder ending there.  A miss
+ * that a re-lookup then finds is reported separately: that is a READER
+ * visibility gap, not a loss.
+ */
+/*
+ * FT_INV_SKI_BYTE=b puts the key's distinguishing byte at position @b (default
+ * 7, the last).  With b < 7 every key carries its own compressed TAIL run over
+ * bytes b+1..7, reached through a skip pointer from the branch at depth b --
+ * so under EXPONENTIAL spacing a lock level (2, 4) can fall strictly INSIDE a
+ * skipped run, the shape where the anchor is the compressed node rather than
+ * the node holding the skip pointer.  b = 7 never builds it.
+ */
+static uint64_t ski_key(unsigned int k)
+{
+	static int b = -1;
+
+	if (b < 0) {
+		const char *e = getenv("FT_INV_SKI_BYTE");
+
+		b = e ? atoi(e) : 7;
+		if (b < 0 || b > 7)
+			b = 7;
+	}
+	return (uint64_t) k << (8 * (7 - b));
+}
+
+static unsigned long ski_online_checks, ski_online_transient;
+
+static bool ski_node_in_chain(struct ski_ctx *c, struct cds_ft_iter *iter,
+		const uint8_t *key, struct cds_ft_node *want)
+{
+	struct cds_ft_node *h;
+
+	cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+	if (cds_ft_lookup(c->ft, iter) != CDS_FT_STATUS_OK)
+		return false;
+	for (h = cds_ft_iter_node(iter); h; h = cds_ft_node_next_rcu(h))
+		if (h == want)
+			return true;
+	return false;
+}
+
+/* Called inside a read-side critical section. */
+static void ski_online_check(struct ski_ctx *c, struct cds_ft_iter *iter,
+		const uint8_t *key, unsigned int id, unsigned int k,
+		struct cds_ft_node *want, const char *when, unsigned int r,
+		unsigned int burst)
+{
+	unsigned int t;
+
+	uatomic_inc(&ski_online_checks);
+	if (ski_node_in_chain(c, iter, key, want))
+		return;
+	for (t = 0; t < 8; t++)
+		if (ski_node_in_chain(c, iter, key, want)) {
+			uatomic_inc(&ski_online_transient);
+			fprintf(stderr, "ski ONLINE: TRANSIENT reader miss, key %u worker %u %s (r=%u burst=%u), found on re-lookup %u\n",
+				k, id, when, r, burst, t + 1);
+			return;
+		}
+	{
+		/*
+		 * SELF-DIAGNOSING: what did the lookup find, and what does the
+		 * lost node itself still say?  next bit 1 = the library marked it
+		 * REMOVED (an unlink that meant to take it); a clear next with a
+		 * prev still naming a holder = it was dropped WITHOUT being
+		 * unlinked (a wholesale detach / stale skip target).
+		 */
+		enum cds_ft_status ls;
+		struct cds_ft_node *h, *head = NULL;
+		unsigned int len = 0;
+		uintptr_t wn = (uintptr_t) CMM_LOAD_SHARED(want->next);
+		void *wp = CMM_LOAD_SHARED(want->prev);
+
+		cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+		ls = cds_ft_lookup(c->ft, iter);
+		if (ls == CDS_FT_STATUS_OK) {
+			head = cds_ft_iter_node(iter);
+			for (h = head; h; h = cds_ft_node_next_rcu(h))
+				len++;
+		}
+		report_violation("inv_concurrent_same_key_inserts_nolist",
+			"ONLINE: key %u worker %u node %p LOST %s (r=%u burst=%u, peer in=%u) | lookup=%d head=%p len=%u | lost node: next=%#lx%s prev=%p%s",
+			k, id, (void *) want, when, r, burst,
+			(unsigned int) c->in[1 - id][k], (int) ls,
+			(void *) head, len, (unsigned long) wn,
+			(wn & 2) ? " (REMOVED-marked)" : " (NOT marked)",
+			wp, ((uintptr_t) wp & 1) ? " (tagged)" : "");
+	}
+}
+
+/*
+ * After MY op on @k: the PEER's node for @k, if the peer says it is in and was
+ * not mid-op across this check, must be reachable.  If not, the op that lost
+ * it is the one THIS thread just finished -- report from here, so the flight
+ * recorder ends on the culprit's own events.
+ */
+static unsigned long ski_peer_checks;
+
+static void ski_peer_check(struct ski_ctx *c, struct cds_ft_iter *iter,
+		const uint8_t *key, unsigned int id, unsigned int k,
+		unsigned int r, unsigned int burst)
+{
+	unsigned int o = 1 - id;
+	unsigned long s1, s2;
+	struct ft_test_node *n;
+	bool found;
+
+	s1 = uatomic_load(&c->seq[o][k], CMM_ACQUIRE);
+	if (s1 & 1)
+		return;
+	if (!uatomic_load(&c->in[o][k], CMM_RELAXED))
+		return;
+	n = uatomic_load(&c->cur[o][k], CMM_RELAXED);
+	if (!n)
+		return;
+	found = ski_node_in_chain(c, iter, key, &n->node);
+	cmm_smp_rmb();
+	s2 = uatomic_load(&c->seq[o][k], CMM_RELAXED);
+	if (s1 != s2)
+		return;		/* the owner moved: no verdict */
+	uatomic_inc(&ski_peer_checks);
+	if (!found)
+		report_violation("inv_concurrent_same_key_inserts_nolist",
+			"ONLINE PEER: key %u: worker %u's node %p is GONE right after worker %u's own %s (r=%u burst=%u) -- the culprit is this thread's last op",
+			k, o, (void *) &n->node, id,
+			c->in[id][k] ? "INSERT" : "REMOVE", r, burst);
+}
+
 static void *ski_worker(void *arg)
 {
 	struct ski_arg *a = (struct ski_arg *) arg;
 	struct ski_ctx *c = a->c;
 	unsigned int id = a->id, r, burst, k;
 	struct cds_ft_iter *iter;
+	bool online = getenv("FT_INV_SKI_ONLINE") != NULL;
 
 	rcu_register_thread();
 	rcu_thread_online();
@@ -23866,8 +24008,10 @@ static void *ski_worker(void *arg)
 		for (k = 0; k < SKI_K; k++) {
 			uint8_t key[8];
 
-			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
+			cds_ft_u64_to_key(c->ft, ski_key(k), key,
 				CDS_FT_LEN_DEFAULT);
+			if (online)
+				uatomic_inc(&c->seq[id][k]);	/* odd: mid-op */
 			if (!c->in[id][k]) {
 				struct ft_test_node *fresh =
 					node_alloc((uint64_t) k);
@@ -23889,6 +24033,12 @@ static void *ski_worker(void *arg)
 					c->cur[id][k] = fresh;
 					fresh = NULL;
 					c->in[id][k] = 1;
+					if (online)
+						ski_online_check(c, iter, key,
+							id, k,
+							&c->cur[id][k]->node,
+							"after my insert", r,
+							burst);
 #ifdef FT_INV_SKI_COVERAGE
 					/* Did this insert APPEND to a chain the
 					 * PEER already owns?  That is the
@@ -23906,6 +24056,10 @@ static void *ski_worker(void *arg)
 					node_free(fresh);
 			} else {
 				rcu_read_lock();
+				if (online && c->cur[id][k])
+					ski_online_check(c, iter, key, id, k,
+						&c->cur[id][k]->node,
+						"before my remove", r, burst);
 				cds_ft_iter_set_key(iter, key,
 					CDS_FT_LEN_DEFAULT);
 				/*
@@ -23930,6 +24084,12 @@ static void *ski_worker(void *arg)
 					c->cur[id][k] = NULL;
 					c->in[id][k] = 0;
 				}
+				rcu_read_unlock();
+			}
+			if (online) {
+				uatomic_inc(&c->seq[id][k]);	/* even: done */
+				rcu_read_lock();
+				ski_peer_check(c, iter, key, id, k, r, burst);
 				rcu_read_unlock();
 			}
 			rcu_quiescent_state();
@@ -24002,7 +24162,7 @@ static int inv_concurrent_same_key_inserts_run(bool ordered_list, bool coarse,
 		uint8_t key[8];
 		unsigned int seen[2] = { 0, 0 }, extra = 0;
 
-		cds_ft_u64_to_key(c.ft, (uint64_t) k, key, CDS_FT_LEN_DEFAULT);
+		cds_ft_u64_to_key(c.ft, ski_key(k), key, CDS_FT_LEN_DEFAULT);
 		cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
 		if (cds_ft_lookup(c.ft, iter) == CDS_FT_STATUS_OK) {
 			for (h = cds_ft_iter_node(iter); h;
@@ -24753,8 +24913,26 @@ static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
 
 static int inv_concurrent_same_key_inserts_nolist(void)
 {
-	return inv_concurrent_same_key_inserts_run(false, false,
-		"inv_concurrent_same_key_inserts_nolist");
+	/*
+	 * FT_INV_SKI_REPEAT=N runs the row N times in one process, stopping
+	 * at the first red: a reproducer for a rare key loss that the row
+	 * alone never shows, which separates "the process has aged" (memory
+	 * reuse accumulates here) from "the machine is loaded".
+	 */
+	const char *rep = getenv("FT_INV_SKI_REPEAT");
+	unsigned long n = rep ? strtoul(rep, NULL, 10) : 1, i;
+	int ret = 0;
+
+	for (i = 0; i < (n ? n : 1) && !ret; i++)
+		ret = inv_concurrent_same_key_inserts_run(false, false,
+			"inv_concurrent_same_key_inserts_nolist");
+	if (rep)
+		fprintf(stderr, "# ski repeat: %lu run(s), %s\n", i,
+			ret ? "RED" : "ok");
+	if (getenv("FT_INV_SKI_ONLINE"))
+		fprintf(stderr, "# ski ONLINE: %lu checks, %lu transient reader misses, %lu peer checks\n",
+			ski_online_checks, ski_online_transient, ski_peer_checks);
+	return ret;
 }
 
 static int inv_concurrent_same_key_replace_nolist(void)
