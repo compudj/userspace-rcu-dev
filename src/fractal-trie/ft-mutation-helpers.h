@@ -2011,6 +2011,107 @@ static void ft_dt_engine_clear(const struct urcu_txn_record *r, void *v)
 
 static unsigned long ft_dt_rec_foreign, ft_dt_rec_unowned, ft_dt_rec_swblind;
 
+/*
+ * ☞ THE STALE-PLAN AUDIT (see ft-txn-rec-dbg.h).  Counted per PRODUCER: the
+ * hook runs on the recording op's own stack, so a bucket keyed on the return
+ * addresses past the engine frames names the site.  One sample backtrace per
+ * bucket; resolve the offsets with addr2line.
+ */
+#define FT_SWS_BUCKETS	64
+#define FT_SWS_DEPTH	12
+static struct ft_sws_bucket {
+	unsigned long key;
+	unsigned long n, nproxy;
+	int nbt;
+	void *bt[FT_SWS_DEPTH];
+	uintptr_t old, cur;
+} ft_sws_tab[FT_SWS_BUCKETS];
+static unsigned long ft_sws_checked, ft_sws_stale, ft_sws_proxy,
+	ft_sws_overflow, ft_sws_doomed_stale, ft_sws_doomed_proxy;
+/*
+ * Set by a producer around records it makes in a txn it KNOWS is doomed
+ * (@acquire_miss: ft_flip_txn_commit discards it unplanted).  Such a record
+ * never installs, so its staleness is noted apart from the live population.
+ */
+static __thread int ft_sws_doomed;
+
+static void ft_sw_stale_check(const struct urcu_txn_record *r)
+{
+	void *cur, *bt[FT_SWS_DEPTH];
+	unsigned long key = 0;
+	unsigned int i;
+	int nbt, isproxy = 0;
+
+	if (r->kind != URCU_TXN_KIND_SW)
+		return;
+	uatomic_inc(&ft_sws_checked);
+	cur = CMM_LOAD_SHARED(*r->slot);
+	if (urcu_txn_is_proxy(cur, r->proxy_tag)) {
+		/* A peer parked on a word this op records SW: no exclusion. */
+		uatomic_inc(&ft_sws_proxy);
+		isproxy = 1;
+	} else if (cur == r->old_ptr) {
+		return;
+	}
+	if (cur == r->old_ptr)
+		return;
+	if (ft_sws_doomed) {
+		uatomic_inc(&ft_sws_doomed_stale);
+		if (urcu_txn_is_proxy(cur, r->proxy_tag)) {
+			uatomic_inc(&ft_sws_doomed_proxy);
+			uatomic_add(&ft_sws_proxy, -1);
+		}
+		return;
+	}
+	uatomic_inc(&ft_sws_stale);
+	nbt = backtrace(bt, FT_SWS_DEPTH);
+	for (i = 2; i < (unsigned int) nbt && i < 9; i++)
+		key = key * 1000003UL ^ (unsigned long) (uintptr_t) bt[i];
+	/* Proxy and plain mismatches are different findings: own buckets. */
+	key ^= (unsigned long) isproxy;
+	for (i = 0; i < FT_SWS_BUCKETS; i++) {
+		struct ft_sws_bucket *b = &ft_sws_tab[i];
+		unsigned long k = uatomic_read(&b->key);
+
+		if (k == key) {
+			uatomic_inc(&b->n);
+			if (isproxy)
+				uatomic_inc(&b->nproxy);
+			return;
+		}
+		if (!k && uatomic_cmpxchg(&b->key, 0, key) == 0) {
+			b->nbt = nbt;
+			memcpy(b->bt, bt, sizeof(void *) * nbt);
+			b->old = (uintptr_t) r->old_ptr;
+			b->cur = (uintptr_t) cur;
+			uatomic_inc(&b->n);
+			if (isproxy)
+				uatomic_inc(&b->nproxy);
+			return;
+		}
+	}
+	uatomic_inc(&ft_sws_overflow);
+}
+
+static __attribute__((destructor)) void ft_sw_stale_report(void)
+{
+	unsigned int i;
+
+	fprintf(stderr, "FT SW STALE-OLD: %lu of %lu SW records created with an expected-old != the live word (%lu with a peer proxy parked on it; %lu past the table) | in DOOMED txns (acquire_miss, discarded unplanted): %lu stale, %lu proxy\n",
+		ft_sws_stale, ft_sws_checked, ft_sws_proxy, ft_sws_overflow,
+		ft_sws_doomed_stale, ft_sws_doomed_proxy);
+	for (i = 0; i < FT_SWS_BUCKETS; i++) {
+		struct ft_sws_bucket *b = &ft_sws_tab[i];
+
+		if (!b->key)
+			continue;
+		fprintf(stderr, "FT SW STALE-OLD SITE: %lu  (sample old %#lx live %#lx) proxy=%lu\n",
+			b->n, (unsigned long) b->old, (unsigned long) b->cur,
+			b->nproxy);
+		backtrace_symbols_fd(b->bt, b->nbt, 2);
+	}
+}
+
 static void ft_dt_rec_check(const struct urcu_txn_record *r)
 {
 	const struct cds_ft_metadata *m;

@@ -348,10 +348,22 @@ static void ft_sh_clobber(const struct urcu_txn_record *r, void *prev);
  */
 struct urcu_txn_record;
 static void ft_dt_rec_check(const struct urcu_txn_record *r);
+/*
+ * THE STALE-PLAN AUDIT: an SW record is CREATED by an op that already holds
+ * the lock covering its word, so the word's committed value must equal the
+ * record's expected-old -- an SW park and settle store BLIND and will not
+ * find out otherwise.  CREATION only: a chained record's old_ptr is this
+ * txn's own earlier value.  Defined in ft-mutation-helpers.h.
+ */
+static void ft_sw_stale_check(const struct urcu_txn_record *r);
 # if defined(URCU_TXN_REC_DBG_STAMP) || defined(URCU_TXN_REC_DBG_CHAIN)
 #  warning "FT_DT_ARMED: record hooks already claimed; the record-time release check is BLIND in this build"
 # else
-#  define URCU_TXN_REC_DBG_STAMP(r)	ft_dt_rec_check(r)
+#  define URCU_TXN_REC_DBG_STAMP(r)					\
+	do {								\
+		ft_dt_rec_check(r);					\
+		ft_sw_stale_check(r);					\
+	} while (0)
 #  define URCU_TXN_REC_DBG_CHAIN(r)	ft_dt_rec_check(r)
 # endif
 /*

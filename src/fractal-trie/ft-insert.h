@@ -4613,6 +4613,100 @@ unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
  * Returns 0 on success, -EINVAL on bad arguments, or a negative errno
  * on memory allocation failure.
  */
+#ifdef FT_DEBUG_IR_HOLDER
+/*
+ * PROBE (B2): does insert_replace LOCK the word the chain's other writers lock?
+ * Appenders and removers take the node named by the HEAD's back-pointer
+ * (ft_chain_head_holder / ft_node_holder); these arms take the DESCENT's node.
+ * Compared at the under-lock check, i.e. while the lock is held.
+ */
+static unsigned long ft_irh_n[4], ft_irh_mismatch[4], ft_irh_kind[4][3][3];
+/* On a mismatch: [locked retired][head-holder retired][slot still names head] */
+static unsigned long ft_irh_cls[4][2][2][3], ft_irh_live_miss;
+
+static inline unsigned int ft_irh_k(const struct cds_ft_inode_flag *nf)
+{
+	if (ft_node_skip_compressed((struct cds_ft_inode_flag *) nf))
+		return 2;
+	if (ft_node_compressed((struct cds_ft_inode_flag *) nf))
+		return 1;
+	return 0;
+}
+
+static inline void ft_irh_probe(struct cds_ft *ft, unsigned int arm,
+		struct cds_ft_inode_flag *locked, struct cds_ft_node *displaced,
+		struct cds_ft_inode_flag **slot, const struct ft_flip_txn *t)
+{
+	struct cds_ft_inode_flag *hh = ft_chain_head_holder(ft, displaced);
+
+	uatomic_inc(&ft_irh_n[arm]);
+	if (!hh || !locked)
+		return;
+	if (ft_flag_to_metadata(ft, locked) == ft_flag_to_metadata(ft, hh))
+		return;
+	uatomic_inc(&ft_irh_mismatch[arm]);
+	uatomic_inc(&ft_irh_kind[arm][ft_irh_k(locked)][ft_irh_k(hh)]);
+	{
+		unsigned int lr = !!ft_flag_tombstoned(ft, locked);
+		unsigned int hr = !!ft_flag_tombstoned(ft, hh);
+		unsigned int sn = 2;	/* no slot to ask */
+
+		if (slot)
+			sn = (struct cds_ft_node *) ft_node_ptr(
+				ft_resolve_flip_proxy(CMM_LOAD_SHARED(*slot)))
+				== displaced;
+		uatomic_inc(&ft_irh_cls[arm][lr][hr][sn]);
+		if (!lr && !hr) {
+			static unsigned long printed;
+
+			if (t && t->acquire_miss)
+				uatomic_inc(&ft_irh_live_miss);
+			if (uatomic_add_return(&printed, 1) <= 6)
+				fprintf(stderr, "FT IR HOLDER LIVE/LIVE: head %p prev raw %p | locked X %p state %#lx | head-holder Y %p state %#lx | X slot raw %p | txn acquire_miss=%d\n",
+					(void *) displaced,
+					CMM_LOAD_SHARED(displaced->prev),
+					(void *) locked,
+					(unsigned long) CMM_LOAD_SHARED(
+						ft_flag_to_metadata(ft, locked)->state),
+					(void *) hh,
+					(unsigned long) CMM_LOAD_SHARED(
+						ft_flag_to_metadata(ft, hh)->state),
+					slot ? (void *) CMM_LOAD_SHARED(*slot) : NULL,
+					t ? (int) t->acquire_miss : -1);
+		}
+	}
+}
+
+static __attribute__((destructor)) void ft_irh_report(void)
+{
+	static const char *kn[3] = { "internal", "compressed", "SKIP" };
+	unsigned int a, x, y;
+
+	for (a = 0; a < 4; a++) {
+		fprintf(stderr, "FT IR HOLDER arm %u: %lu of %lu locked a DIFFERENT word than the head's back-pointer names (live/live with acquire_miss set: %lu, all arms)\n",
+			a, ft_irh_mismatch[a], ft_irh_n[a], ft_irh_live_miss);
+		for (x = 0; x < 3; x++)
+			for (y = 0; y < 3; y++)
+				if (ft_irh_kind[a][x][y])
+					fprintf(stderr, "    locked %-10s vs head-holder %-10s: %lu\n",
+						kn[x], kn[y], ft_irh_kind[a][x][y]);
+		for (x = 0; x < 2; x++)
+			for (y = 0; y < 2; y++)
+				for (unsigned int z = 0; z < 3; z++)
+					if (ft_irh_cls[a][x][y][z])
+						fprintf(stderr, "    locked %s, head-holder %s, locked's slot %s: %lu\n",
+							x ? "RETIRED" : "live",
+							y ? "RETIRED" : "live",
+							z == 2 ? "n/a" : z ? "STILL NAMES the head" : "no longer names it",
+							ft_irh_cls[a][x][y][z]);
+	}
+}
+# define FT_IRH_PROBE(ft, arm, locked, displaced, slot)			\
+	ft_irh_probe((ft), (arm), (locked), (displaced), (slot), (txn))
+#else
+# define FT_IRH_PROBE(ft, arm, locked, displaced, slot)	do { } while (0)
+#endif
+
 static
 int _cds_ft_insert_replace(struct cds_ft *ft,
 		const uint8_t *_key, size_t _key_len,
@@ -4980,6 +5074,7 @@ restart_replace_attempt:
 						 * very bail.  The retry re-descends against an
 						 * untouched structure.
 						 */
+						FT_IRH_PROBE(ft, 0, d.nf, displaced, NULL);
 						if (!ft_hlist_chain_plan_ok(ft,
 								ft_flip_txn_handle(txn),
 								displaced, nr_disp)) {
@@ -5158,6 +5253,7 @@ restart_replace_attempt:
 						 * very bail.  The retry re-descends against an
 						 * untouched structure.
 						 */
+						FT_IRH_PROBE(ft, 1, d.nf, displaced, NULL);
 						if (!ft_hlist_chain_plan_ok(ft,
 								ft_flip_txn_handle(txn),
 								displaced, nr_disp)) {
@@ -5421,6 +5517,7 @@ restart_replace_attempt:
 						 * very bail.  The retry re-descends against an
 						 * untouched structure.
 						 */
+						FT_IRH_PROBE(ft, 2, d.pnf, displaced, d.nfp);
 						if (!ft_hlist_chain_plan_ok(ft,
 								ft_flip_txn_handle(txn),
 								displaced, nr_disp)) {
@@ -5610,6 +5707,7 @@ restart_replace_attempt:
 						 * very bail.  The retry re-descends against an
 						 * untouched structure.
 						 */
+						FT_IRH_PROBE(ft, 3, d.pnf, displaced, d.nfp);
 						if (!ft_hlist_chain_plan_ok(ft,
 								ft_flip_txn_handle(txn),
 								displaced, nr_disp)) {
@@ -5637,9 +5735,15 @@ restart_replace_attempt:
 							ret = -EAGAIN;
 							goto insert_replace_done;
 						}
+#if FT_DT_ARMED
+						ft_sws_doomed = txn->acquire_miss;
+#endif
 						ft_hlist_freeze_chain_prepare_checked(ft,
 							ft_flip_txn_handle(txn),
 							displaced, nr_disp);
+#if FT_DT_ARMED
+						ft_sws_doomed = 0;
+#endif
 					}
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 					FT_IR_SEDGE_LANE_ASK(ft, txn, &actx, d.pnf,
