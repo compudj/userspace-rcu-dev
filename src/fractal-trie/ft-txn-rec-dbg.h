@@ -5,6 +5,8 @@
 #ifndef _FT_TXN_REC_DBG_H
 #define _FT_TXN_REC_DBG_H
 
+#include "ft-dt-arm.h"		/* FT_DT_ARMED, shared with the allocator's TU */
+
 /*
  * ft-txn-rec-dbg: WHICH RECORD LOST, when a commit aborts.
  *
@@ -302,7 +304,28 @@ static void ft_hf_pc_note(const struct urcu_txn_record *r, const void *pc);
 	ft_hf_pc_note((r), NULL)
 #endif
 
-#if defined(FT_DEBUG_SLOT_HIST) && !defined(URCU_TXN_REC_WROTE)
+/*
+ * ☠ THE ENGINE OFFERS ONE STORE HOOK AND TWO INSTRUMENTS WANT IT.
+ *
+ * Both of the blocks below used to claim URCU_TXN_REC_WROTE behind a
+ * `!defined(URCU_TXN_REC_WROTE)` guard, so whichever was parsed first won and
+ * the other went SILENTLY blind -- harmless only while both were opt-in and
+ * nobody passed them together.  FT_DT_ARMED now follows --enable-rcu-debug, so
+ * that collision would be the DEFAULT on every debug build carrying
+ * -DFT_DEBUG_SLOT_HIST, and a slot history that quietly records nothing is a
+ * wrong zero waiting to be believed.  They CHAIN instead.
+ */
+#if FT_DT_ARMED
+/*
+ * The engine writes state words too -- its settles are how a recorded release
+ * actually clears FT_STATE_LOCK -- and a detector keyed on the BIT has to see
+ * them.  Defined in ft-mutation-helpers.h, where the record type is complete.
+ */
+struct urcu_txn_record;
+static void ft_dt_wrote(const struct urcu_txn_record *r, void *v);
+#endif
+
+#ifdef FT_DEBUG_SLOT_HIST
 /*
  * -DFT_DEBUG_SLOT_HIST: a per-SLOT history of every engine store -- plant,
  * park, settle, abort restore, lone edge -- replayed by a writer that stalls,
@@ -313,8 +336,21 @@ static void ft_hf_pc_note(const struct urcu_txn_record *r, const void *pc);
 struct urcu_txn_record;
 static void ft_sh_note(const struct urcu_txn_record *r, void *v);
 static void ft_sh_clobber(const struct urcu_txn_record *r, void *prev);
-# define URCU_TXN_REC_WROTE(r, v)	ft_sh_note((r), (void *) (v))
 # define URCU_TXN_PARK_CLOBBER_NOTE(r, prev)	ft_sh_clobber((r), (prev))
+#endif
+
+#ifndef URCU_TXN_REC_WROTE
+# if FT_DT_ARMED && defined(FT_DEBUG_SLOT_HIST)
+#  define URCU_TXN_REC_WROTE(r, v)					\
+	do {								\
+		ft_dt_wrote((r), (void *) (v));				\
+		ft_sh_note((r), (void *) (v));				\
+	} while (0)
+# elif FT_DT_ARMED
+#  define URCU_TXN_REC_WROTE(r, v)	ft_dt_wrote((r), (void *) (v))
+# elif defined(FT_DEBUG_SLOT_HIST)
+#  define URCU_TXN_REC_WROTE(r, v)	ft_sh_note((r), (void *) (v))
+# endif
 #endif
 
 #endif /* _FT_TXN_REC_DBG_H */

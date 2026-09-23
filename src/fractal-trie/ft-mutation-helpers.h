@@ -1,6 +1,9 @@
 #ifdef FT_DEBUG_DEL_TOMB
 #include <execinfo.h>
 #endif
+/* The bad-release report resolves its caller to a file offset (PIE). */
+#include <dlfcn.h>
+#include <execinfo.h>	/* the double-take report unwinds the taker */
 // SPDX-FileCopyrightText: 2012-2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 //
 // SPDX-License-Identifier: LGPL-2.1-only
@@ -1437,6 +1440,308 @@ extern unsigned long ft_acq_heap_taken;
 # define FT_ACQ_EMBED_LOCKS	FT_FLIP_TXN_MAX_LOCKS
 #endif
 
+/*
+ * ☞ THE KINDS ARE UNCONDITIONAL, so the LOW-OVERHEAD mode can use them: with
+ * -DFT_ENABLE_TRACING and no -DFT_DEBUG_LOCK_LEAK, FT_LL_LOG emits ONLY the
+ * LTTng tracepoint -- a per-CPU lock-free buffer write -- and keeps the hashed
+ * in-process ring, with its SHARED ATOMIC head and its clock_gettime per
+ * event, out of the way.  That ring is a 4096-slot hash over every lock word in
+ * the trie, so unrelated nodes collide on one counter; it costs only ~1.6% of
+ * wall clock on ft_inv (106.4 s -> 108.1 s), but its serialization points are
+ * exactly what a rare interleaving notices.
+ */
+static inline unsigned int ft_ll_violation_tid(void)
+{
+	static __thread unsigned int t;
+
+	if (caa_unlikely(!t))
+		t = (unsigned int) syscall(SYS_gettid);
+	return t;
+}
+
+enum ft_ll_kind {
+	FT_LL_TAKE	= 1,	/* CAS clean -> LOCK won; a = state before */
+	FT_LL_CLEAR	= 2,	/* ft_meta_lock_release; a = state before */
+	FT_LL_CLEAR_IF	= 3,	/* release_if_held cleared; a = state before */
+	FT_LL_SKIP_IF	= 4,	/* release_if_held found no LOCK; a = state */
+	FT_LL_REG	= 5,	/* registered into @txn; a = snap */
+	FT_LL_REC_SW	= 6,	/* record on the word into @txn, SW; a = old, b = new */
+	FT_LL_REC_MW	= 7,	/* record on the word into @txn, MW; a = old, b = new */
+	FT_LL_COMMIT	= 8,	/* @txn committed; a = status, b = state now */
+	FT_LL_DESTROY	= 9,	/* @txn destroyed uncommitted; b = state now */
+	FT_LL_REFUSED	= 10,	/* first refusal of a streak; a = state */
+	/*
+	 * ☠ THE RING IS KEYED BY ADDRESS, so a freed and RECYCLED item makes one
+	 * history out of TWO logical nodes and every replay across the boundary
+	 * is ambiguous -- measured the hard way: a captured lock_release history
+	 * read as "this op born-locked the word and then released it" was in
+	 * fact two incarnations, and the attribution was wrong.  These two mark
+	 * the boundary so a replay can be read at all.
+	 */
+	FT_LL_REUSE	= 11,	/* the item was handed out by the allocator */
+	FT_LL_FREED	= 12,	/* ...and returned to it */
+	/*
+	 * ☞ THE ONE WRITER THE FT-LEVEL EVENTS CANNOT SHOW.  A settle that
+	 * writes a LOCK-masked value clears the bit without any take/release of
+	 * its own, so a captured history shows a word losing its owner with no
+	 * event to explain it -- measured: A takes, and 471 ns later B takes
+	 * the same word with no clear in between.  @a carries the descriptor.
+	 */
+	FT_LL_ENGINE_CLEAR = 13,
+};
+
+#if FT_DT_ARMED
+/*
+ * ☞ THE DEFECT IS A BIT CLEARED BY A NON-OWNER.
+ *
+ * Two earlier shapes failed, and both failures are the point:
+ *  - tracking release INTENT means enumerating every way an op gives up a word,
+ *    and this codebase has at least five (plain release, the registrar, the
+ *    SKIP_IF path, the item being freed, and the cell lock-set which hands over
+ *    BY RECORD and never registers).  Each one missed = phantom reports.
+ *  - watching who SETS the bit cannot work at all: a take only succeeds when
+ *    the bit was already clear, so "another thread owns it" can only mean the
+ *    table is STALE.  Measured 644-12,644 phantoms per run, which is the
+ *    design telling you it asks an unanswerable question.
+ *
+ * What the captures actually show is the answerable one: thread X clears a bit
+ * that thread Y owns, and Y asserts later when it finds the bit gone.  So:
+ * remember the owner when a take sets the bit, and report when a PLAIN release
+ * clears a bit owned by someone else.  Engine settles only CLEAR the entry and
+ * never report -- a peer may drive another op's settle (helping), so the
+ * writing thread there is not evidence of anything.
+ *
+ * ☞ WHY THIS LIVES IN THE PRIMITIVE AND NOT AT THE CALL SITES.  All ~55 callers
+ * of ft_meta_lock_release / _if_held already pass a pointer out of the op's own
+ * bookkeeping -- held[i].lock, taken[], a *_holder field, t->locks[i].meta; not
+ * one loads a bare word first.  The ownership evidence exists at every call and
+ * the SIGNATURE throws it away: the primitives take the word's address and
+ * nothing else, so they must re-derive "do I hold this?" from the shared state
+ * word, which cannot separate (1) I still hold it, from (2) my own commit
+ * already consumed my LOCK through a LOCK-masked edge -- the strict release
+ * then asserts and _if_held silently skips -- from (3) a PEER holds it and I am
+ * about to steal it.  Auditing the call sites therefore finds nothing; the
+ * witness has to sit where the bit is cleared.
+ */
+#define FT_DT_SLOTS	16384
+static struct ft_dt_ent {
+	const void *word;
+	const void *pc;		/* who took the bit */
+	unsigned int tid;	/* ...and owns it; 0 once it is gone */
+	/*
+	 * THE PREVIOUS CLEARER, kept so a report can answer the question the
+	 * report itself raises: A's unwind clears a bit owned by B, which means
+	 * A's OWN bit had already been taken away -- by whom, and through which
+	 * kind of write?  Without this the next step is another guess.
+	 */
+	const void *cpc;
+	unsigned int ctid;
+	int cengine;		/* 1 = an engine settle, 0 = a plain release */
+} ft_dt_tab[FT_DT_SLOTS];
+/*
+ * ☞ AN ARM YIELD, not just a violation count.  "0 stolen locks" is a claim
+ * about the CODE only if the detector was reached and saw ordinary traffic; the
+ * same zero is what an unreached, mis-gated or collision-thrashed table prints.
+ * These four separate the cases at no extra thought at read time:
+ *   @ft_dt_sets	takes recorded			-- 0 => never armed / never ran
+ *   @ft_dt_matched	clears by the recorded owner	-- 0 => armed but BLIND
+ *   @ft_dt_unowned	clears of a word whose owner had already gone: the op's
+ *			own commit consumed its LOCK through a LOCK-masked edge,
+ *			or the item was freed.  This is the STRICT release's
+ *			assert seen from the other side, so it is a population
+ *			to watch and not a fault by itself.
+ *   @ft_dt_double	THE DEFECT: cleared by a thread that did not take it.
+ */
+static unsigned long ft_dt_sets, ft_dt_double, ft_dt_matched, ft_dt_unowned;
+
+static inline struct ft_dt_ent *ft_dt_slot(const void *w)
+{
+	return &ft_dt_tab[(((uintptr_t) w) >> 6) & (FT_DT_SLOTS - 1)];
+}
+
+/*
+ * @newval is the value now in the word.  @pc names the setter for the report;
+ * it is ignored when the bit is being cleared.
+ */
+/* A take: this thread now owns the bit. */
+static inline void ft_dt_note_take(const void *w, const void *pc)
+{
+	struct ft_dt_ent *e = ft_dt_slot(w);
+
+	uatomic_inc(&ft_dt_sets);
+	uatomic_set(&e->word, w);
+	uatomic_set(&e->pc, pc);
+	uatomic_set(&e->tid, ft_ll_violation_tid());
+}
+
+/*
+ * ☠ RESOLVE EACH PC AGAINST ITS OWN OBJECT.  Every offset in the report used to
+ * be taken against the FT library's base, so a PC from any other object -- the
+ * test binary, liburcu -- printed as a wild 0xffff... difference that looks
+ * like a corrupt record rather than a resolvable frame.  Ask dladdr about the
+ * PC itself and name the object it landed in.
+ */
+static inline const char *ft_dt_pc_str(const void *pc, char *buf, size_t len)
+{
+	Dl_info di;
+	const char *obj;
+
+	if (!dladdr((void *) (uintptr_t) pc, &di) || !di.dli_fbase) {
+		snprintf(buf, len, "%p", pc);
+		return buf;
+	}
+	obj = di.dli_fname ? strrchr(di.dli_fname, '/') : NULL;
+	obj = obj ? obj + 1 : (di.dli_fname ? di.dli_fname : "?");
+	snprintf(buf, len, "%s+0x%lx", obj,
+		(unsigned long) ((const char *) pc - (const char *) di.dli_fbase));
+	return buf;
+}
+
+/* A plain release: whoever clears it should be the owner. */
+static inline void ft_dt_note_clear(const void *w, const void *pc, bool report,
+		int engine)
+{
+	struct ft_dt_ent *e = ft_dt_slot(w);
+	unsigned int self = ft_ll_violation_tid();
+	unsigned int owner;
+	const void *opc;
+
+	if (uatomic_read(&e->word) != w)
+		return;				/* never seen, or a collision */
+	owner = uatomic_read(&e->tid);
+	opc = uatomic_read(&e->pc);
+	if (report) {
+		if (!owner)
+			uatomic_inc(&ft_dt_unowned);
+		else if (owner == self)
+			uatomic_inc(&ft_dt_matched);
+	}
+	if (report && owner && owner != self &&
+			uatomic_read(&e->word) == w &&
+			uatomic_add_return(&ft_dt_double, 1) <= 8) {
+		char cbuf[160], obuf[160], pbuf[160];
+		int cengine = uatomic_read(&e->cengine);
+		const void *cpc = uatomic_read(&e->cpc);
+		void *bt[16];
+		int nbt = backtrace(bt, 16);
+
+		if (cengine)
+			snprintf(pbuf, sizeof(pbuf), "desc %p", cpc);
+		else
+			ft_dt_pc_str(cpc, pbuf, sizeof(pbuf));
+
+		/*
+		 * THE EVENT FIRST, THEN THE CAPTURE.  ft_trace_capture freezes
+		 * emission in-process before paying for `lttng stop` +
+		 * `snapshot record`, so anything emitted after it is dropped by
+		 * its own flag (fractal-trie-trace.h states the order).  The
+		 * snapshot then ends with this event and carries the word's
+		 * whole lock_ev history behind it -- which is the half a
+		 * one-owner table cannot show: WHEN the clearer's own claim
+		 * lapsed.
+		 */
+		FT_TP(lock_stolen, w, self, pc, owner, opc);
+		ft_trace_capture();
+		fprintf(stderr, "FT STOLEN LOCK: word %p cleared by tid %u from %s, but the bit was taken by tid %u from %s; BEFORE that the bit was cleared by tid %u from %s (%s) -- clearer's path:\n",
+			w, self, ft_dt_pc_str(pc, cbuf, sizeof(cbuf)),
+			owner, ft_dt_pc_str(opc, obuf, sizeof(obuf)),
+			uatomic_read(&e->ctid), pbuf,
+			cengine ? "ENGINE settle" : "plain release");
+		backtrace_symbols_fd(bt, nbt, 2);
+	}
+	uatomic_set(&e->cpc, pc);
+	uatomic_set(&e->ctid, self);
+	uatomic_set(&e->cengine, engine);
+	uatomic_set(&e->tid, 0);
+}
+
+/* The engine's half: every store it makes, including the settles. */
+static inline void ft_dt_wrote(const struct urcu_txn_record *r, void *v)
+{
+	const struct cds_ft_metadata *m;
+
+	if (r->proxy_tag != FT_STATE_PROXY)
+		return;				/* not a state word */
+	if (urcu_txn_is_proxy(v, r->proxy_tag))
+		return;				/* a parked proxy says nothing yet */
+	/*
+	 * ☠ THE ENGINE CAN ONLY END OWNERSHIP, NEVER ESTABLISH IT.  A settle
+	 * that writes LOCK|s back is an ABORT-RESTORE on behalf of the original
+	 * owner -- and in this engine a PEER may drive that settle (helping),
+	 * so the writing thread is routinely not the owner.  Treating such a
+	 * write as a take reported 644-12,644 phantom double takes per run.
+	 * Only the FT's own acquire CASes and the born store take a word; the
+	 * engine's contribution is the CLEARING half, which an intent-based
+	 * detector could never see.
+	 */
+	if ((uintptr_t) v & FT_STATE_LOCK)
+		return;
+	m = (const struct cds_ft_metadata *) ((const char *) (const void *)
+		r->slot - offsetof(struct cds_ft_metadata, state));
+	/*
+	 * Only when it actually takes a bit away from someone: this is the
+	 * event that explains an owner vanishing, and emitting it for every
+	 * state settle would drown the ring it is meant to make readable.
+	 */
+	if (uatomic_read(&ft_dt_slot(m)->word) == m &&
+			uatomic_read(&ft_dt_slot(m)->tid))
+		FT_TP(lock_ev, 0, (int) FT_LL_ENGINE_CLEAR, (const void *) m,
+			(unsigned long) (uintptr_t) r->desc,
+			(unsigned long) (uintptr_t) v, (const void *) r->desc,
+			(const void *) r->slot, ft_ll_violation_tid(),
+			(uint64_t) 0);
+	ft_dt_note_clear(m, (const void *) r->desc, /*report=*/ false,
+		/*engine=*/ 1);
+}
+
+void ft_dt_note_freed(const struct cds_ft_metadata *m)
+{
+	struct ft_dt_ent *e = ft_dt_slot(m);
+
+	if (uatomic_read(&e->word) == m)
+		uatomic_set(&e->tid, 0);
+}
+
+static __attribute__((destructor)) void ft_dt_report(void)
+{
+	if (!uatomic_read(&ft_dt_sets))
+		return;
+	fprintf(stderr, "FT STOLEN LOCK: %lu takes, %lu released by their owner, %lu released with the owner already gone, %lu STOLEN (cleared by a thread that did not take them)\n",
+		uatomic_read(&ft_dt_sets), uatomic_read(&ft_dt_matched),
+		uatomic_read(&ft_dt_unowned), uatomic_read(&ft_dt_double));
+}
+# define FT_DT_TAKE(w)		ft_dt_note_take((w), __builtin_return_address(0))
+# define FT_DT_CLEAR(w)		ft_dt_note_clear((w),			\
+					__builtin_return_address(0), true, 0)
+#else
+# define FT_DT_TAKE(w)		do { } while (0)
+# define FT_DT_CLEAR(w)		do { } while (0)
+#endif
+
+
+#if !defined(FT_DEBUG_LOCK_LEAK) && defined(FT_ENABLE_TRACING)
+/*
+ * Trace-only incarnation marks: the ring is absent, so these emit the same
+ * FT_LL_REUSE / FT_LL_FREED kinds straight into the tracepoint stream.
+ */
+void ft_ll_mark_reuse(const struct cds_ft_metadata *m)
+{
+	FT_TP(lock_ev, 0, (int) FT_LL_REUSE, (const void *) m,
+		0UL, 0UL, (const void *) NULL,
+		(const void *) __builtin_return_address(0),
+		ft_ll_violation_tid(), (uint64_t) 0);
+}
+
+void ft_ll_mark_freed(const struct cds_ft_metadata *m)
+{
+	FT_TP(lock_ev, 0, (int) FT_LL_FREED, (const void *) m,
+		0UL, 0UL, (const void *) NULL,
+		(const void *) __builtin_return_address(0),
+		ft_ll_violation_tid(), (uint64_t) 0);
+}
+#endif
+
+
 #ifdef FT_DEBUG_SLOT_HIST
 /*
  * -DFT_DEBUG_SLOT_HIST (see ft-txn-rec-dbg.h): every engine store, filed in a
@@ -1692,28 +1997,6 @@ void ft_sh_stall_dump(struct cds_ft *ft, const char *who)
 # include <time.h>
 # include <dlfcn.h>
 
-enum ft_ll_kind {
-	FT_LL_TAKE	= 1,	/* CAS clean -> LOCK won; a = state before */
-	FT_LL_CLEAR	= 2,	/* ft_meta_lock_release; a = state before */
-	FT_LL_CLEAR_IF	= 3,	/* release_if_held cleared; a = state before */
-	FT_LL_SKIP_IF	= 4,	/* release_if_held found no LOCK; a = state */
-	FT_LL_REG	= 5,	/* registered into @txn; a = snap */
-	FT_LL_REC_SW	= 6,	/* record on the word into @txn, SW; a = old, b = new */
-	FT_LL_REC_MW	= 7,	/* record on the word into @txn, MW; a = old, b = new */
-	FT_LL_COMMIT	= 8,	/* @txn committed; a = status, b = state now */
-	FT_LL_DESTROY	= 9,	/* @txn destroyed uncommitted; b = state now */
-	FT_LL_REFUSED	= 10,	/* first refusal of a streak; a = state */
-	/*
-	 * ☠ THE RING IS KEYED BY ADDRESS, so a freed and RECYCLED item makes one
-	 * history out of TWO logical nodes and every replay across the boundary
-	 * is ambiguous -- measured the hard way: a captured lock_release history
-	 * read as "this op born-locked the word and then released it" was in
-	 * fact two incarnations, and the attribution was wrong.  These two mark
-	 * the boundary so a replay can be read at all.
-	 */
-	FT_LL_REUSE	= 11,	/* the item was handed out by the allocator */
-	FT_LL_FREED	= 12,	/* ...and returned to it */
-};
 
 struct ft_ll_ev {
 	const struct cds_ft_metadata *lock;
@@ -1990,7 +2273,30 @@ static __attribute__((destructor)) void ft_ll_marks_report(void)
  */
 # define FT_LL_INLINE	__attribute__((noinline, unused))
 #else
-# define FT_LL_LOG(k, lock, txn, a, b)	do { } while (0)
+# ifdef FT_ENABLE_TRACING
+/*
+ * LOW-OVERHEAD MODE: the tracepoint WITHOUT the ring.  Same events, per-CPU
+ * lock-free buffers, no shared atomic and no clock_gettime -- LTTng stamps the
+ * event itself, so @ts_ns is left 0 here.  This is the shape CLAUDE.md asks for
+ * on a concurrency wall: flight-recorder mode, small per-cpu buffers, a
+ * violation event from the culprit, and a snapshot taken at the abort.
+ */
+static __thread unsigned int ft_ll_trace_tid;
+static inline unsigned int ft_ll_trace_self(void)
+{
+	if (caa_unlikely(!ft_ll_trace_tid))
+		ft_ll_trace_tid = (unsigned int) syscall(SYS_gettid);
+	return ft_ll_trace_tid;
+}
+#  define FT_LL_LOG(k, lock, txn, a, b)					\
+	FT_TP(lock_ev, 0, (int) (k), (const void *) (lock),		\
+		(unsigned long) (uintptr_t) (a),			\
+		(unsigned long) (uintptr_t) (b), (const void *) (txn),	\
+		(const void *) __builtin_return_address(0),		\
+		ft_ll_trace_self(), (uint64_t) 0)
+# else
+#  define FT_LL_LOG(k, lock, txn, a, b)	do { } while (0)
+# endif
 # define FT_LL_REFUSED(lock, s)		do { } while (0)
 # define FT_LL_INLINE	inline
 #endif
@@ -5631,6 +5937,7 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 #ifdef FT_DEBUG_BORN_RELEASE
 	ft_born_forget(meta);
 #endif
+	FT_DT_TAKE(meta);
 	FT_LL_LOG(FT_LL_TAKE, meta, NULL, s, 0);
 	/* Hold longer, so a peer's already-sampled record settles inside it. */
 	ft_delay_seam(FT_DELAY_SITE_HELD);
@@ -5699,6 +6006,18 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 #endif
 		if (caa_unlikely(!(s & FT_STATE_LOCK))) {
 			/*
+			 * THE VIOLATION EVENT FIRST, THEN THE CAPTURE.  It must
+			 * be the LAST event in the ring, not the first one its
+			 * own freeze drops (fractal-trie-trace.h's order rule),
+			 * and ft_trace_capture freezes in-process before paying
+			 * for `lttng stop` + `snapshot record`.
+			 */
+			FT_TP(lock_release_violation, (const void *) meta,
+				(unsigned long) s,
+				(const void *) __builtin_return_address(0),
+				(unsigned int) ft_ll_violation_tid());
+			ft_trace_capture();
+			/*
 			 * WHO IS RELEASING IT?  The replay below names every
 			 * writer of the word; the one thing it cannot name is
 			 * the caller standing here, and that is the half that
@@ -5706,9 +6025,24 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 			 * already consumed.  One address, printed before the
 			 * assert takes the process down.
 			 */
-			fprintf(stderr, "FT BAD RELEASE: word %p state %#lx, released from +%p\n",
-				(void *) meta, (unsigned long) s,
-				__builtin_return_address(0));
+			{
+				Dl_info di__;
+				const void *ra__ = __builtin_return_address(0);
+
+				/*
+				 * A FILE OFFSET, not a raw pointer: the library
+				 * is PIE and the process is gone by the time
+				 * anyone reads this, so an absolute address
+				 * cannot be resolved afterwards.
+				 */
+				fprintf(stderr, "FT BAD RELEASE: word %p state %#lx, released from +0x%lx\n",
+					(void *) meta, (unsigned long) s,
+					dladdr((void *) ra__, &di__) &&
+						di__.dli_fbase ?
+					(unsigned long) ((const char *) ra__ -
+						(const char *) di__.dli_fbase) :
+					(unsigned long) (uintptr_t) ra__);
+			}
 			ft_hold_trace_bad_release(meta, s);
 			/*
 			 * A PROBE THAT RECORDS BEATS A GUARD THAT REFUSES: the
@@ -5733,6 +6067,7 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 		assert(s & FT_STATE_LOCK);
 		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
 				s & ~FT_STATE_LOCK) == s)) {
+			FT_DT_CLEAR(meta);
 			FT_LL_LOG(FT_LL_CLEAR, meta, NULL, s, 0);
 			return;
 		}
@@ -5773,6 +6108,7 @@ void ft_meta_lock_release_if_held(struct cds_ft_metadata *meta)
 		}
 		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
 				s & ~FT_STATE_LOCK) == s)) {
+			FT_DT_CLEAR(meta);
 			FT_LL_LOG(FT_LL_CLEAR_IF, meta, NULL, s, 0);
 			return;
 		}
@@ -10293,6 +10629,7 @@ int ft_dlm_lock_now(struct cds_ft_metadata *meta, uintptr_t *snap)
 #ifdef FT_DEBUG_BORN_RELEASE
 	ft_born_forget(meta);
 #endif
+	FT_DT_TAKE(meta);
 	FT_LL_LOG(FT_LL_TAKE, meta, NULL, s, 0);
 	ft_delay_seam(FT_DELAY_SITE_HELD);
 
@@ -14952,6 +15289,7 @@ void ft_flip_txn_lock_born(struct ft_flip_txn *t, struct cds_ft_metadata *meta)
 	return;
 #endif
 	CMM_STORE_SHARED(meta->state, s | FT_STATE_LOCK);
+	FT_DT_TAKE(meta);
 #ifdef FT_DEBUG_BORN_RELEASE
 	/*
 	 * ☞ THE DEFECT WITHOUT THE RACE.  A born lock's release is RECORDED and

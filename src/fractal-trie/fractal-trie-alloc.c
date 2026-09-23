@@ -1631,6 +1631,19 @@ struct cds_ft_metadata *cds_ft_alloc_cell_item(struct cds_ft *ft)
 static
 void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 {
+	/*
+	 * ☞ THE HOOK BELONGS AT THE CHOKEPOINT, NOT AT THE WRAPPERS.  It sat
+	 * on cds_ft_free_item / _unpublished / _deferred, which between them
+	 * miss TWO routes back to the arena: the arena drain's bulk reclaim and
+	 * -- the common one -- cds_ft_free_item_rcu, the call_rcu callback.  The
+	 * non-owner-clear table is keyed by ADDRESS, so a free it does not see
+	 * leaves a stale "held by tid T" against a chunk the allocator then
+	 * hands out again, and the next legitimate take of the NEW item reads as
+	 * a steal.  Every route ends here; this is the only place that cannot be
+	 * missed.
+	 */
+	FT_DT_NOTE_FREED(metadata);
+
 #ifdef FT_ENABLE_TRACING
 	/*
 	 * THE push itself, keyed on the ITEM pointer to match item_alloc /

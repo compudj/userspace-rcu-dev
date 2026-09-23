@@ -1475,6 +1475,51 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, remove_anchor_starved,
  * that reveal it have piled up.  @ts_ns is CLOCK_MONOTONIC at the transition,
  * the clock LTTng itself stamps with, so replayed and live events interleave.
  */
+/*
+ * THE VIOLATION EVENT for ft_meta_lock_release finding its word already
+ * unlocked.  Emitted BEFORE the capture freezes emission, so it is the LAST
+ * event in the ring rather than the first one its own flag drops
+ * (fractal-trie-trace.h states the order).  @pc is the releasing caller, which
+ * the lock_ev stream cannot name.
+ */
+/*
+ * A LOCK BIT CLEARED BY A THREAD THAT DID NOT TAKE IT -- the defect whose late
+ * symptom is lock_release_violation.  Emitted by the bit-keyed detector before
+ * it dumps the flight recorder, so the snapshot ends with this event and
+ * carries the word's whole lock_ev history behind it.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, lock_stolen,
+	LTTNG_UST_TP_ARGS(
+		const void *, lock,
+		unsigned int, thief_tid,
+		const void *, thief_pc,
+		unsigned int, owner_tid,
+		const void *, owner_pc
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, lock, (uintptr_t) lock)
+		lttng_ust_field_integer(unsigned int, thief_tid, thief_tid)
+		lttng_ust_field_integer_hex(uintptr_t, thief_pc, (uintptr_t) thief_pc)
+		lttng_ust_field_integer(unsigned int, owner_tid, owner_tid)
+		lttng_ust_field_integer_hex(uintptr_t, owner_pc, (uintptr_t) owner_pc)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, lock_release_violation,
+	LTTNG_UST_TP_ARGS(
+		const void *, lock,
+		unsigned long, state,
+		const void *, pc,
+		unsigned int, tid
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, lock, (uintptr_t) lock)
+		lttng_ust_field_integer_hex(unsigned long, state, state)
+		lttng_ust_field_integer_hex(uintptr_t, pc, (uintptr_t) pc)
+		lttng_ust_field_integer(unsigned int, tid, tid)
+	)
+)
+
 LTTNG_UST_TRACEPOINT_EVENT(cds_ft, lock_ev,
 	LTTNG_UST_TP_ARGS(
 		int, replay,

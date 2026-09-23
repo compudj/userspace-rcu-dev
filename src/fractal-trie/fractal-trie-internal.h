@@ -6,6 +6,14 @@
 #define _URCU_FT_INTERNAL_H
 
 /*
+ * For FT_DT_ARMED alone: fractal-trie-alloc.c includes ONLY this header, and
+ * the non-owner-clear detector's forget hook lives there.  Without a shared
+ * gate the allocator would compile that forget out of an armed build and every
+ * recycled address would read as a stolen lock.
+ */
+#include "ft-dt-arm.h"
+
+/*
  * src/fractal-trie-internal.h
  *
  * Userspace RCU library - Fractal Trie Internal Header
@@ -4018,6 +4026,24 @@ static unsigned long ft_ba_seams_in_bulk __attribute__((unused));
 # define FT_BA_GATE_NOTE()	do { } while (0)
 #endif
 /*
+ * ☠ THE NON-OWNER-CLEAR TABLE IS KEYED BY ADDRESS, so a freed and recycled item
+ * would leave a stale "held by tid T" entry and the next legitimate take of the
+ * new node would be reported as a steal.  Forget the word when its item goes
+ * back to the allocator.  Declared here because ft-helpers.h, where the frees
+ * live, precedes the table.
+ *
+ * FT_DT_ARMED comes from ft-txn-rec-dbg.h (included at the top of this file so
+ * the allocator's TU, which includes only this header, cannot see a different
+ * gate than the table does -- see the arm's own comment).
+ */
+#if FT_DT_ARMED
+void ft_dt_note_freed(const struct cds_ft_metadata *m);
+# define FT_DT_NOTE_FREED(m_)	ft_dt_note_freed(m_)
+#else
+# define FT_DT_NOTE_FREED(m_)	do { } while (0)
+#endif
+
+/*
  * INCARNATION MARKS FOR THE LOCK RING.  The ring is keyed by ADDRESS, so a
  * freed and recycled item makes ONE history out of TWO logical nodes; without a
  * boundary marker every replay across a reuse is ambiguous, and one such replay
@@ -4025,7 +4051,13 @@ static unsigned long ft_ba_seams_in_bulk __attribute__((unused));
  * ft-helpers.h -- where the FT's node alloc/free live -- is included long
  * before the ring itself; defined with it, non-static, the way ft_seam_check is.
  */
-#ifdef FT_DEBUG_LOCK_LEAK
+#if defined(FT_DEBUG_LOCK_LEAK) || defined(FT_ENABLE_TRACING)
+/*
+ * ☞ ALSO IN TRACE-ONLY MODE.  Gated on the RING alone, these marks vanished
+ * from exactly the build that needs them: the captured history of a word shows
+ * two threads taking it with no release between, and whether the bit vanished
+ * because the ITEM WAS RECYCLED is precisely what a reuse boundary answers.
+ */
 void ft_ll_mark_reuse(const struct cds_ft_metadata *m);
 void ft_ll_mark_freed(const struct cds_ft_metadata *m);
 # define FT_LL_MARK_REUSE(m_)	ft_ll_mark_reuse(m_)
