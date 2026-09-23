@@ -14979,6 +14979,21 @@ static void *gss_point_writer(void *arg)
 				uatomic_inc(&c->rm_miss);
 			else
 				uatomic_inc(&c->rm);
+			/*
+			 * ☠ DROP THE CACHED POSITION BEFORE THE LOCK.  @iter
+			 * outlives this critical section, and its position --
+			 * and, with an in-leaf key, a key that POINTS INTO the
+			 * result node -- is valid only while the lock is held
+			 * (fractal-trie.h).  The next iteration passes a
+			 * quiescent state, so a grace period can reclaim what
+			 * the position names.  Nothing is carried across the
+			 * gap here, so RESET rather than bind: bind_key
+			 * MATERIALIZES the key from the current position, and
+			 * after a remove (or a missed lookup) there is no
+			 * position to materialize -- it SEGVs in
+			 * ft_ord_cell_cursor, which is how this was found.
+			 */
+			cds_ft_iter_reset(iter);
 			rcu_read_unlock();
 		}
 		seq++;
@@ -15012,6 +15027,7 @@ static void gss_drain(struct cds_ft *ft)
 			abort();
 		cds_ft_for_each_duplicate_safe_rcu(node, p)
 			node_free_rcu(to_test_node(node));
+		cds_ft_iter_reset(iter);	/* see gss_point_writer */
 		rcu_read_unlock();
 		rcu_quiescent_state();
 	}
@@ -15025,8 +15041,14 @@ static int gss_check(struct cds_ft *ft, unsigned long round)
 	unsigned long fwd = 0, rev = 0, cnt;
 	int ret = 0;
 
-	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK)
-		abort();
+	/*
+	 * ☞ ONE ITERATOR PER SCOPE, not one across all three.  An iterator's
+	 * cached position is valid only while the read-side lock that produced
+	 * it is held (fractal-trie.h), and these scopes are separated by
+	 * quiescent states -- a grace period may reclaim what the position
+	 * names.  The walks share nothing, so each gets its own; the structure
+	 * check needs no iterator at all.
+	 */
 	rcu_read_lock();
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "inv_graft_swap_whole_seam_points: round %lu: "
@@ -15035,18 +15057,25 @@ static int gss_check(struct cds_ft *ft, unsigned long round)
 	}
 	rcu_read_unlock();
 	rcu_quiescent_state();
+
+	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
 	rcu_read_lock();
 	cds_ft_for_each_rcu(ft, iter)
 		fwd++;
 	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
 	rcu_quiescent_state();
+
+	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
 	rcu_read_lock();
 	cds_ft_for_each_reverse_rcu(ft, iter)
 		rev++;
 	cnt = cds_ft_count_keys(ft);
 	rcu_read_unlock();
-	rcu_quiescent_state();
 	cds_ft_iter_destroy(iter);
+	rcu_quiescent_state();
 	if (fwd != rev || fwd != cnt) {
 		fprintf(stderr, "inv_graft_swap_whole_seam_points: round %lu: "
 			"forward %lu, reverse %lu, count_keys %lu disagree\n",
