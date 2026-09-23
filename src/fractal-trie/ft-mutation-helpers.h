@@ -5905,7 +5905,18 @@ struct urcu_txn_record *ft_lock_terminal_pending(const struct ft_flip_txn *t,
 	if (!t || !t->mtxn || !lock)
 		return NULL;
 	d = t->mtxn->desc;
-	if (!d || urcu_txn_desc_status(d) != URCU_TXN_DESC_UNDECIDED)
+	/*
+	 * ☠ URCU_TXN_ENOMEM IS A SENTINEL, NOT A DESCRIPTOR: (void *) -1.  An
+	 * UNBOUNDED txn whose grow fails parks it in @desc and the FT record
+	 * helpers carry on STICKY, surfacing it at the commit as MEMORY_ERROR
+	 * -- so a detach can reach this sweep with it in place.  Dereferencing
+	 * it here (urcu_txn_desc_status loads through it) is a SIGSEGV with the
+	 * orphan LOCK bits still set, where the code this replaced released
+	 * them by CAS and returned a clean MEMORY_ERROR.  Every other raw
+	 * reader of @desc in this file guards the sentinel; this one did not.
+	 */
+	if (!d || d == URCU_TXN_ENOMEM ||
+			urcu_txn_desc_status(d) != URCU_TXN_DESC_UNDECIDED)
 		return NULL;
 	return urcu_txn_find(d, (void **) (void *)
 		&((struct cds_ft_metadata *) (uintptr_t) lock)->state);

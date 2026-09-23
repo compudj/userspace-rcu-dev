@@ -2578,6 +2578,18 @@ struct ft_detach_recompact_out {
 	struct cds_ft_inode_flag *orphan_trailing;
 };
 
+#ifdef FT_DEBUG_STACK_SILENCER
+static unsigned long ft_stack_silencer_hits, ft_stack_silencer_scans,
+	ft_stack_silencer_locks;
+static __attribute__((destructor)) void ft_stack_silencer_report(void)
+{
+	fprintf(stderr, "FT STACK SILENCER: %lu deferred returns scanned, %lu registered locks examined, %lu still pointing into a dead frame\n",
+		uatomic_read(&ft_stack_silencer_scans),
+		uatomic_read(&ft_stack_silencer_locks),
+		uatomic_read(&ft_stack_silencer_hits));
+}
+#endif
+
 static
 int ft_detach_node(struct cds_ft *ft,
 		const struct ft_lock_ctx *op_ctx,
@@ -6105,6 +6117,40 @@ end:
 	 * record_only @commit_txn IS the caller's SHARED txn -- never freed here
 	 * (the caller owns it and, on any bail, destroys it after re-descending).
 	 */
+#ifdef FT_DEBUG_STACK_SILENCER
+	/*
+	 * ☠ DOES A TXN THAT OUTLIVES THIS FRAME STILL POINT INTO IT?
+	 *
+	 * ft_flip_txn_lock_own links &h->shared as the terminal's silencer, and
+	 * @orphan_held is THIS frame's stack.  When the txn is the caller's
+	 * deferred one (@record_only), its terminal runs after this function has
+	 * returned and writes through that pointer -- the same dangling write
+	 * that SEGV'd the orphan sweep before @c5ab837d.  The bounds are known
+	 * exactly here, so this is a measurement, not a heuristic: no address
+	 * arithmetic guess, just "is the registered silencer inside the array I
+	 * am about to destroy".
+	 */
+	if (record_only && shared_txn) {
+		unsigned int li;
+
+		/* ARM: a zero above is only evidence if this ran at all. */
+		uatomic_inc(&ft_stack_silencer_scans);
+		uatomic_add(&ft_stack_silencer_locks, shared_txn->nr_locks);
+		for (li = 0; li < shared_txn->nr_locks; li++) {
+			const void *sil = (const void *)
+				shared_txn->locks[li].src_shared;
+
+			if (sil >= (const void *) &orphan_held[0] &&
+					sil < (const void *) &orphan_held[
+						FT_MAX_DEPTH + 1]) {
+				if (uatomic_add_return(&ft_stack_silencer_hits,
+						1) <= 4)
+					fprintf(stderr, "FT STACK SILENCER: txn %p lock slot %u points at %p, inside this frame's orphan_held[] -- it outlives the frame\n",
+						(void *) shared_txn, li, sil);
+			}
+		}
+	}
+#endif
 	if (commit_txn && !commit_txn_used && !record_only)
 		ft_flip_txn_destroy(commit_txn);
 	/*
