@@ -690,6 +690,22 @@ struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
  * @d may be NULL where no descent ran; that is legal ONLY under per-node
  * granularity, where no depth is needed, and is asserted as such.
  */
+#ifdef FT_DEBUG_CN_ANCHOR
+static unsigned long *ft_cna_n, *ft_cna_cn;
+
+static void ft_cn_anchor_register(unsigned long *n, unsigned long *cn)
+{
+	ft_cna_n = n;
+	ft_cna_cn = cn;
+}
+
+static __attribute__((destructor)) void ft_cn_anchor_report(void)
+{
+	fprintf(stderr, "FT CN ANCHOR: %lu of %lu table-anchored members anchored on a COMPRESSED ancestor\n",
+		ft_cna_cn ? *ft_cna_cn : 0UL, ft_cna_n ? *ft_cna_n : 0UL);
+}
+#endif
+
 static inline
 struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
 		const struct ft_descent *d, struct cds_ft_inode_flag *nf,
@@ -751,6 +767,24 @@ struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
 			rcu_dereference(ft->root)));
 	assert(d);
 	anchor = ft_descent_anchor_of(d, nf, depth);
+#ifdef FT_DEBUG_CN_ANCHOR
+	/*
+	 * ARM YIELD for the skip-anchor shape (Mathieu): a member whose
+	 * anchor is a COMPRESSED ANCESTOR -- a node downward traversal skips
+	 * when its parent's slot is skip-encoded.  Zero means the workload
+	 * never builds the shape, and then no green run speaks for it.
+	 */
+	{
+		static unsigned long cna_n, cna_cn;
+		static int cna_reg;
+
+		uatomic_inc(&cna_n);
+		if (anchor && anchor != nf && ft_node_compressed(anchor))
+			uatomic_inc(&cna_cn);
+		if (!uatomic_xchg(&cna_reg, 1))
+			ft_cn_anchor_register(&cna_n, &cna_cn);
+	}
+#endif
 	/*
 	 * @node, never a re-derivation, whenever the anchor IS the member: a
 	 * flag reconstructed from a node pointer and a type index is wrong for

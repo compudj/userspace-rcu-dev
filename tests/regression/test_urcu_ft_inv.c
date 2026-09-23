@@ -23876,7 +23876,28 @@ static unsigned long ski_dup_appends, ski_solo_appends;
  */
 static uint64_t ski_key(unsigned int k)
 {
-	static int b = -1;
+	static int b = -1, exp_shape = -1;
+
+	/*
+	 * FT_INV_SKI_KEYS=exp: the EXPONENTIAL skip-anchor shape.  Keys
+	 * [0,0,0,g, 0x11+g,0x22+g, i+1, 0] (g = k >> 2, i = k & 3) build
+	 *   GP (depth 3, branches on g) --skip--> M_g (depth 6, branches on i)
+	 * with the compressed run cn_g = [4,6) between them, skipped by GP's
+	 * slot.  M_g's lock level is 4 and cn_g STARTS at 4, so under
+	 * exponential spacing M_g anchors on cn_g -- a node the descent never
+	 * enters.  Removing i-keys collapses M_g into cn_g; inserting splits it.
+	 */
+	if (exp_shape < 0) {
+		const char *e = getenv("FT_INV_SKI_KEYS");
+
+		exp_shape = e && !strcmp(e, "exp");
+	}
+	if (exp_shape) {
+		uint64_t g = k >> 2, i = k & 3;
+
+		return (g << 32) | ((0x11 + g) << 24) | ((0x22 + g) << 16) |
+			((i + 1) << 8);
+	}
 
 	if (b < 0) {
 		const char *e = getenv("FT_INV_SKI_BYTE");
