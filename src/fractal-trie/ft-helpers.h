@@ -4550,6 +4550,8 @@ struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 	if (!metadata) {
 		return NULL;
 	}
+	/* A NEW INCARNATION of this address begins here (see FT_LL_REUSE). */
+	FT_LL_MARK_REUSE(metadata);
 	p = cds_ft_metadata_to_item(metadata);
 	FT_TP(item_alloc, (const void *) p, 0, ft_type->order);
 #ifdef FT_DEBUG_DEL_TOMB
@@ -4581,6 +4583,8 @@ static
 void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
 {
 	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
+
+	FT_LL_MARK_FREED(metadata);
 
 	FT_TP(item_free, (const void *) node, 0);
 	FT_TP(item_retire, (const void *) node, __builtin_return_address(0));

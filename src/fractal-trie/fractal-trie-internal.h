@@ -4017,6 +4017,24 @@ static unsigned long ft_ba_seams_in_bulk __attribute__((unused));
 #else
 # define FT_BA_GATE_NOTE()	do { } while (0)
 #endif
+/*
+ * INCARNATION MARKS FOR THE LOCK RING.  The ring is keyed by ADDRESS, so a
+ * freed and recycled item makes ONE history out of TWO logical nodes; without a
+ * boundary marker every replay across a reuse is ambiguous, and one such replay
+ * was misread as a single node's story (2026-09-23).  Declared here because
+ * ft-helpers.h -- where the FT's node alloc/free live -- is included long
+ * before the ring itself; defined with it, non-static, the way ft_seam_check is.
+ */
+#ifdef FT_DEBUG_LOCK_LEAK
+void ft_ll_mark_reuse(const struct cds_ft_metadata *m);
+void ft_ll_mark_freed(const struct cds_ft_metadata *m);
+# define FT_LL_MARK_REUSE(m_)	ft_ll_mark_reuse(m_)
+# define FT_LL_MARK_FREED(m_)	ft_ll_mark_freed(m_)
+#else
+# define FT_LL_MARK_REUSE(m_)	do { } while (0)
+# define FT_LL_MARK_FREED(m_)	do { } while (0)
+#endif
+
 #ifdef FT_DEBUG_SEAM
 /*
  * ☞ -DFT_DEBUG_SEAM: THE SEAM RULE, CHECKED WHERE IT IS RELIED ON.

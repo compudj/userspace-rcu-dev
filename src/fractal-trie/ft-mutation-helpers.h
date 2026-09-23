@@ -1703,6 +1703,16 @@ enum ft_ll_kind {
 	FT_LL_COMMIT	= 8,	/* @txn committed; a = status, b = state now */
 	FT_LL_DESTROY	= 9,	/* @txn destroyed uncommitted; b = state now */
 	FT_LL_REFUSED	= 10,	/* first refusal of a streak; a = state */
+	/*
+	 * ☠ THE RING IS KEYED BY ADDRESS, so a freed and RECYCLED item makes one
+	 * history out of TWO logical nodes and every replay across the boundary
+	 * is ambiguous -- measured the hard way: a captured lock_release history
+	 * read as "this op born-locked the word and then released it" was in
+	 * fact two incarnations, and the attribution was wrong.  These two mark
+	 * the boundary so a replay can be read at all.
+	 */
+	FT_LL_REUSE	= 11,	/* the item was handed out by the allocator */
+	FT_LL_FREED	= 12,	/* ...and returned to it */
 };
 
 struct ft_ll_ev {
@@ -1889,7 +1899,8 @@ void ft_ll_replay(const struct cds_ft_metadata *lock, const char *why)
 {
 	static const char *const kn[] = { "?", "TAKE", "CLEAR", "CLEAR_IF",
 		"SKIP_IF", "REG", "REC_SW", "REC_MW", "COMMIT", "DESTROY",
-		"REFUSED" };
+		"REFUSED", ">>> REUSE (a NEW incarnation starts here)",
+		"<<< FREED" };
 	struct ft_ll_slot *sl = ft_ll_slot_of(lock);
 	unsigned long h = uatomic_read(&sl->head);
 	unsigned long i = h > FT_LL_HIST ? h - FT_LL_HIST : 0;
@@ -1939,6 +1950,32 @@ uint32_t ft_ll_last_taker(const struct cds_ft_metadata *lock)
 			tid = 0;		/* released again */
 	}
 	return tid;
+}
+
+static unsigned long ft_ll_marks_reuse, ft_ll_marks_freed;
+
+void ft_ll_mark_reuse(const struct cds_ft_metadata *m)
+{
+	uatomic_inc(&ft_ll_marks_reuse);
+	ft_ll_log(FT_LL_REUSE, m, NULL, 0, 0, __builtin_return_address(0));
+}
+
+void ft_ll_mark_freed(const struct cds_ft_metadata *m)
+{
+	uatomic_inc(&ft_ll_marks_freed);
+	ft_ll_log(FT_LL_FREED, m, NULL, 0, 0, __builtin_return_address(0));
+}
+
+/* ARM: a replay showing no boundary must mean there was none, not that the
+ * marks were never logged. */
+static __attribute__((destructor)) void ft_ll_marks_report(void)
+{
+	if (!uatomic_read(&ft_ll_marks_reuse) &&
+			!uatomic_read(&ft_ll_marks_freed))
+		return;
+	fprintf(stderr, "FT LOCK HIST MARKS: %lu reuse, %lu freed\n",
+		uatomic_read(&ft_ll_marks_reuse),
+		uatomic_read(&ft_ll_marks_freed));
 }
 
 # define FT_LL_LOG(k, lock, txn, a, b)					\
@@ -5470,6 +5507,53 @@ static void ft_ch_audit_report(void)
 #endif	/* FT_DEBUG_CHAIN_HOLD */
 
 
+#ifdef FT_DEBUG_BORN_RELEASE
+#include <dlfcn.h>
+#define FT_BORN_RING	64
+static __thread const struct cds_ft_metadata *ft_born_ring[FT_BORN_RING];
+static __thread unsigned int ft_born_ring_n;
+static unsigned long ft_born_rel_hits, ft_born_notes;
+static inline void ft_born_note(const struct cds_ft_metadata *m)
+{
+	uatomic_inc(&ft_born_notes);
+	ft_born_ring[ft_born_ring_n++ % FT_BORN_RING] = m;
+}
+/*
+ * ☠ A LATER, LEGITIMATE TAKE CLEARS THE MARK.  Once the commit publishes the
+ * node, any op may acquire and release it normally -- indistinguishable from
+ * the born lock by the word's state alone.  Without this, the detector counted
+ * 30,895 "born releases" against 19,993 born locks: mostly ordinary later
+ * releases of a word that had once been born.  A take means the releaser holds
+ * it in its own right, so the question no longer applies.
+ */
+static inline void ft_born_forget(const struct cds_ft_metadata *m)
+{
+	unsigned int i, n = ft_born_ring_n < FT_BORN_RING ?
+		ft_born_ring_n : FT_BORN_RING;
+
+	for (i = 0; i < n; i++)
+		if (ft_born_ring[i] == m)
+			ft_born_ring[i] = NULL;
+}
+static inline bool ft_born_seen(const struct cds_ft_metadata *m)
+{
+	unsigned int i, n = ft_born_ring_n < FT_BORN_RING ?
+		ft_born_ring_n : FT_BORN_RING;
+
+	for (i = 0; i < n; i++)
+		if (m && ft_born_ring[i] == m)
+			return true;
+	return false;
+}
+static __attribute__((destructor)) void ft_born_rel_report(void)
+{
+	if (!uatomic_read(&ft_born_notes))
+		return;
+	fprintf(stderr, "FT BORN RELEASE: %lu born locks noted, %lu strictly released afterwards\n",
+		uatomic_read(&ft_born_notes), uatomic_read(&ft_born_rel_hits));
+}
+#endif
+
 /*
  * FT_STATE_LOCK, ACQUIRE side (MW F2, Option A --
  * fractal-trie-internal.h at the bit's definition, CORE_682870 fix plan).  A
@@ -5544,6 +5628,9 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 			s | FT_STATE_LOCK) != s))
 		return -EAGAIN;
 	*state_snapshot = s;
+#ifdef FT_DEBUG_BORN_RELEASE
+	ft_born_forget(meta);
+#endif
 	FT_LL_LOG(FT_LL_TAKE, meta, NULL, s, 0);
 	/* Hold longer, so a peer's already-sampled record settles inside it. */
 	ft_delay_seam(FT_DELAY_SITE_HELD);
@@ -5594,7 +5681,34 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 		if (!(s & FT_STATE_LOCK))
 			return;
 #endif
+#ifdef FT_DEBUG_BORN_RELEASE
+		if (caa_unlikely(ft_born_seen(meta))) {
+			if (uatomic_add_return(&ft_born_rel_hits, 1) <= 8) {
+				Dl_info di__;
+				const void *ra__ = __builtin_return_address(0);
+
+				fprintf(stderr, "FT BORN RELEASE: strict release of a BORN word %p (state %#lx) from +0x%lx\n",
+					(void *) meta, (unsigned long) s,
+					dladdr((void *) ra__, &di__) &&
+						di__.dli_fbase ?
+					(unsigned long) ((const char *) ra__ -
+						(const char *) di__.dli_fbase) :
+					(unsigned long) (uintptr_t) ra__);
+			}
+		}
+#endif
 		if (caa_unlikely(!(s & FT_STATE_LOCK))) {
+			/*
+			 * WHO IS RELEASING IT?  The replay below names every
+			 * writer of the word; the one thing it cannot name is
+			 * the caller standing here, and that is the half that
+			 * says WHICH path released a bit its own commit had
+			 * already consumed.  One address, printed before the
+			 * assert takes the process down.
+			 */
+			fprintf(stderr, "FT BAD RELEASE: word %p state %#lx, released from +%p\n",
+				(void *) meta, (unsigned long) s,
+				__builtin_return_address(0));
 			ft_hold_trace_bad_release(meta, s);
 			/*
 			 * A PROBE THAT RECORDS BEATS A GUARD THAT REFUSES: the
@@ -10176,6 +10290,9 @@ int ft_dlm_lock_now(struct cds_ft_metadata *meta, uintptr_t *snap)
 			s | FT_STATE_LOCK) != s))
 		return -EAGAIN;		/* a peer won it between load and CAS */
 	*snap = s;
+#ifdef FT_DEBUG_BORN_RELEASE
+	ft_born_forget(meta);
+#endif
 	FT_LL_LOG(FT_LL_TAKE, meta, NULL, s, 0);
 	ft_delay_seam(FT_DELAY_SITE_HELD);
 
@@ -14835,6 +14952,16 @@ void ft_flip_txn_lock_born(struct ft_flip_txn *t, struct cds_ft_metadata *meta)
 	return;
 #endif
 	CMM_STORE_SHARED(meta->state, s | FT_STATE_LOCK);
+#ifdef FT_DEBUG_BORN_RELEASE
+	/*
+	 * ☞ THE DEFECT WITHOUT THE RACE.  A born lock's release is RECORDED and
+	 * settled by the commit, so a STRICT ft_meta_lock_release of the same
+	 * word is wrong whether or not the settle got there first -- the assert
+	 * only fires when it did, which is why it is rare.  Remember the word
+	 * and say so at every such release, not just the losing ones.
+	 */
+	ft_born_note(meta);
+#endif
 	ft_flip_txn_lock_register(t, meta, s);
 	t->locks[t->nr_locks - 1].born = true;
 	ft_flip_txn_record_anchor_release_held(t, meta);
