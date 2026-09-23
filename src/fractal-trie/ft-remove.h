@@ -295,11 +295,28 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		if (freeze_leaf) {
 			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
 			/*
-			 * MEASURED, not argued: this site's plan is never stale
-			 * -- 0 of 65,434 / 93,152 / 64,149 per ft_inv leg at the
-			 * three spacings (plus ft_unit), with the observe arm
-			 * left in so a future workload says so too.
+			 * ★ VALIDATE THE PLAN UNDER THE LOCK -- see
+			 * ft_chain_compress_fused's twin.  @freeze_leaf's holder
+			 * is held: @cn itself when no climb happened, else an
+			 * orphan below it that ft_detach_node's orphan walk locked
+			 * and holds until its `end:` sweep.  @freeze_len was derived before the acquire, and
+			 * the chain parks SW: a duplicate appended in between
+			 * would be frozen over BLIND and lost.  The note that
+			 * stood here ("MEASURED ... never stale, 0 of 65,434")
+			 * was a fact about unpreempted load; the chain_compress
+			 * twin went stale 9 times in ~6M once the remover was
+			 * preempted.  Nothing recorded or stored yet on this
+			 * path; same unwind as the acquire's bail above.
 			 */
+			if (ft->lock_fine && !record_only &&
+					!ft_hlist_chain_plan_ok(ft,
+						ft_flip_txn_handle(txn),
+						freeze_leaf, freeze_len)) {
+				FT_HLIST_PLAN_BAIL();
+				FT_DBG_RETRY_SITE();
+				ft_flip_txn_destroy(txn);
+				return -EAGAIN;
+			}
 			FT_HLIST_PLAN_OBSERVE(ft, ft_flip_txn_handle(txn),
 				freeze_leaf, freeze_len, 1);
 			ft_hlist_freeze_chain_prepare_checked(ft,
@@ -703,6 +720,23 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 */
 		if (freeze_leaf) {
 			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
+			/*
+			 * ★ VALIDATE THE PLAN UNDER THE LOCK -- same reason,
+			 * same holder argument and same disposition as the
+			 * promote arm above.  Only the
+			 * unpublished @fresh exists; same unwind as the acquire's
+			 * bail above.
+			 */
+			if (ft->lock_fine && !record_only &&
+					!ft_hlist_chain_plan_ok(ft,
+						ft_flip_txn_handle(txn),
+						freeze_leaf, freeze_len)) {
+				FT_HLIST_PLAN_BAIL();
+				FT_DBG_RETRY_SITE();
+				free_cds_ft_node_unpublished(ft, fresh);
+				ft_flip_txn_destroy(txn);
+				return -EAGAIN;
+			}
 			FT_HLIST_PLAN_OBSERVE(ft, ft_flip_txn_handle(txn),
 				freeze_leaf, freeze_len, 2);
 			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
@@ -2215,6 +2249,51 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			ft_flip_txn_destroy(txn);
 		return -EAGAIN;
 	}
+	/*
+	 * ★ VALIDATE THE FREEZE'S PLAN UNDER THE LOCK -- the fused detach's
+	 * check (ft_detach_node), owed here since the chain parked SW.
+	 *
+	 * @freeze_len reached this collapse as cds_ft_remove's literal "1 =
+	 * this key's SOLE entry", derived from an UNHELD read of @succ_node.
+	 * A same-key insert can append a duplicate between that read and the
+	 * acquire above -- a remover preempted there is all it takes -- and
+	 * the freeze below would then record {NULL -> MARK(NULL)} over the
+	 * live @freeze_leaf->next.  Under MW the install CAS absorbed that
+	 * stale plan; under SW the record parks and stores BLIND, so the
+	 * appended node is dropped with the key, UNMARKED: a lost insert.
+	 * MEASURED under preemption (2 cpus, 2 competing spinners): 9 stale
+	 * plans here of ~5.9M, one per lost node, per-node and root-only;
+	 * 0 with -DNO_FEATURE_FT_CHAIN_SW.  The comment that stood at the
+	 * freeze, "MEASURED 0 of 279,029", was a fact about unpreempted load.
+	 *
+	 * @freeze_leaf's chain holder is HELD here, so the word can be asked:
+	 * on the prefix arms (cds_ft_remove, cds_ft_remove_all) the leaf heads
+	 * the boundary's external chain and the holder is the boundary itself
+	 * (@iter_held, acquired above); on ft_detach_node's shape-D call the
+	 * holder is an orphan below the boundary or the trailing skip target,
+	 * which ft_detach_node locked in its orphan walk and holds until its
+	 * `end:` sweep.  Refused BEFORE any record or store: only the
+	 * unpublished @new_cn exists, and this is the same unwind as the bail
+	 * just above.  Retriable, and it terminates: the caller re-derives,
+	 * sees the successor, and takes the promote / unchain lane.
+	 *
+	 * @record_only is excluded for the txn's ownership (a caller-owned txn
+	 * must not be destroyed here), not for exclusion: no record_only caller
+	 * passes a @freeze_leaf today (the rekey fold passes NULL).
+	 */
+	if (freeze_leaf && !record_only &&
+#ifdef FT_RED_NO_CCF_PLAN_CHECK
+			/* RED CONTROL: the pre-fix code, for the audit's positive. */
+			0 &&
+#endif
+			!ft_hlist_chain_plan_ok(ft, ft_flip_txn_handle(txn),
+				freeze_leaf, freeze_len)) {
+		FT_HLIST_PLAN_BAIL();
+		FT_DBG_RETRY_SITE();
+		free_compressed_node_unpublished(ft, new_cn);
+		ft_flip_txn_destroy(txn);
+		return -EAGAIN;
+	}
 
 	new_cn_flag = ft_compressed_node_flag(new_cn);
 	{
@@ -2421,9 +2500,44 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		if (freeze_leaf) {
 			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
-			/* MEASURED 0 of 279,029 / 263,218 / 230,360 per leg. */
+			/*
+			 * The plan was validated under the holder before the
+			 * publish (see the bail above @new_cn_flag), which is
+			 * what licenses the _checked form.  The observe stays,
+			 * so a stale plan past that check still gets counted.
+			 */
 			FT_HLIST_PLAN_OBSERVE(ft, ft_flip_txn_handle(txn),
 				freeze_leaf, freeze_len, 3);
+#ifdef FT_DEBUG_FREEZE_STALE_ABORT
+			/*
+			 * PROBE: the plan was checked under the lock above and
+			 * is stale NOW -- so a peer changed the chain while this
+			 * op holds what it believes is the holder.  Name the word
+			 * we hold and the chain word's raw value (a parked proxy
+			 * names the peer's descriptor), end the flight recorder
+			 * here, and die: the peer's lock take and chain store are
+			 * the last events on its cpu.
+			 */
+			if (!record_only &&
+					!ft_hlist_chain_plan_ok(ft,
+						ft_flip_txn_handle(txn),
+						freeze_leaf, freeze_len)) {
+				void *raw = CMM_LOAD_SHARED(freeze_leaf->next);
+
+				FT_TP(lock_stolen, (const void *) freeze_leaf,
+					0u, (const void *) raw, 0u,
+					(const void *) iter_held.lock);
+				fprintf(stderr, "FT FREEZE STALE AFTER CHECK: leaf %p next raw %p (%s) len %u; this op holds %p (boundary %p meta %p)\n",
+					(void *) freeze_leaf, raw,
+					urcu_txn_is_proxy(raw, FT_HLIST_TAG) ?
+						"PARKED PROXY" : "plain",
+					freeze_len, (void *) iter_held.lock,
+					(void *) iter_node_flag,
+					(void *) iter_meta);
+				ft_trace_capture();
+				abort();
+			}
+#endif
 			ft_hlist_freeze_chain_prepare_checked(ft,
 				ft_flip_txn_handle(txn),
 				freeze_leaf, freeze_len);
