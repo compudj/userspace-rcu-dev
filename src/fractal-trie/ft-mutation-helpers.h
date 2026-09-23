@@ -3368,6 +3368,96 @@ static void ft_flip_txn_call_rcu_now(struct rcu_head *head,
 	func(head);
 }
 
+#ifdef FT_DEBUG_SEAM
+/*
+ * THE RE-DESCENT'S PREMISE, AT THE SEAM THAT RELIES ON IT.
+ *
+ * A point op that meets a live bulk op re-derives BY KEY from the published
+ * root (@17f2e5c6), and every seam (ft_writer_lock_gp_wait) drops the FT-wide
+ * lock and admits exactly those point writers.  So at a seam the published root
+ * must be something a descent can start from.  ft_seam_check_list already
+ * covers the ordered list; this covers the other entry point.
+ *
+ * ☞ A PROBE THAT RECORDS, NOT A GUARD THAT REFUSES.  Which of these states are
+ * genuinely impossible is not obvious from the code -- a whole-trie detach
+ * stamps the leaving root BEFORE its flip, and a bulk op may legitimately
+ * re-home a root mid-op -- and a tripwire that aborts on a legal transient is
+ * worse than none (the torn-list rule cost two tries for exactly that).  So
+ * COUNT each shape, report at exit, and promote only what measures zero.
+ */
+static unsigned long ft_sr_calls, ft_sr_empty, ft_sr_proxy, ft_sr_null,
+	ft_sr_tomb, ft_sr_parent_node, ft_sr_foreign, ft_sr_external;
+/*
+ * TWO of the four shapes cannot be legal for a descent -- a root that resolves
+ * to NULL, and a RETIRED node published as one -- and both measured ZERO over
+ * ~2.4M seams (6 legs, all three spacings, strict and rcu-debug).  They stop
+ * the run under -DFT_SEAM_ROOT_STRICT rather than by default, because a zero in
+ * this suite is not a proof of impossibility and no positive control forces
+ * either state today: the torn-list rule already cost two tries for aborting on
+ * a transient nobody had characterised.  The other two -- a back edge naming a
+ * NODE, or ANOTHER TRIE -- stay counters on purpose: a whole-trie detach stamps
+ * the leaving root BEFORE its flip, so "illegal" is not yet established.
+ */
+#ifdef FT_SEAM_ROOT_STRICT
+# define FT_SEAM_ROOT_STOP(h_, site_, why_)				\
+	do {								\
+		fprintf(stderr, "FT SEAM ROOT: trie %p dropped its writer lock for a grace period and %s, at %p -- the point writers this seam admits re-descend from there\n", \
+			(void *) (h_), (why_), (site_));		\
+		fflush(stderr);						\
+		abort();						\
+	} while (0)
+#else
+# define FT_SEAM_ROOT_STOP(h_, site_, why_)	do { } while (0)
+#endif
+__attribute__((noinline))
+void ft_seam_check_root(struct cds_ft *h, const void *site)
+{
+	struct cds_ft_inode_flag *raw, *r, *pw;
+	struct cds_ft_metadata *m;
+
+	if (!h)
+		return;
+	uatomic_inc(&ft_sr_calls);
+	raw = rcu_dereference(h->root);
+	if (!raw) {
+		uatomic_inc(&ft_sr_empty);	/* empty trie: nothing to descend */
+		return;
+	}
+	r = ft_resolve_flip_proxy(raw);
+	if (r != raw)
+		uatomic_inc(&ft_sr_proxy);	/* a commit in flight over &ft->root */
+	if (!r) {
+		uatomic_inc(&ft_sr_null);
+		FT_SEAM_ROOT_STOP(h, site, "the published root resolves to NULL");
+		return;
+	}
+	if (ft_node_external(r)) {
+		uatomic_inc(&ft_sr_external);	/* a bare external head as root */
+		return;
+	}
+	m = ft_flag_to_metadata(h, r);
+	if (CMM_LOAD_SHARED(m->state) & FT_STATE_TOMBSTONE) {
+		uatomic_inc(&ft_sr_tomb);	/* a RETIRED node published as root */
+		FT_SEAM_ROOT_STOP(h, site, "a RETIRED node is published as the root");
+	}
+	pw = ft_resolve_flip_proxy(rcu_dereference(m->parent_word));
+	if (!ft_parent_is_root_position(pw))
+		uatomic_inc(&ft_sr_parent_node);	/* its back edge names a NODE */
+	else if (pw && ft_parent_trie(pw) != h)
+		uatomic_inc(&ft_sr_foreign);	/* ...or ANOTHER trie */
+}
+static __attribute__((destructor)) void ft_seam_root_report(void)
+{
+	if (!uatomic_read(&ft_sr_calls))
+		return;			/* per-TU static: never a wrong zero */
+	fprintf(stderr, "FT SEAM ROOT: %lu seams (empty %lu, external %lu, root-word proxy %lu) -- violations: resolves NULL %lu, TOMBSTONED %lu, back edge names a NODE %lu, names ANOTHER TRIE %lu\n",
+		uatomic_read(&ft_sr_calls), uatomic_read(&ft_sr_empty),
+		uatomic_read(&ft_sr_external), uatomic_read(&ft_sr_proxy),
+		uatomic_read(&ft_sr_null), uatomic_read(&ft_sr_tomb),
+		uatomic_read(&ft_sr_parent_node), uatomic_read(&ft_sr_foreign));
+}
+#endif
+
 #ifdef FEATURE_FT_HOLD_TRACE
 /*
  * TEST-ONLY LEDGER of the words this thread currently holds, with the SITE that

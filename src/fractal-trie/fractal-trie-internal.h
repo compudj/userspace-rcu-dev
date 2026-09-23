@@ -4033,6 +4033,14 @@ static unsigned long ft_ba_seams_in_bulk __attribute__((unused));
  * loads per end; the list cannot move under us (point writers of @h are held
  * off by the lock we still hold, the rest drained by the bulk gate).
  */
+/*
+ * ...AND THE ROOT THE POINT WRITERS THIS SEAM ADMITS WILL RE-DESCEND FROM.
+ * Defined with the FT helpers (ft-mutation-helpers.h) and forward-declared
+ * here the way ft_seam_check is: this header precedes ft_flag_to_metadata.
+ */
+/* NOT static: other units of the library reach this seam too. */
+void ft_seam_check_root(struct cds_ft *h, const void *site);
+
 static __attribute__((noinline, unused))
 void ft_seam_check_list(struct cds_ft *h, const void *site)
 {
@@ -4080,6 +4088,7 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 
 #ifdef FT_DEBUG_SEAM
 	ft_seam_check_list(held, __builtin_return_address(0));
+	ft_seam_check_root(held, __builtin_return_address(0));
 #endif
 	FT_BL_TALLY(ft_bl_seam_all);
 	if (ft_bulk_lock_held != NULL) {
