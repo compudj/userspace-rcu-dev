@@ -1559,6 +1559,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 {
 	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
+	/* Set from the step-4 commit; read by ft_glue_clear_fenced below. */
+	bool fenced_committed = false;
 	struct ft_merge_counts cnt = { 0, 0, 0, 0, 0 };
 	bool root_src = (src_key_len == 0);
 	bool ks_dst = (off_dst > 0);
@@ -2553,6 +2555,13 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		enum urcu_txn_status mst = ft_flip_txn_commit(dst_ft, txn);
 
 		/*
+		 * Carried out of this block for ft_glue_clear_fenced below: the
+		 * fenced retires' fate is the OP's own knowledge, and that
+		 * sweep must not re-derive it from the state words.
+		 */
+		fenced_committed = (mst == URCU_TXN_STATUS_OK);
+
+		/*
 		 * The flip did not happen, so no fenced retire took effect and this
 		 * op owns none of those frees -- renounce them before the step-7
 		 * reclaim.  The dominant reason a fenced terminal aborts is a PEER
@@ -2588,7 +2597,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    both, which is why no per-outcome bookkeeping is kept.  Before the
 	 *    step-7 reclaim, while the nodes are still addressable.
 	 */
-	ft_glue_clear_fenced(&gd);
+	ft_glue_clear_fenced(&gd, fenced_committed);
 
 	/*
 	 * 6. The dst net key-count delta (merged_keys - cnt_dst) is FOLDED into

@@ -567,8 +567,13 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 		 * first took that word owns its release, exactly as
 		 * ft_glue_clear_fenced reasons.
 		 */
+		/*
+		 * STRICT: the paragraph above is the ownership proof -- no
+		 * choke point owns this mark yet, so nothing of ours can have
+		 * consumed it and no peer can have taken it while we hold it.
+		 */
 		if (absorb_fenced && !absorb_held.shared && absorb_held.lock)
-			ft_meta_lock_release_if_held(absorb_held.lock);
+			ft_meta_lock_release(absorb_held.lock);
 		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
 	}
 	if (child_cn)

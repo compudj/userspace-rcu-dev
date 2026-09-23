@@ -6086,9 +6086,47 @@ end:
 					orphan_held[oi].txn_owned = true;
 					continue;
 				}
+				/*
+				 * ☠ THE FENCE MAY ALREADY BE GONE, AND THE WORD
+				 * CANNOT SAY SO.  Our own committed terminal drops
+				 * the LOCK; from that instant the word is a peer's
+				 * to take, and a set bit means THEIRS, not ours.
+				 * The sweep used to ask the word (clear_if_held)
+				 * on the premise quoted above -- "an acquire
+				 * refuses a TOMBSTONE, so the bit cannot come
+				 * back" -- which holds only for a terminal that
+				 * actually leaves the word TOMBSTONEd.  Where it
+				 * drops LOCK without one, the word is re-lockable
+				 * and the sweep clears a peer's fence.
+				 *
+				 * So ask what THIS op did.  Under @record_only the
+				 * descriptor is still alive and answers exactly
+				 * (above).  Otherwise it is already freed -- the
+				 * UAF this block's first comment records -- and
+				 * the op's own outcome is the witness: @ret == 0
+				 * means the detach committed, so its fused
+				 * tombstone consumed the fence; any bail or abort
+				 * applied nothing and the mark is still {LOCK|s}.
+				 */
+				if (!pend_txn && !ret) {
+					FT_ORPHAN_CONSUMED();
+					/*
+					 * PREFER A LEAK TO A THEFT, AND MEASURE
+					 * IT.  If the premise is ever false the
+					 * fence stays set and the node becomes
+					 * unmutable -- bad, but bounded and
+					 * local, where a theft corrupts a peer's
+					 * exclusion.  Record it rather than
+					 * refuse: a still-LOCKED, un-TOMBSTONEd
+					 * word here is the premise failing, and
+					 * the count is the thing to look at next.
+					 */
+					FT_ORPHAN_PREMISE_CHECK(
+						orphan_held[oi].lock);
+					continue;
+				}
 				FT_ORPHAN_RELEASED();
-				ft_meta_lock_release_if_held(
-					orphan_held[oi].lock);
+				ft_meta_lock_release(orphan_held[oi].lock);
 				/*
 				 * SCRUB only RELEASED-LIVE (finding A); a
 				 * TOMBSTONED word is a CONSUMED fence and must
@@ -6916,7 +6954,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				uatomic_inc(&ft_dbg_unchain_rehomed);
 #endif
 				if (!h.txn_owned)
-					ft_meta_lock_release_if_held(h.lock);
+					ft_meta_lock_release(h.lock);
 				return -EAGAIN;
 			}
 			/*
@@ -6963,7 +7001,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				 */
 				if (ft_node_is_removed(node)) {
 					if (!h.shared && !h.txn_owned)
-						ft_meta_lock_release_if_held(h.lock);
+						ft_meta_lock_release(h.lock);
 					return -ENOENT;
 				}
 				if ((kind == FT_UNCHAIN_INTERIOR) != member ||
@@ -6973,7 +7011,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 					uatomic_inc(&ft_dbg_unchain_rerouted);
 #endif
 					if (!h.shared && !h.txn_owned)
-						ft_meta_lock_release_if_held(h.lock);
+						ft_meta_lock_release(h.lock);
 					return -EAGAIN;
 				}
 			}
@@ -7396,13 +7434,29 @@ bool ft_rm_holder_rehomed(struct cds_ft *ft, const struct cds_ft_node *node,
 #endif
 
 #if defined(FT_RM_ACQUIRE_FIRST) || defined(FT_RM_REVALIDATE)
-#define FT_RM_RELEASE()	do {						\
-		if (rm_hold && !rm_held.shared && !rm_held.txn_owned)	\
-			ft_meta_lock_release_if_held(rm_held.lock);	\
+/*
+ * @committed: did THIS op's commit run?  Most uses are bails, retries and
+ * re-aims where nothing committed and the fence is provably still ours; the
+ * success arm of the exit switch is the one that is not, and it must not ask
+ * the word -- a committed terminal may have dropped our LOCK, after which a
+ * set bit means a PEER's fence.
+ */
+#define FT_RM_RELEASE_OUTCOME(committed_)	do {			\
+		if (rm_hold && !rm_held.shared && !rm_held.txn_owned) {	\
+			if (committed_) {				\
+				FT_ORPHAN_CONSUMED();			\
+				FT_ORPHAN_PREMISE_CHECK(rm_held.lock);	\
+			} else {					\
+				FT_ORPHAN_RELEASED();			\
+				ft_meta_lock_release(rm_held.lock);	\
+			}						\
+		}							\
 		rm_hold = false;					\
 	} while (0)
+#define FT_RM_RELEASE()	FT_RM_RELEASE_OUTCOME(false)
 #else
-#define FT_RM_RELEASE()	do { } while (0)
+#define FT_RM_RELEASE()			do { } while (0)
+#define FT_RM_RELEASE_OUTCOME(c_)	do { } while (0)
 #endif
 
 static
@@ -7906,7 +7960,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			}
 			/* It moved while we were taking it: drop and re-aim. */
 			if (!rm_held.shared && !rm_held.txn_owned)
-				ft_meta_lock_release_if_held(rm_held.lock);
+				ft_meta_lock_release(rm_held.lock);
 			rm_held = (struct ft_held_anchor){ 0 };
 			if (!fresh || ft_node_external(fresh))
 				break;	/* no state word to hold: as before */
@@ -8032,7 +8086,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * WHOLE op rather than re-aim: see the alternation above.
 			 */
 			if (!rm_held.shared && !rm_held.txn_owned)
-				ft_meta_lock_release_if_held(rm_held.lock);
+				ft_meta_lock_release(rm_held.lock);
 			FT_DBG_RETRY_SITE();
 			*need_retry = true;
 			return CDS_FT_STATUS_OK;	/* value unused: wrapper retries */
@@ -8564,7 +8618,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	switch (ret) {
 	case 0:
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_OK);
-		FT_RM_RELEASE();
+		FT_RM_RELEASE_OUTCOME(true);
 		return CDS_FT_STATUS_OK;
 	case -ENOMEM:
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);

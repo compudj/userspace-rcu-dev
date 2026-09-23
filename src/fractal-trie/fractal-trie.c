@@ -590,7 +590,15 @@ sweep:
 			 * the txn's terminals.  ONE OWNER PER FENCE.
 			 */
 			if (!marks[i].shared && !marks[i].txn_owned) {
-				ft_meta_lock_release_if_held(marks[i].lock);
+				/*
+				 * STRICT: @marks_consumed above already
+				 * excludes the committed case this comment
+				 * describes, so reaching here means the op
+				 * bailed and still holds the mark.  Asking the
+				 * word instead is what took the peer's fresh
+				 * mark the comment warns about.
+				 */
+				ft_meta_lock_release(marks[i].lock);
 				/*
 				 * SCRUB only RELEASED-LIVE (finding A); a
 				 * TOMBSTONED word is a CONSUMED fence and must

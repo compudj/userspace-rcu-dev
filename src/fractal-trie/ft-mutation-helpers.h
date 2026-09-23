@@ -6126,45 +6126,32 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 }
 
 /*
- * CLEAR-IF-HELD: drop the reversible node lock ONLY if the word still holds
- * it, otherwise return silently.  This is the cleanup twin used when the op does
- * NOT know at the cleanup point whether its own commit already consumed the
- * fence (a fenced {LOCK|s -> TOMBSTONE|s} tombstone that committed leaves the
- * word TOMBSTONE, LOCK dropped) or whether it must still be released (any
- * abort / pre-commit bail leaves the word {LOCK|s}).  Because the fence is
- * owner-exclusive -- only WE set it (CAS clean->LOCK), and no peer clears or
- * re-sets it while we hold it -- the settled word is deterministically either
- * {LOCK|s} (release it) or {...|TOMBSTONE} without LOCK (our commit took
- * it; leave it).  A doomed peer guard may transiently park an FT_STATE_PROXY on
- * the word (Dekker note at ft_meta_lock_acquire); wait it out as the plain clear
- * does.  This lets a caller that owns MORE marks than FT_FLIP_TXN_MAX_LOCKS
- * (the orphan chain, up to FT_MAX_DEPTH) clear them from its own array with ONE
- * unconditional post-op sweep instead of registering them or tracking per-commit
- * which ones a success consumed.
+ * ☠ ft_meta_lock_release_if_held IS GONE, AND THE REASON IS ITS OWN PREMISE.
+ *
+ * It cleared the fence "only if the word still holds it", justified by: "the
+ * fence is owner-exclusive -- only WE set it, and no peer clears or re-sets it
+ * while we hold it -- so the settled word is deterministically either {LOCK|s}
+ * (release it) or {...|TOMBSTONE} without LOCK (our commit took it)".  That
+ * disjunction is missing a third branch: once OUR committed terminal drops the
+ * LOCK, the word is free, a peer may take it, and the word then reads {LOCK|s}
+ * again -- indistinguishable from "still ours".  The sweep clears it and steals
+ * a live fence.  Measured, before removal: thousands per ft_inv leg, at every
+ * spacing, while the suite stayed green.
+ *
+ * The deeper point is that the question was unanswerable by construction.  A
+ * thread either KNOWS it holds a lock or it does not; if it does not, the lock
+ * word cannot tell it, because a bit set by us and a bit set by a peer are the
+ * same bit.  Every caller already had the answer -- all ~55 of them passed a
+ * pointer out of their own bookkeeping, and the only thing they lacked was the
+ * op's own commit OUTCOME, which is now passed explicitly (@committed /
+ * @marks_consumed / @ret) or proven by the path (a bail commits nothing).
+ *
+ * Where the outcome says "our terminal consumed it", the sweep now leaves the
+ * word alone and counts it, and FT_ORPHAN_PREMISE_CHECK counts the words where
+ * that turns out to be wrong: those LEAK a fence instead of stealing one, which
+ * is the deliberate trade -- a leak is bounded and local, a theft corrupts a
+ * peer's exclusion.
  */
-static FT_LL_INLINE
-void ft_meta_lock_release_if_held(struct cds_ft_metadata *meta)
-{
-	ft_hold_trace_drop(meta);
-	for (;;) {
-		uintptr_t s = CMM_LOAD_SHARED(meta->state);
-
-		if (caa_unlikely(s & FT_STATE_PROXY)) {
-			caa_cpu_relax();
-			continue;
-		}
-		if (!(s & FT_STATE_LOCK)) {
-			FT_LL_LOG(FT_LL_SKIP_IF, meta, NULL, s, 0);
-			return;	/* our commit already consumed it (TOMBSTONE) */
-		}
-		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
-				s & ~FT_STATE_LOCK) == s)) {
-			FT_DT_CLEAR(meta);
-			FT_LL_LOG(FT_LL_CLEAR_IF, meta, NULL, s, 0);
-			return;
-		}
-	}
-}
 
 /*
  * THE CLAIM WITHOUT THE ARM: assert this commit's records against its held set
@@ -6356,29 +6343,52 @@ void ft_flip_txn_lock_register_held(struct ft_flip_txn *t,
 	ft_flip_txn_lock_register_member(t, h->lock, h->lock_snap, h->member);
 }
 
-#ifdef FT_DEBUG_ORPHAN_RELEASE
+#if defined(FT_DEBUG_ORPHAN_RELEASE) || FT_DT_ARMED
 /*
- * ARM YIELD for the orphan sweep's two outcomes: released by plain CAS here,
- * or HANDED to the txn that still carries the word's terminal.  A zero on the
- * hand-over line means the path never armed -- not that it is sound.  The red
- * control -DFT_RED_ORPHAN_RELEASE_EARLY forces the old always-release
- * behaviour, and the park-clobber detector must go loud again.
+ * ARM YIELD for the orphan sweep's outcomes: released by plain CAS here, HANDED
+ * to the txn that still carries the word's terminal, or CONSUMED by this op's
+ * own committed terminal.  A zero on the hand-over line means the path never
+ * armed -- not that it is sound.  The red control
+ * -DFT_RED_ORPHAN_RELEASE_EARLY forces the old always-release behaviour, and
+ * the park-clobber detector must go loud again.
+ *
+ * @ft_orphan_premise_broken is the one to watch.  The sweep no longer asks the
+ * WORD whether the fence is still ours; it concludes "consumed" from the op's
+ * own commit, on the premise that a successful detach's terminal took the bit.
+ * Where that premise is false the fence LEAKS instead of being stolen -- the
+ * deliberate trade -- and this counts exactly those words: still LOCKED, never
+ * TOMBSTONEd, after a commit that was supposed to consume them.
  */
 static unsigned long ft_orphan_rel_released, ft_orphan_rel_handed;
+static unsigned long ft_orphan_rel_consumed, ft_orphan_premise_broken;
 # define FT_ORPHAN_RELEASED()	uatomic_inc(&ft_orphan_rel_released)
 # define FT_ORPHAN_HANDED()	uatomic_inc(&ft_orphan_rel_handed)
+# define FT_ORPHAN_CONSUMED()	uatomic_inc(&ft_orphan_rel_consumed)
+# define FT_ORPHAN_PREMISE_CHECK(lock_)					\
+	do {								\
+		uintptr_t s__ = CMM_LOAD_SHARED((lock_)->state);	\
+									\
+		if ((s__ & FT_STATE_LOCK) &&				\
+				!(s__ & FT_STATE_TOMBSTONE))		\
+			uatomic_inc(&ft_orphan_premise_broken);		\
+	} while (0)
 static __attribute__((destructor)) void ft_orphan_release_report(void)
 {
 	if (!uatomic_read(&ft_orphan_rel_released) &&
-			!uatomic_read(&ft_orphan_rel_handed))
+			!uatomic_read(&ft_orphan_rel_handed) &&
+			!uatomic_read(&ft_orphan_rel_consumed))
 		return;		/* per-TU statics: do not print a wrong zero */
-	fprintf(stderr, "FT ORPHAN SWEEP: released by CAS %lu, handed to the terminal's txn %lu\n",
+	fprintf(stderr, "FT ORPHAN SWEEP: released by CAS %lu, handed to the terminal's txn %lu, consumed by our own commit %lu, PREMISE BROKEN (leaked fence) %lu\n",
 		uatomic_read(&ft_orphan_rel_released),
-		uatomic_read(&ft_orphan_rel_handed));
+		uatomic_read(&ft_orphan_rel_handed),
+		uatomic_read(&ft_orphan_rel_consumed),
+		uatomic_read(&ft_orphan_premise_broken));
 }
 #else
 # define FT_ORPHAN_RELEASED()	do { } while (0)
 # define FT_ORPHAN_HANDED()	do { } while (0)
+# define FT_ORPHAN_CONSUMED()	do { } while (0)
+# define FT_ORPHAN_PREMISE_CHECK(lock_)	do { } while (0)
 #endif
 
 /*
@@ -6421,6 +6431,65 @@ struct urcu_txn_record *ft_lock_terminal_pending(const struct ft_flip_txn *t,
 		return NULL;
 	return urcu_txn_find(d, (void **) (void *)
 		&((struct cds_ft_metadata *) (uintptr_t) lock)->state);
+}
+
+/*
+ * ☠ WHY THE ANSWER ABOVE IS NOT ENOUGH: IT RETURNS NULL FOR TWO OPPOSITE FACTS.
+ *
+ * "No terminal exists for this word" (the fence is STILL OURS -- release it)
+ * and "the descriptor already DECIDED" (a committed terminal has ALREADY
+ * dropped our LOCK -- the word is not ours any more) both come back as NULL.
+ * A caller that cannot tell them apart has exactly one question left, and it
+ * is the wrong one: it asks the WORD whether the bit is set, which is answered
+ * identically by "still mine" and "already re-taken by a peer".  That is the
+ * ft_meta_lock_release_if_held hole -- measured as thousands of stolen locks
+ * per ft_inv leg.  A thread either KNOWS it holds a lock or it does not; if it
+ * does not, the lock word cannot tell it.
+ *
+ * So ask the op's OWN record and report the four distinguishable states.  The
+ * consumed test reads the RECORD's own old/new values, never the live word: a
+ * committed record that drops FT_STATE_LOCK is what took our fence, and a
+ * record on the state word that does not touch LOCK (an nr_child edit, say)
+ * consumes nothing.
+ */
+enum ft_lock_terminal_state {
+	FT_LOCK_TERMINAL_NONE,		/* no record: the fence is still ours */
+	FT_LOCK_TERMINAL_PENDING,	/* undecided: hand it to the txn */
+	FT_LOCK_TERMINAL_CONSUMED,	/* committed, and it dropped our LOCK */
+	FT_LOCK_TERMINAL_KEPT,		/* decided, but our LOCK survived it */
+};
+
+static inline
+enum ft_lock_terminal_state ft_lock_terminal_query(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *lock,
+		struct urcu_txn_record **rec)
+{
+	struct urcu_txn_desc *d;
+	struct urcu_txn_record *r;
+	unsigned long st;
+
+	if (rec)
+		*rec = NULL;
+	if (!t || !t->mtxn || !lock)
+		return FT_LOCK_TERMINAL_NONE;
+	d = t->mtxn->desc;
+	/* The ENOMEM sentinel is (void *) -1, not a descriptor: never deref. */
+	if (!d || d == URCU_TXN_ENOMEM)
+		return FT_LOCK_TERMINAL_NONE;
+	r = urcu_txn_find(d, (void **) (void *)
+		&((struct cds_ft_metadata *) (uintptr_t) lock)->state);
+	if (!r)
+		return FT_LOCK_TERMINAL_NONE;
+	if (rec)
+		*rec = r;
+	st = urcu_txn_desc_status(d);
+	if (st == URCU_TXN_DESC_UNDECIDED)
+		return FT_LOCK_TERMINAL_PENDING;
+	if (st != URCU_TXN_DESC_SUCCEEDED)
+		return FT_LOCK_TERMINAL_KEPT;	/* failed: nothing was applied */
+	return (((uintptr_t) r->old_ptr & FT_STATE_LOCK) &&
+			!((uintptr_t) r->new_ptr & FT_STATE_LOCK)) ?
+		FT_LOCK_TERMINAL_CONSUMED : FT_LOCK_TERMINAL_KEPT;
 }
 
 /*
@@ -22882,8 +22951,21 @@ void ft_glue_fenced_renounce_free(struct ft_glue *g)
 			g->free_list[i].retired = false;
 }
 
+/*
+ * @committed: did the fenced retire's commit SUCCEED?  The caller knows and
+ * the word does not.
+ *
+ * This sweep used to be called with no outcome at all, on the premise its
+ * callers still state: "a COMMITTED fenced retire consumed each fence into
+ * TOMBSTONE (clear_if_held no-ops), while an ABORTED commit left {LOCK|s}
+ * ... One unconditional sweep covers both, which is why no per-outcome
+ * bookkeeping is kept."  The no-op half is the hole: once our committed
+ * terminal drops the LOCK, the word belongs to whoever takes it next, and
+ * asking the word gives the same answer for "still ours" and "already
+ * a peer's".  The outcome is bookkeeping the caller already has.
+ */
 static
-void ft_glue_clear_fenced(struct ft_glue *g)
+void ft_glue_clear_fenced(struct ft_glue *g, bool committed)
 {
 	int i;
 
@@ -22898,8 +22980,16 @@ void ft_glue_clear_fenced(struct ft_glue *g)
 		 */
 		if (!g->free_list[i].holder_shared &&
 				!g->free_list[i].holder_txn_owned &&
-				g->free_list[i].holder)
-			ft_meta_lock_release_if_held(g->free_list[i].holder);
+				g->free_list[i].holder) {
+			if (committed) {
+				FT_ORPHAN_CONSUMED();
+				FT_ORPHAN_PREMISE_CHECK(
+					g->free_list[i].holder);
+			} else {
+				FT_ORPHAN_RELEASED();
+				ft_meta_lock_release(g->free_list[i].holder);
+			}
+		}
 		g->free_list[i].fenced = false;
 	}
 	/*
@@ -22915,8 +23005,15 @@ void ft_glue_clear_fenced(struct ft_glue *g)
 	 * Shared takes nothing and owes nothing, the same rule as the loop above.
 	 */
 	if (g->absorb_node) {
+		/*
+		 * STRICT, because the paragraph above is a proof of ownership:
+		 * @absorb_node still set means no absorb ever filed the entry,
+		 * so no terminal of ours can have consumed the fence and no
+		 * other owner exists to have released it.  The op knows; it
+		 * does not need to ask the word.
+		 */
 		if (!g->absorb_held.shared && g->absorb_held.lock)
-			ft_meta_lock_release_if_held(g->absorb_held.lock);
+			ft_meta_lock_release(g->absorb_held.lock);
 		g->absorb_node = NULL;
 	}
 }
@@ -23706,7 +23803,7 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * stay LIVE and unmarked, the trie byte-for-byte as before.  No-op for a
 	 * glue that never fenced.
 	 */
-	ft_glue_clear_fenced(g);
+	ft_glue_clear_fenced(g, /*committed=*/ false);
 	/*
 	 * FOLD: same argument for the re-parent marks.  This is the choke point for
 	 * every path that reaches here without a successful commit -- pre-commit
@@ -23759,8 +23856,17 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 		 * ft_flip_txn_lock_release_all drains it -- clearing here as well
 		 * is the fence theft @split_cn_holder spells out.
 		 */
+		/*
+		 * STRICT: this is ft_glue_abort.  No commit of ours ran,
+		 * so no terminal consumed the fence -- with @shared and
+		 * @txn_owned already excluded, the op HOLDS this word and
+		 * knows it.  (The clear-if-held this replaces was there
+		 * for callers that release the fence themselves without
+		 * clearing the field; those NULL it, as ft_graft_keylen
+		 * does on retry_attach, so the guard above covers them.)
+		 */
 		if (!g->publish_parent_shared && !g->publish_parent_txn_owned)
-			ft_meta_lock_release_if_held(g->publish_parent_holder);
+			ft_meta_lock_release(g->publish_parent_holder);
 		g->publish_parent_holder = NULL;
 		g->publish_parent_shared = false;
 		g->publish_parent_snap = 0;
@@ -23774,8 +23880,17 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * fence theft @split_cn_holder spells out.
 	 */
 	if (g->publish_gp_holder) {
+		/*
+		 * STRICT: this is ft_glue_abort.  No commit of ours ran,
+		 * so no terminal consumed the fence -- with @shared and
+		 * @txn_owned already excluded, the op HOLDS this word and
+		 * knows it.  (The clear-if-held this replaces was there
+		 * for callers that release the fence themselves without
+		 * clearing the field; those NULL it, as ft_graft_keylen
+		 * does on retry_attach, so the guard above covers them.)
+		 */
 		if (!g->publish_gp_shared && !g->publish_gp_txn_owned)
-			ft_meta_lock_release_if_held(g->publish_gp_holder);
+			ft_meta_lock_release(g->publish_gp_holder);
 		g->publish_gp_holder = NULL;
 		g->publish_gp_shared = false;
 		g->publish_gp_snap = 0;

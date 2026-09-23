@@ -2075,9 +2075,10 @@ chain_done:
 			ft->lock_fine ? held : NULL, NULL);
 	return 0;
 refuse:
+	/* STRICT: a refusal commits nothing, so every mark left is ours. */
 	for (i = *nr_held - 1; i >= 0; i--)
 		if (!held[i].shared && !held[i].txn_owned)
-			ft_meta_lock_release_if_held(held[i].lock);
+			ft_meta_lock_release(held[i].lock);
 	*nr_held = 0;
 	ctx->held.nr_extra = 0;
 	rc->nr_orphans = 0;
@@ -2111,9 +2112,14 @@ void ft_rekey_fold_sweep_orphan_marks(struct ft_held_anchor *held, int *nr_held)
 {
 	int i;
 
+	/*
+	 * STRICT: the committed path sweeps these itself and leaves
+	 * @nr_held at zero (see the caller), so reaching the body at all
+	 * proves the op bailed and still holds the mark.
+	 */
 	for (i = 0; i < *nr_held; i++)
 		if (!held[i].shared && !held[i].txn_owned) {
-			ft_meta_lock_release_if_held(held[i].lock);
+			ft_meta_lock_release(held[i].lock);
 			/*
 			 * SCRUB only RELEASED-LIVE: a TOMBSTONED word is a
 			 * CONSUMED fence and must keep answering holds().
@@ -6696,9 +6702,10 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * reclaims it on the way out.
 			 */
 			if (caa_unlikely(glue.absorb_node)) {
+				/* STRICT: a release-and-retry, nothing committed. */
 				if (!glue.absorb_held.shared &&
 						glue.absorb_held.lock)
-					ft_meta_lock_release_if_held(
+					ft_meta_lock_release(
 						glue.absorb_held.lock);
 				glue.absorb_node = NULL;
 				ret = -EAGAIN;
@@ -8320,7 +8327,8 @@ sweep:
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
 			if (!marks[i].shared && !marks[i].txn_owned) {
-				ft_meta_lock_release_if_held(marks[i].lock);
+				/* STRICT: @marks_consumed excludes the commit. */
+				ft_meta_lock_release(marks[i].lock);
 				/*
 				 * SCRUB: the frame chain answers holds() from
 				 * this array (ft_held_set_snap skips shared),
@@ -8718,6 +8726,8 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 		struct ft_flip_txn **pre_txn, bool *contended)
 {
 	struct ft_glue gd, gs;
+	/* Set from the commit below; read by ft_glue_clear_fenced. */
+	bool fenced_committed = false;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
 	struct ft_merge_counts cnt = { 0, 0, 0, 0, 0 };
 
@@ -9681,6 +9691,13 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 		enum urcu_txn_status mst = ft_flip_txn_commit(dst_ft, txn);
 
 		/*
+		 * Carried out of this block for ft_glue_clear_fenced below: the
+		 * fenced retires' fate is the OP's own knowledge, and that sweep
+		 * must not re-derive it from the state words.
+		 */
+		fenced_committed = (mst == URCU_TXN_STATUS_OK);
+
+		/*
 		 * The flip did not happen, so no fenced retire took effect and this
 		 * op owns none of those frees -- renounce them before the step-7
 		 * reclaim.  The dominant reason a fenced terminal aborts is a PEER
@@ -9716,7 +9733,7 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 	 *    both, which is why no per-outcome bookkeeping is kept.  Before the
 	 *    step-7 reclaim, while the nodes are still addressable.
 	 */
-	ft_glue_clear_fenced(&gd);
+	ft_glue_clear_fenced(&gd, fenced_committed);
 
 	/*
 	 * 6. The dst net key-count delta (merged_keys - cnt_dst) is FOLDED into
