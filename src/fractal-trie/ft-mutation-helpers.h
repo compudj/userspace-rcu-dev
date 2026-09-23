@@ -2712,6 +2712,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 
 	if (!t)
 		return NULL;
+	FT_TXN_OPEN_INC();
 	t->mtxn = &t->own;
 	urcu_txn_init(t->mtxn, NULL);	/* flavor-agnostic: the caller brackets the
 					 * RCU read side; no escalation domain
@@ -2989,6 +2990,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 
 	if (!t)
 		return NULL;
+	FT_TXN_OPEN_INC();
 	t->mtxn = op;
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
@@ -3088,6 +3090,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t = (struct ft_flip_txn *) malloc(sizeof(*t));
 	if (!t)
 		return NULL;
+	FT_TXN_OPEN_INC();
 	t->mtxn = op;
 	if (urcu_txn_reserve(op, cap) < 0) {
 		ft_flip_txn_free(t);
@@ -5562,6 +5565,7 @@ bool ft_flip_txn_reserve_locks(struct ft_flip_txn *t, unsigned int n)
 static inline
 void ft_flip_txn_free(struct ft_flip_txn *t)
 {
+	FT_TXN_OPEN_DEC();
 	if (t->locks != t->locks_floor)
 		free(t->locks);
 	free(t);

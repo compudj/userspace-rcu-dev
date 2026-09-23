@@ -4632,6 +4632,44 @@ void ft_move_gate_enter(struct cds_ft *ft)
  * grace period is needed on the way out: a reader that still sees @move_active
  * set merely runs the coherent path once more, which is never wrong, only slower.
  */
+/*
+ * THE GATE'S EXIT PREMISE, MADE CHECKABLE.
+ *
+ * ft_bulk_gate_exit clears @move_active with NO grace period, and the reason it
+ * is allowed to is stated below: a reader that still sees the word set merely
+ * runs the conservative rule once more, and a reader that sees it CLEAR starts
+ * after the structure is final.  That second half is a claim about the MOVER --
+ * that it has published everything before it clears -- and nothing checked it.
+ *
+ * A flip-txn that is still open is exactly "something not published yet", so
+ * count them per thread and assert none is left at the last bracket.  The
+ * counter is also REPORTED (max seen), because a silent zero here would be
+ * indistinguishable between "the premise holds" and "this TU's copy of the
+ * counter was never incremented" -- the per-TU wrong zero this codebase has
+ * been bitten by more than once.
+ */
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG) || defined(FT_DEBUG_GATE_PENDING)
+static __thread unsigned long ft_flip_txn_open_nr;
+static unsigned long ft_flip_txn_open_max;
+# define FT_TXN_OPEN_INC()						\
+	do {								\
+		if (++ft_flip_txn_open_nr >				\
+				uatomic_read(&ft_flip_txn_open_max))	\
+			uatomic_set(&ft_flip_txn_open_max,		\
+				ft_flip_txn_open_nr);			\
+	} while (0)
+# define FT_TXN_OPEN_DEC()	(ft_flip_txn_open_nr--)
+static __attribute__((destructor)) void ft_txn_open_report(void)
+{
+	if (uatomic_read(&ft_flip_txn_open_max))
+		fprintf(stderr, "FT GATE PENDING: deepest open flip-txn nesting seen %lu (0 left at every gate exit)\n",
+			uatomic_read(&ft_flip_txn_open_max));
+}
+#else
+# define FT_TXN_OPEN_INC()	do { } while (0)
+# define FT_TXN_OPEN_DEC()	do { } while (0)
+#endif
+
 static inline
 void ft_bulk_gate_exit(struct cds_ft *ft, enum ft_bulk_kind kind)
 {
@@ -4647,8 +4685,13 @@ void ft_bulk_gate_exit(struct cds_ft *ft, enum ft_bulk_kind kind)
 	 * on the way out: a peer that still sees a word set merely runs the
 	 * more conservative rule once more, which is never wrong, only slower.
 	 */
-	if (kind == FT_BULK_COHERENT && --ft->move_gate_nr == 0)
+	if (kind == FT_BULK_COHERENT && --ft->move_gate_nr == 0) {
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG) || defined(FT_DEBUG_GATE_PENDING)
+		/* Nothing of this mover's may still be unpublished here. */
+		urcu_assert_debug(!ft_flip_txn_open_nr);
+#endif
 		CMM_STORE_SHARED(ft->move_active, 0);
+	}
 	if (--ft->bulk_gate_nr) {
 		CMM_STORE_SHARED(ft->bulk_state, ft->bulk_gate_nr);
 	} else {
