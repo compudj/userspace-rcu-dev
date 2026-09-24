@@ -83,7 +83,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(132 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish */
+#define NR_TESTS	(133 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -24739,6 +24739,225 @@ static int inv_concurrent_insert_unique_coarse(void)
 }
 
 /*
+ * THE SAME RACE ON A PIGEON NODE.  The rows above contend on SKI_K = 8 keys,
+ * so the attach node never leaves the popcount tiers -- and the in-place
+ * reserve's FENCED ADD check (a live-node reserve must not clear a byte a
+ * peer filled after this op's descent) was present on every popcount/bitmap
+ * arm and MISSING on the pigeon one (ft_types[5], min_child 51).  Two
+ * concurrent inserts of one absent key then BOTH returned OK: the second's
+ * reserve stored NULL over the first's live child and published its own, so
+ * the first's key left the trie while its ordered cell stayed in the list.
+ *
+ * Here keys [0, SID_PIN) are pinned by the main thread, which holds the
+ * attach node at >= min_child and therefore a pigeon, and two workers race
+ * cds_ft_insert_unique / cds_ft_remove over [SID_PIN, SID_PIN + SID_HOT).
+ * Each worker removes ONLY nodes it installed, and a unique insert cannot
+ * displace a present one, so a worker's own node must still be the key's
+ * head when it goes to remove it: anything else is a LOST node (@sid_lost).
+ * cds_ft_verify at the join catches the orphaned cell.
+ */
+#define SID_PIN		128
+#define SID_HOT		128
+#define SID_OPS		200000
+#define SID_LOST_MAX	4096
+
+static unsigned long sid_ok, sid_dup, sid_lost;
+
+struct sid_ctx {
+	struct cds_ft *ft;
+	struct ft_test_node *mine[2][SID_HOT];
+	/* Lost nodes may still be reachable (a stale cell): freed at teardown. */
+	struct ft_test_node *lost[2][SID_LOST_MAX];
+	unsigned int nr_lost[2];
+};
+
+struct sid_arg {
+	struct sid_ctx *c;
+	unsigned int id;
+	unsigned int seed;
+};
+
+static void *sid_worker(void *arg)
+{
+	struct sid_arg *a = (struct sid_arg *) arg;
+	struct sid_ctx *c = a->c;
+	unsigned int id = a->id, seed = a->seed, i;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	rcu_thread_online();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (i = 0; i < SID_OPS; i++) {
+		unsigned int h = (unsigned int) rand_r(&seed) % SID_HOT;
+		uint64_t k = SID_PIN + h;
+		uint8_t key[8];
+
+		cds_ft_u64_to_key(c->ft, k, key, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		if (!c->mine[id][h]) {
+			struct ft_test_node *fresh = node_alloc(k);
+			struct cds_ft_node *dup = NULL;
+			enum cds_ft_status st;
+
+			st = cds_ft_insert_unique(c->ft, key, CDS_FT_LEN_DEFAULT,
+				&fresh->node, &dup);
+			if (st == CDS_FT_STATUS_OK) {
+				c->mine[id][h] = fresh;
+				fresh = NULL;
+				uatomic_inc(&sid_ok);
+			} else if (st == CDS_FT_STATUS_DUPLICATE_FOUND) {
+				uatomic_inc(&sid_dup);
+			} else {
+				fprintf(stderr, "inv_concurrent_insert_unique_dense: "
+					"insert_unique: %s\n",
+					cds_ft_status_to_string(st));
+				abort();
+			}
+			/* Refused: never reachable, plain free. */
+			if (fresh)
+				node_free(fresh);
+		} else {
+			struct ft_test_node *n = c->mine[id][h];
+
+			cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+			if (cds_ft_lookup(c->ft, iter) != CDS_FT_STATUS_OK ||
+					cds_ft_iter_node(iter) != &n->node ||
+					cds_ft_remove(c->ft, iter, &n->node) !=
+						CDS_FT_STATUS_OK) {
+				uatomic_inc(&sid_lost);
+				if (c->nr_lost[id] < SID_LOST_MAX)
+					c->lost[id][c->nr_lost[id]++] = n;
+			} else {
+				node_free_rcu(n);
+			}
+			c->mine[id][h] = NULL;
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_concurrent_insert_unique_dense(void)
+{
+	const char *name = "inv_concurrent_insert_unique_dense";
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct ft_test_node *pin[SID_PIN];
+	struct sid_ctx *c;
+	struct sid_arg arg[2];
+	pthread_t th[2];
+	struct cds_ft_iter *iter;
+	unsigned int i, h;
+	int ret = 0;
+
+	sid_ok = sid_dup = sid_lost = 0;
+	c = (struct sid_ctx *) calloc(1, sizeof(*c));
+	if (!c)
+		abort();
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, 8) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &c->ft) < 0)
+		abort();
+	cds_ft_make_shared(c->ft);
+	rcu_read_lock();
+	for (i = 0; i < SID_PIN; i++) {
+		uint8_t key[8];
+
+		pin[i] = node_alloc(i);
+		cds_ft_u64_to_key(c->ft, i, key, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_insert(c->ft, key, CDS_FT_LEN_DEFAULT,
+				&pin[i]->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+	for (i = 0; i < 2; i++) {
+		arg[i].c = c;
+		arg[i].id = i;
+		arg[i].seed = 0x5eed0 + i;
+		if (pthread_create(&th[i], NULL, sid_worker, &arg[i]))
+			abort();
+	}
+	rcu_thread_offline();
+	pthread_join(th[0], NULL);
+	pthread_join(th[1], NULL);
+	rcu_thread_online();
+	rcu_quiescent_state();
+	rcu_barrier();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_lock();
+	if (cds_ft_verify(c->ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify RED after the run\n", name);
+		ret = -1;
+	}
+	/* Every hot key: exactly its owner's node, or absent. */
+	for (h = 0; h < SID_HOT; h++) {
+		struct ft_test_node *own = c->mine[0][h] ? c->mine[0][h] :
+			c->mine[1][h];
+		uint8_t key[8];
+		enum cds_ft_status st;
+
+		if (c->mine[0][h] && c->mine[1][h]) {
+			fprintf(stderr, "%s: key %u OWNED BY BOTH workers\n",
+				name, SID_PIN + h);
+			ret = -1;
+		}
+		cds_ft_u64_to_key(c->ft, SID_PIN + h, key, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+		st = cds_ft_lookup(c->ft, iter);
+		if (own ? (st != CDS_FT_STATUS_OK ||
+				cds_ft_iter_node(iter) != &own->node ||
+				cds_ft_node_next_rcu(&own->node)) :
+				st != CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr, "%s: key %u is not exactly its owner's "
+				"node at the join\n", name, SID_PIN + h);
+			ret = -1;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	rcu_quiescent_state();
+	rcu_barrier();
+	cds_ft_destroy(c->ft);
+	cds_ft_group_destroy(group);
+	/* The trie is gone; what it handed out under RCU leaves the same way. */
+	for (i = 0; i < SID_PIN; i++)
+		node_free_rcu(pin[i]);
+	for (i = 0; i < 2; i++) {
+		unsigned int j;
+
+		for (h = 0; h < SID_HOT; h++)
+			if (c->mine[i][h])
+				node_free_rcu(c->mine[i][h]);
+		for (j = 0; j < c->nr_lost[i]; j++)
+			node_free_rcu(c->lost[i][j]);
+	}
+	/* The deferred frees must land before RUN_TEST's leak_check(). */
+	rcu_quiescent_state();
+	rcu_barrier();
+	free(c);
+	if (sid_lost) {
+		fprintf(stderr, "%s: %lu node(s) LOST -- a worker's own "
+			"installed node was not the key's head when it went to "
+			"remove it\n", name, sid_lost);
+		ret = -1;
+	}
+	diag("%s: 2 workers x %u ops over %u hot keys (+%u pinned, pigeon): "
+		"ok=%lu dup=%lu lost=%lu -> %s", name, SID_OPS, SID_HOT,
+		SID_PIN, sid_ok, sid_dup, sid_lost, ret ? "RED" : "ok");
+	return ret;
+}
+
+/*
  * A CONTRACT PROBE, NOT YET A GATE: cds_ft_replace against a same-key
  * insert/remove peer, on the FINE arm.
  *
@@ -26983,6 +27202,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_same_key_replace_coarse);
 	RUN_TEST(inv_concurrent_insert_unique_nolist);
 	RUN_TEST(inv_concurrent_insert_unique_coarse);
+	RUN_TEST(inv_concurrent_insert_unique_dense);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);
