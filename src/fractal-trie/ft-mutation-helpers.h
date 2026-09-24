@@ -9851,22 +9851,14 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 * not per txn: the txn-wide arm stays what it was, and a record whose
 	 * owner is registered later than it is planted keeps its CAS.
 	 *
-	 * ☠ NOT ON AN IN-PLACE TRIE YET -- LOCKS FIRST, SW LATER (the leaf-delete
-	 * hoist's rule in ft_detach_node).  "Every writer holds the lock" is
-	 * what makes the CAS redundant, and the in-place delete tier is not
-	 * shown to meet it on every shape: the leaf-delete hoist excludes
-	 * @topmost_external_nodes and the fold, and a promote acquires only
-	 * after its plan.  MEASURED with this arm on in-place:
-	 * inv_concurrent_remove_all_nolist RED every round at all three
-	 * spacings -- keys DOUBLE-OWNED, and the SW stale-old audit names 48 SW
-	 * records from remove_all's detach (ft_ord_cell_flip_into) whose
-	 * expected-old was a child the live slot no longer held (live NULL).
-	 * The CAS those records dropped had been rejecting that write; WHICH
-	 * writer cleared the slot is not named yet.  Lift this once it is, and
-	 * the in-place delete tier holds its lock on every shape.
+	 * What an SW record gives up is exactly that check, so every site
+	 * whose expected-old comes from a plan read BEFORE the lock owes the
+	 * re-read under it: insert_replace's leaf slot, and ft_remove_one_commit's
+	 * structural edge (the in-place delete's -- measured double-owned keys
+	 * until it did).
 	 */
 	held_sw = !t->structural_sw && t->ft && t->ft->lock_fine &&
-		!ft_in_place_ok(t->ft) && ft_flip_txn_owns(t, owner);
+		ft_flip_txn_owns(t, owner);
 	if (!FT_TK_TXN_IS_TAKE(t) && !held_sw) {
 		/*
 		 * COUNTED ONLY WHERE THE QUESTION IS OPEN, so that OWN_HELD +
