@@ -893,8 +893,28 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
 		defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED,
 		FT_CH_TXN_USE);
-	if (*ptr)
+	if (*ptr) {
+		/*
+		 * FENCED ADD, in-place mirror -- the check the popcount and
+		 * bitmap arms carry and this one lacked.  A LIVE-node RESERVE
+		 * (NULL child) whose byte a peer filled between this op's
+		 * descent and this store would CLEAR the peer's live child:
+		 * the store below writes NULL over it, the count is left alone
+		 * (replace, not add), and this op then publishes its own node
+		 * into the slot.  The peer's key is gone from the trie while
+		 * its ordered cell stays in the list.
+		 * MEASURED: two concurrent inserts of the same absent key both
+		 * returned OK (cds_ft_insert_unique included), each holding the
+		 * attach node's lock in turn (REGISTERED, in-place new-byte arm,
+		 * 1-8 us apart) -- a 256-key pool keeps the attach node a
+		 * pigeon, and a stop-the-world cds_ft_verify every 2 ms found
+		 * "ord-cell order mismatch" in 100% of runs within 200 ms.
+		 * Bail -EAGAIN to re-descend: the retry finds the peer's child.
+		 */
+		if (!defer_parent && !child_node_flag)
+			return -EAGAIN;
 		replace_old_ptr = true;
+	}
 	rcu_assign_pointer(*ptr, child_node_flag);
 	if (!replace_old_ptr) {
 		struct cds_ft_bitmap *bitmap = cds_ft_item_to_bitmap(node, type->order);
