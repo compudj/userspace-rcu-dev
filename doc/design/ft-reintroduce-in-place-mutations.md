@@ -329,10 +329,19 @@ Also surfaced by the review, unfixed and worth its own look:
   never reach the dst parent. `FEATURE_FT_FAULT_INJECT`'s
   `cds_ft_fault_rekey_countdown` forces a coherence miss and is the cheap way to
   exercise it.
-- The in-place reserve sets a bitmap bit in the LIVE attach node and only the
-  *count* is made idempotent; nothing rolls the bit back on the `acquire_miss`
-  discard path. Sticky semantics suggest this is harmless, but the tree does not
-  say so. Settle it.
+- ☑ SETTLED (2026-09-23): **a discarded in-place reserve is harmless.** The
+  reserve sets the bitmap bit over an EMPTY slot (the child arrives through the
+  txn) and defers `nr_child++` into the txn, so a later missed take or a commit
+  abort leaves "bit set, slot NULL, not counted" -- exactly the soft-deleted
+  HOLE the node format already carries: the setter's refill arm fills it and
+  counts it; `cds_ft_verify` checks `nr_child` against NON-NULL slots; readers
+  and iteration skip a NULL slot; and popcount capacity is decided by RANK
+  (`qp_ptr_idx = popcount(bms) >= max_child` -> `-ENOSPC` -> recompact, which
+  drops holes), so a stale bit cannot push an append past the slot array.
+  MEASURED with `-DFT_DEBUG_INPLACE_DISCARD` (1 in 64 in-place reserves
+  discarded AFTER their raw stores), rcu-debug + in-place, THP disabled per
+  process: ft_inv 155/155 at all three spacings (21,941-24,697 holes left per
+  leg out of 1.40-1.58M in-place reserves), ft_unit 363/363 (10,346 per leg).
 - The pigeon sticky-hint arm (`ft-mutation-node.h`) is the sibling change: make
   the occupancy bitmap a sticky hint set with an atomic OR, with a cleanup
   recompact once stale bits (`popcount(bitmap) - nr_child`) get high, keeping

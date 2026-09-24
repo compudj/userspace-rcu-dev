@@ -42,6 +42,16 @@ static void ft_ip_reserve_report(void)
 }
 #endif
 
+#ifdef FT_DEBUG_INPLACE_DISCARD
+static unsigned long ft_ipd_injected;
+
+static __attribute__((destructor)) void ft_ipd_report(void)
+{
+	fprintf(stderr, "FT INPLACE DISCARD: %lu in-place reserves discarded after their raw stores\n",
+		ft_ipd_injected);
+}
+#endif
+
 /*
  * One-commit insert state (ordered-list fresh-head insert): the attach
  * machinery parks a flip proxy in the structural slot (resolving to the OLD
@@ -2660,6 +2670,28 @@ int ft_attach_node(struct cds_ft *ft,
 					dbg_printf("branch publish error %d\n", ret);
 					goto check_error;
 				}
+#ifdef FT_DEBUG_INPLACE_DISCARD
+				/*
+				 * RED-STYLE INJECTION, never shipping: discard 1 in 64
+				 * attempts whose reserve landed IN PLACE, AFTER the raw
+				 * bitmap/slot stores -- what a later missed take or a
+				 * commit abort does.  The count rides the txn and is
+				 * dropped; the bit stays over an empty slot, i.e. a
+				 * soft-deleted HOLE, which the node format already
+				 * carries (the refill arm, verify counting non-NULL
+				 * slots, capacity by popcount).  The in-place doc's §5
+				 * question, made measurable.
+				 */
+				if (iter_dest_node_flag == attach_node_flag &&
+						in_place && ic->txn) {
+					static unsigned long ipd_n;
+
+					if (!(uatomic_add_return(&ipd_n, 1) & 63)) {
+						ic->txn->acquire_miss = true;
+						uatomic_inc(&ft_ipd_injected);
+					}
+				}
+#endif
 #ifdef FT_DEBUG_INPLACE_HOIST
 				/*
 				 * The in-place / relocation split of the reserve,
