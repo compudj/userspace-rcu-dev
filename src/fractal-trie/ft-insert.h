@@ -5417,6 +5417,25 @@ restart_replace_attempt:
 					ft_flip_txn_lock_or_guard_parent(ft, txn, &actx, d.pnf,
 						FT_DEPTH_FROM_DESCENT);
 					/*
+					 * ☞ A MISSED TAKE ENDS THE ATTEMPT HERE.  The acquire
+					 * latches @acquire_miss and returns; carrying on would
+					 * build the dual GP acquire, the sedges and the chain
+					 * freeze into a txn ft_flip_txn_commit is bound to
+					 * DISCARD (it tests the miss first and installs
+					 * nothing) -- measured ~28k such attempts per ft_inv
+					 * leg on the list-off leaf arm, every stale SW record
+					 * the audit saw there among them.  So run that discard NOW: the same
+					 * call, the same aging, trace and destroy, the same
+					 * -EAGAIN the flip below would return -- only without
+					 * the records.  Nothing has been recorded or stored
+					 * on this txn yet; @txn was created just above.
+					 */
+					if (caa_unlikely(txn->acquire_miss)) {
+						(void) ft_flip_txn_commit(ft, txn);
+						ret = -EAGAIN;
+						goto insert_replace_done;
+					}
+					/*
 					 * §9.3's THIRD LOCK-SET MEMBER, as cds_ft_replace takes
 					 * it.  Under a compressed @d.pnf the SKIP_X dual lives in
 					 * the GRANDPARENT's body, which {P} does not cover.
@@ -5612,6 +5631,25 @@ restart_replace_attempt:
 					ft_lock_ctx_init(&actx, &d, txn, &optxn);
 					ft_flip_txn_lock_or_guard_parent(ft, txn, &actx, d.pnf,
 						FT_DEPTH_FROM_DESCENT);
+					/*
+					 * ☞ A MISSED TAKE ENDS THE ATTEMPT HERE.  The acquire
+					 * latches @acquire_miss and returns; carrying on would
+					 * build the dual GP acquire, the sedges and the chain
+					 * freeze into a txn ft_flip_txn_commit is bound to
+					 * DISCARD (it tests the miss first and installs
+					 * nothing) -- measured ~28k such attempts per ft_inv
+					 * leg on the list-off leaf arm, every stale SW record
+					 * the audit saw there among them.  So run that discard NOW: the same
+					 * call, the same aging, trace and destroy, the same
+					 * -EAGAIN the flip below would return -- only without
+					 * the records.  Nothing has been recorded or stored
+					 * on this txn yet; @txn was created just above.
+					 */
+					if (caa_unlikely(txn->acquire_miss)) {
+						(void) ft_flip_txn_commit(ft, txn);
+						ret = -EAGAIN;
+						goto insert_replace_done;
+					}
 					/*
 					 * §9.3's THIRD LOCK-SET MEMBER, as cds_ft_replace takes
 					 * it.  Under a compressed @d.pnf the SKIP_X dual lives in
