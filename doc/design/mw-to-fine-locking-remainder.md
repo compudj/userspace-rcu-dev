@@ -3905,12 +3905,13 @@ still COWs and the bench measures the wrong thing.
 "lock-free" → "optimistic" is purged from new code but pervasive in older
 comments and the design notes; sweep once the machinery stops moving.
 
-### 8.4 The missing single-writer strategy
+### 8.4 The missing single-writer strategy — ☑ LANDED
 
 Add the validation-only mode (caller guarantees one writer, library takes no
 lock, `CDS_FT_SCOPED_WRITER` machinery already validates it). Under it,
 content SW is trivially sound — it is the cheapest full consumer of this
-whole conversion.
+whole conversion.  ☑ `f6ab074d` (`CDS_FT_WRITER_EXCL_CALLER`), renamed
+`CDS_FT_WRITER_EXTERNAL_SYNC` in `d2543946`.
 
 ---
 
@@ -4555,7 +4556,16 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               certification chore.  ☑ E.1-E.4
                                                               done; ☑ the probe-free control
                                                               landed @c90228da
-    F   §8.3 layout split + in-place + single-writer mode   (large, last).  ★ §8.2 in-place
+    F   §8.3 layout split + in-place + single-writer mode   (large, last).
+                                                              ☑ single-writer mode LANDED
+                                                              f6ab074d/d2543946 (§8.4).
+                                                              ◐ in-place: the point-op INSERT
+                                                              tier landed (opt-in, see
+                                                              ft-reintroduce-in-place-
+                                                              mutations.md §6); DELETE tier,
+                                                              bulk reserves and the default
+                                                              flip open.  ☐ layout split,
+                                                              ☐ terminology sweep.  ★ §8.2 in-place
                                                               is now DOUBLY motivated: E.4
                                                               says the FINE-vs-COARSE sweep is
                                                               not actionable until it lands,
