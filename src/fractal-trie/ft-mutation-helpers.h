@@ -15516,7 +15516,7 @@ struct ft_cell_plan {
  * Gating on ft_bulk_active() did not fix that (measured: the gate is already
  * clear when the point writer validates).  What separates the two is WHAT the
  * disagreement points at -- a DELETED cell, or a live one -- which is the
- * predicate ft_cell_pair_check states.
+ * predicate ft_cell_pair_check_held states.
  */
 #if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG) || defined(FT_DEBUG_CELL_TORN)
 static __attribute__((noinline, cold, noreturn))
@@ -15576,49 +15576,73 @@ bool ft_cell_deleted(const struct ft_ord_cell *c)
 }
 
 /*
- * @c's neighbour must name @c back -- AND THE DISAGREEMENT MUST POINT AT A
- * DELETED CELL.  That second half is the whole rule, and it is what tells the
- * two measured disagreements apart:
+ * A TEAR IN THE PAIR THIS PLAN HOLDS: @pred's next word and @succ's prev word,
+ * both under the plan's own locks.  Two signatures, each a disagreement that
+ * points at a DELETED cell:
  *
- *   TORN: the neighbour still names a cell that is already MARKED.  Every
- *         producer of a mark (urcu_txn_list_del_prepare, _replace_prepare,
- *         ft_ord_cell_unsplice_edges, the cell-swap site) records the mark AND
- *         both neighbour edges in ONE descriptor, so a committed mark whose
- *         neighbour edge did not move cannot happen -- unless the unsplice was
- *         half-applied, which is the defect.
- *   LEGAL: the neighbour names a live cell that is simply not us.  A whole-trie
- *         graft_swap DISPLACES a run and its cells keep naming a sentinel that
- *         has moved on -- one-way staleness, by design, and the staleness
- *         answer re-plans.  Measured as this detector's first (false) finding.
+ *   T1: succ->prev names pred, but pred->next names a DELETED cell -- the
+ *       unsplice's pred->next half was lost (the red control's shape);
+ *   T2: pred->next names succ, but succ->prev names a DELETED cell -- the
+ *       mirror.
+ *   T3: pred->next names succ, and succ itself is DELETED;
+ *   T4: succ->prev names pred, and pred itself is DELETED.
  *
- * Proxies are resolved on both sides, so a commit in flight reads as its
- * committed value and never as a disagreement.
+ * T3/T4 are the red control's STUCK shape: the torn cell Y is still named by
+ * its pred P, so a plan built from P->next is (P, Y) -- P and Y agree with
+ * each other and T1/T2 see nothing, while every retry re-reads the same pair
+ * and the op spins (measured: "insert retried > 2 s" with T1/T2 only).  A
+ * non-sentinel cell's mark lives in its own next word, under the cell lock
+ * this plan holds, so a held neighbour naming a MARKED cell is a committed
+ * mark whose edge did not move.  The SENTINEL is never deleted and its two
+ * ends are two locks, so it is excluded from T3/T4.
+ *
+ * Every producer of a mark (urcu_txn_list_del_prepare, _replace_prepare,
+ * ft_ord_cell_unsplice_edges, the cell-swap site) records the mark AND both
+ * neighbour edges in ONE descriptor, so a committed mark whose neighbour edge
+ * did not move is the defect.  A disagreement pointing at a LIVE cell is
+ * one-way staleness (a whole-trie graft_swap's displaced run) and the
+ * staleness answer below re-plans it.
+ *
+ * ☠ ONLY THE HELD PAIR, AND WHY IT TOOK A THIRD TRY.  The previous rule
+ * checked BOTH sides of every member -- pred's prev side and succ's next side
+ * too, which are OTHER ops' words.  Three plain reads of unheld words can
+ * straddle two correct commits: MEASURED at ft_inv test 84, exponential,
+ * ~1 run in 30 -- the checker read sentinel->prev = X before a peer's
+ * insert of Y at the tail, X->next = Y between that insert and its removal,
+ * and Y's mark after the removal; the slot history showed each commit moving
+ * both edges atomically and the pair consistent again at abort time.  A
+ * tripwire that reads outside its own exclusion reports the gaps between
+ * other ops' commits.  With both words held no commit can land between the
+ * reads, and a mark is one-way, so a signature here is a real tear.
  */
 static inline
-void ft_cell_pair_check(const struct cds_ft *ft, const struct ft_ord_cell *c)
+void ft_cell_pair_check_held(const struct cds_ft *ft,
+		const struct ft_ord_cell *pred, const struct ft_ord_cell *succ)
 {
-	const struct ft_ord_cell *o, *back;
+	const struct ft_ord_cell *pn, *sp;
 
-	if (!c)
+	if (!pred || !succ)
 		return;
-	o = ft_ord_cell_resolve_ord(&c->lnode.prev);
-	if (o) {
-		back = ft_ord_cell_resolve_ord(&o->lnode.next);
-		if (caa_unlikely(back && back != c && ft_cell_deleted(back)))
-			ft_cell_torn(ft, "pred->next still names a DELETED cell",
-				c, o, back);
-	}
-	o = ft_ord_cell_resolve_ord(&c->lnode.next);
-	if (o) {
-		back = ft_ord_cell_resolve_ord(&o->lnode.prev);
-		if (caa_unlikely(back && back != c && ft_cell_deleted(back)))
-			ft_cell_torn(ft, "succ->prev still names a DELETED cell",
-				c, o, back);
-	}
+	pn = ft_ord_cell_resolve_ord(&pred->lnode.next);
+	sp = ft_ord_cell_resolve_ord(&succ->lnode.prev);
+	if (caa_unlikely(sp == pred && pn && pn != succ && ft_cell_deleted(pn)))
+		ft_cell_torn(ft, "T1: succ->prev names pred, but pred->next names a DELETED cell",
+			pred, succ, pn);
+	if (caa_unlikely(pn == succ && sp && sp != pred && ft_cell_deleted(sp)))
+		ft_cell_torn(ft, "T2: pred->next names succ, but succ->prev names a DELETED cell",
+			succ, pred, sp);
+	if (caa_unlikely(pn == succ && !ft_ord_is_end(ft, succ) &&
+			ft_cell_deleted(succ)))
+		ft_cell_torn(ft, "T3: pred->next names succ, which is DELETED",
+			pred, succ, succ);
+	if (caa_unlikely(sp == pred && !ft_ord_is_end(ft, pred) &&
+			ft_cell_deleted(pred)))
+		ft_cell_torn(ft, "T4: succ->prev names pred, which is DELETED",
+			succ, pred, pred);
 }
-# define FT_CELL_PAIR_CHECK(c)	ft_cell_pair_check(ft, (c))
+# define FT_CELL_PAIR_CHECK(pred, succ)	ft_cell_pair_check_held(ft, (pred), (succ))
 #else
-# define FT_CELL_PAIR_CHECK(c)	do { } while (0)
+# define FT_CELL_PAIR_CHECK(pred, succ)	do { } while (0)
 #endif
 
 static inline
@@ -15629,12 +15653,10 @@ bool ft_cell_plan_still_valid(const struct cds_ft *ft,
 	 * TORN BEFORE STALE.  Every answer below is "false", which the caller
 	 * reads as "re-plan and retry"; ask FIRST whether the list around the
 	 * words this plan holds is self-consistent, because a tear makes that
-	 * retry an infinite loop (see ft_cell_pair_check).  Debug builds only.
+	 * retry an infinite loop (see ft_cell_pair_check_held).  Debug builds only.
 	 */
-	FT_CELL_PAIR_CHECK(p->pred);
-	FT_CELL_PAIR_CHECK(p->succ);
-	FT_CELL_PAIR_CHECK(p->pred2);
-	FT_CELL_PAIR_CHECK(p->succ2);
+	FT_CELL_PAIR_CHECK(p->pred, p->succ);
+	FT_CELL_PAIR_CHECK(p->pred2, p->succ2);
 	if (p->cell && !p->splice) {
 		const struct ft_ord_cell *last = p->last ? p->last : p->cell;
 
