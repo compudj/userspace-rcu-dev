@@ -9736,6 +9736,7 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		struct cds_ft_metadata *owner, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
+	bool held_sw;
 	int ret;
 
 	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
@@ -9837,7 +9838,36 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		t->dbg_take_at_own = dbg_take0;
 	}
 #endif
-	if (!FT_TK_TXN_IS_TAKE(t)) {
+	/*
+	 * A WORD THE OP HOLDS TAKES NO CAS, armed or not.  Every writer of a
+	 * word holds that word's lock (the lock take itself is outside the
+	 * txn), so an MW install on a HELD word arbitrates against nobody: the
+	 * CAS is redundant, and a lock-less CAS writer racing a lock holder
+	 * would be unsound anyway.  The one thing it still caught is a plan
+	 * DERIVED BEFORE the lock -- a stale expected-old -- and the contract
+	 * already owes a re-validation under the lock for that (the SW
+	 * stale-old audit measures it).  ft_flip_txn_owns is exact at every
+	 * spacing (ft_txn_per_op_spacing_ok), so the question is per record,
+	 * not per txn: the txn-wide arm stays what it was, and a record whose
+	 * owner is registered later than it is planted keeps its CAS.
+	 *
+	 * ☠ NOT ON AN IN-PLACE TRIE YET -- LOCKS FIRST, SW LATER (the leaf-delete
+	 * hoist's rule in ft_detach_node).  "Every writer holds the lock" is
+	 * what makes the CAS redundant, and the in-place delete tier is not
+	 * shown to meet it on every shape: the leaf-delete hoist excludes
+	 * @topmost_external_nodes and the fold, and a promote acquires only
+	 * after its plan.  MEASURED with this arm on in-place:
+	 * inv_concurrent_remove_all_nolist RED every round at all three
+	 * spacings -- keys DOUBLE-OWNED, and the SW stale-old audit names 48 SW
+	 * records from remove_all's detach (ft_ord_cell_flip_into) whose
+	 * expected-old was a child the live slot no longer held (live NULL).
+	 * The CAS those records dropped had been rejecting that write; WHICH
+	 * writer cleared the slot is not named yet.  Lift this once it is, and
+	 * the in-place delete tier holds its lock on every shape.
+	 */
+	held_sw = !t->structural_sw && t->ft && t->ft->lock_fine &&
+		!ft_in_place_ok(t->ft) && ft_flip_txn_owns(t, owner);
+	if (!FT_TK_TXN_IS_TAKE(t) && !held_sw) {
 		/*
 		 * COUNTED ONLY WHERE THE QUESTION IS OPEN, so that OWN_HELD +
 		 * OWN_MISS == MW_STRUCT exactly: the surface, split by whether
@@ -9935,9 +9965,13 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 * and the rekey / root-COW writers (door 3) set @structural_sw WITHOUT
 	 * @sw_per_op -- their exclusion is the FT-wide lock or the trie's own
 	 * privacy, not the lock registry -- so they keep parking SW throughout.
+	 *
+	 * @held_sw is the same question asked OUTSIDE an arm (above): the
+	 * per-record answer is what licenses the park, so it needs no txn-wide
+	 * arm to be asked.
 	 */
-	if (t->structural_sw &&
-	    (!t->sw_per_op || t->sw_body || ft_flip_txn_owns(t, owner))) {
+	if (held_sw || (t->structural_sw &&
+	    (!t->sw_per_op || t->sw_body || ft_flip_txn_owns(t, owner)))) {
 		FT_TK_COUNT_REC(t, FT_TK_SW);
 		FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 #ifdef FT_DEBUG_TXN_KIND
@@ -9960,7 +9994,7 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		 * whole-body writer, whose words it fenced itself -- so it is
 		 * counted apart rather than pooled with the trie-wide claim.)
 		 */
-		if (!t->sw_per_op || t->sw_body) {
+		if (!held_sw && (!t->sw_per_op || t->sw_body)) {
 			const struct cds_ft *xft = t->ft;
 
 			if (t->sw_body) {
