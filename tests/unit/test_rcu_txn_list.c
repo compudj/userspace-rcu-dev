@@ -266,6 +266,8 @@ int main(void)
 	int i;
 
 	plan_tests(NR_TESTS);
+	if (create_all_cpu_call_rcu_data(0))
+		diag("Per-CPU call_rcu() workers unavailable, using default.");
 	rcu_register_thread();
 	urcu_txn_list_init(&g_head);
 	urcu_txn_domain_init(&g_dom);
@@ -318,5 +320,6 @@ int main(void)
 
 	rcu_barrier();
 	rcu_unregister_thread();
+	free_all_cpu_call_rcu_data();
 	return exit_status();
 }

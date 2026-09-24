@@ -156,6 +156,8 @@ int main(void)
 	int i, k;
 
 	plan_tests(NR_TESTS);
+	if (create_all_cpu_call_rcu_data(0))
+		diag("Per-CPU call_rcu() workers unavailable, using default.");
 	rcu_register_thread();
 
 	memset(slot, 0, sizeof(slot));
@@ -221,5 +223,6 @@ int main(void)
 
 	rcu_barrier();
 	rcu_unregister_thread();
+	free_all_cpu_call_rcu_data();
 	return exit_status();
 }
