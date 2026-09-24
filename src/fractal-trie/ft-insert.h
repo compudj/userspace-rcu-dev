@@ -4510,6 +4510,32 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  * names the grandparent the lock set holds rather than the one a plan made
  * before it saw.
  */
+/*
+ * THE LEAF SLOT, RE-READ UNDER THE LOCK.  @nf is the DESCENT's sample of *@nfp,
+ * taken holding nothing; ft_insert_replace_leaf_sedges plans the forward edge
+ * {@nf -> node} from it and names @d.pnf -- held by now -- as its owner, and a
+ * held owner records SW (__ft_flip_txn_record_tag_ctx's @held_sw): a plain
+ * store with no expected-old check.  The install CAS that used to reject a
+ * peer's republish of this slot between the descent and the acquire is gone,
+ * so the plan has to be the slot's value UNDER the lock -- derive, acquire,
+ * RE-VALIDATE, exactly as ft_attach_node's occupied-slot arm does.
+ *
+ * MEASURED without it (SW on held owners): the SW stale-old audit's only site
+ * on a non-in-place ft_inv leg -- 742 (per-node) / 473 (exponential) records
+ * whose expected-old was not the live child -- and a WEDGED
+ * inv_concurrent_insert_replace_nolist at root-only, a peer replace looping in
+ * ft_anchor_descend over the structure the blind store left.
+ *
+ * Identity only (ft_node_ptr_raw): a parked flip proxy compares unequal and
+ * retries, which is the conservative answer.
+ */
+static inline
+bool ft_insert_replace_leaf_plan_ok(struct cds_ft_inode_flag **nfp,
+		struct cds_ft_inode_flag *nf)
+{
+	return ft_node_ptr_raw(rcu_dereference(*nfp)) == ft_node_ptr_raw(nf);
+}
+
 static
 unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
 		struct urcu_txn *mtxn, struct cds_ft_inode_flag *pnf,
@@ -5482,6 +5508,12 @@ restart_replace_attempt:
 					 */
 					gp_held = ft_lock_skip_dual_gp(ft, &actx, txn, d.pnf,
 						txn->mtxn);
+					/* The pre-commit terminal, as the chain-plan bail below. */
+					if (!ft_insert_replace_leaf_plan_ok(d.nfp, d.nf)) {
+						ft_flip_txn_destroy(txn);
+						ret = -EAGAIN;
+						goto insert_replace_done;
+					}
 					n_sedge = ft_insert_replace_leaf_sedges(ft,
 						txn->mtxn, d.pnf, d.nfp, d.nf, node, sedges,
 						gp_held);
@@ -5697,6 +5729,12 @@ restart_replace_attempt:
 					 */
 					gp_held = ft_lock_skip_dual_gp(ft, &actx, txn, d.pnf,
 						txn->mtxn);
+					/* The pre-commit terminal, as the chain-plan bail below. */
+					if (!ft_insert_replace_leaf_plan_ok(d.nfp, d.nf)) {
+						ft_flip_txn_destroy(txn);
+						ret = -EAGAIN;
+						goto insert_replace_done;
+					}
 					n_sedge = ft_insert_replace_leaf_sedges(ft,
 						txn->mtxn, d.pnf, d.nfp, d.nf, node, sedges,
 						gp_held);
