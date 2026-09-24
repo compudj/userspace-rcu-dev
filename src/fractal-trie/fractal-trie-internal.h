@@ -5474,6 +5474,21 @@ enum ft_delay_mode {
  * So arm ONE site (FT_DELAY_SITES=recompact), and treat a quieter run under
  * injection as evidence the injection is wrong, never as evidence of a fix.
  */
+/*
+ * ☠ FT_DELAY_SITE_ACQUIRE DOES NOT OPEN A DERIVE-BEFORE-LOCK WINDOW -- the
+ * "averages out" rule above, measured on the class it looks made for.  A
+ * stale-plan lost insert (the sole-entry freeze, 1d74625e) reproduces at
+ * ~0.4% of rows when the remover is PREEMPTED between its unheld read and its
+ * first take (taskset 2 cpus + 2 spinners).  With the fix disabled
+ * (-DFT_RED_NO_CCF_PLAN_CHECK) and this site sleeping instead
+ * (FT_DELAY_SPIN=0 FT_DELAY_US=50 FT_DELAY_PCT=10, 122M firings): 0 losses
+ * in 2,000 rows where ~8 were due.  It sleeps the PEER at its own takes too,
+ * so the peer rarely finishes an append inside the gap.  Use CPU pinning
+ * with competing spinners for that class.  (Also: without FT_DELAY_SPIN=0 a
+ * site SPINS ~200 pauses and FT_DELAY_US is ignored; and a sleep inside a
+ * point op stalls grace periods, so bound the rows per process or the
+ * call_rcu backlog outgrows a memory cage.)
+ */
 enum ft_delay_site {
 	FT_DELAY_SITE_ACQUIRE   = (1 << 0),	/* the 3 shared lock helpers */
 	FT_DELAY_SITE_RECOMPACT = (1 << 1),	/* post-lock child-count re-read */
