@@ -890,16 +890,47 @@ static void report_violation(const char *test, const char *fmt, ...)
 		}							\
 	} while (0)
 
+/*
+ * FT_INV_REPEAT=N, with a test NAME filter only: run that one test N times in
+ * this process, stopping at the first red, and report ONE TAP line -- the
+ * plan stays exact.  Each repetition runs the test's own oracle and the leak
+ * check.  A rare race that shows once in hundreds of runs needs hundreds of
+ * runs in ONE process under preemption (taskset + competing spinners); a
+ * process per run spends its time in startup.  Ignored without a filter, so
+ * a stray environment variable cannot multiply a whole suite.
+ */
+static unsigned long inv_repeat(const char *filter)
+{
+	const char *e = getenv("FT_INV_REPEAT");
+	unsigned long n;
+
+	if (!filter || !e)
+		return 1;
+	n = strtoul(e, NULL, 10);
+	return n ? n : 1;
+}
+
 #define RUN_TEST(fn)							\
 	do {								\
+		unsigned long rep_n__, rep_i__;				\
+		int rep_ok__ = 1;					\
+									\
 		if (filter && strcmp(filter, #fn) != 0) {		\
 			skip(1, "filtered out: " #fn);			\
 			break;						\
 		}							\
-		leak_reset();						\
-		atomic_store(&violation_count, 0);			\
-		rcu_quiescent_state();					\
-		ok((fn)() == 0 && leak_check() == 0, "%s", #fn);	\
+		rep_n__ = inv_repeat(filter);				\
+		for (rep_i__ = 0; rep_i__ < rep_n__ && rep_ok__;	\
+				rep_i__++) {				\
+			leak_reset();					\
+			atomic_store(&violation_count, 0);		\
+			rcu_quiescent_state();				\
+			rep_ok__ = (fn)() == 0 && leak_check() == 0;	\
+		}							\
+		if (rep_n__ > 1)					\
+			diag("%s: %lu repetition(s), %s", #fn, rep_i__,	\
+				rep_ok__ ? "ok" : "RED");		\
+		ok(rep_ok__, "%s", #fn);				\
 	} while (0)
 
 /* ================================================================== */
