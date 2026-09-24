@@ -19403,6 +19403,31 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	struct ft_ord_cell_edge edges[7] = { 0 };	/* 1 struct + state + <=4 cell/run + leaf freeze */
 	unsigned int n = 0;
 
+	/*
+	 * THE PLAN'S CHILD, RE-READ UNDER THE LOCK.  @struct_old is the plan's
+	 * value -- the child the caller's climb condemned, read before the
+	 * holder's lock was taken -- and it becomes this edge's expected-old.
+	 * A record on a word the op holds is parked SW (@held_sw in
+	 * __ft_flip_txn_record_tag_ctx): a plain store, so the install CAS that
+	 * used to reject "a peer republished this slot since the plan" is gone
+	 * and the plan has to be checked HERE, holding the owner.
+	 * MEASURED (in-place, SW on held owners, this check absent):
+	 * inv_concurrent_remove_all_nolist RED every round, keys DOUBLE-OWNED;
+	 * the slot history named the writer -- a PEER remove_all lane, itself
+	 * holding the lock, cleared the slot with a committed SW record ~1 us
+	 * BEFORE this lane registered the lock.  Both held the lock in turn;
+	 * the plan was simply older than the lock.
+	 * On a mismatch, the terminal an aborted commit would give (the caller
+	 * reads a failure as "nothing installed, txn consumed"), and retry.
+	 * Identity only (ft_node_ptr_raw): a parked proxy retries too.
+	 */
+	if (txn && slot_owner && ft_flip_txn_owns(txn, slot_owner) &&
+			ft_node_ptr_raw(rcu_dereference(*struct_slot)) !=
+				ft_node_ptr_raw(struct_old)) {
+		ft_remove_take_refused(txn, record_only);
+		return -EAGAIN;
+	}
+
 	edges[n].slot = (struct ft_ord_cell **) struct_slot;
 	edges[n].owner_cell = NULL;	/* not a cell link */
 	edges[n].old_target = (struct ft_ord_cell *) struct_old;
