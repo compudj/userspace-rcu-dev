@@ -138,10 +138,26 @@ static void set_affinity(void)
 #endif /* HAVE_SCHED_SETAFFINITY */
 }
 
+/*
+ * The writer mutex is the APPLICATION's exclusion, so it exists only for the
+ * strategy whose contract asks the application for it: external-sync.  Under
+ * fine or coarse the trie excludes its own writers, and taking this mutex
+ * around every insert and remove serialized them in the HARNESS -- every
+ * multi-writer throughput this tool reported for those strategies measured
+ * one writer at a time plus a futex hand-off (64% of the writers' samples in
+ * futex wait/wake at 4 in-place writers), never the trie's own locking.
+ */
+static
+bool mutex_mt_needed(void)
+{
+	return nr_writers > 1 &&
+		writer_strategy == CDS_FT_WRITER_EXTERNAL_SYNC;
+}
+
 static
 void mutex_lock_mt(void)
 {
-	if (nr_writers <= 1)
+	if (!mutex_mt_needed())
 		return;
 	if (pthread_mutex_lock(&lock)) {
 		perror("Error in pthread mutex lock");
@@ -152,7 +168,7 @@ void mutex_lock_mt(void)
 static
 void mutex_unlock_mt(void)
 {
-	if (nr_writers <= 1)
+	if (!mutex_mt_needed())
 		return;
 	if (pthread_mutex_unlock(&lock)) {
 		perror("Error in pthread mutex unlock");
