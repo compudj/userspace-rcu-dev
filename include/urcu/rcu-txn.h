@@ -926,6 +926,7 @@ int urcu_txn__record(struct urcu_txn *txn, void **slot,
 		unsigned int kind)
 {
 	struct urcu_txn_desc *m = txn->desc;
+	int miss = 0;			/* the RYW filter's certain miss, below */
 
 	urcu_txn__rp_check(txn, slot);	/* debug: @slot enters the read/write set */
 	if (caa_unlikely(m == URCU_TXN_ENOMEM))
@@ -946,6 +947,9 @@ int urcu_txn__record(struct urcu_txn *txn, void **slot,
 
 		if (coincide && urcu_txn__eff_retry(txn) == 0)
 			txn->esc_pending = 1;
+#ifndef URCU_TXN_RYW_NO_BLOOM
+		miss = !coincide;
+#endif
 #ifdef URCU_TXN_ESCALATION_STATS
 		if (coincide)
 			txn->esc_bloom++;
@@ -973,6 +977,26 @@ int urcu_txn__record(struct urcu_txn *txn, void **slot,
 #endif
 			recorded = urcu_txn_add(m, slot, old_ptr, new_ptr,
 					tag, kind);
+		} else if (miss) {
+			/*
+			 * THE FILTER'S CERTAIN MISS, AT AGE 1+ TOO.  @ryw_bloom
+			 * holds a bit for every slot this descriptor has
+			 * recorded (set just above, reset with the descriptor),
+			 * so a CLEAR bit means @slot is definitely not in the
+			 * write set and the reconcile's linear urcu_txn_find
+			 * could only confirm it.  At age 0 the filter's HIT is
+			 * an escalation signal; at age 1+ the same filter is
+			 * what urcu_txn__load already trusts to skip ITS find,
+			 * so a record trusts it too: append on a certain miss,
+			 * reconcile on a hit.  The answer is unchanged -- a
+			 * false positive still reaches the exact find -- only
+			 * the O(nr) scan per record goes, which made building
+			 * an nr-record write set O(nr^2).  <urcu/rcu-txn-sw.h>'s
+			 * urcu_txn_sw__find_ryw is this filter in front of the
+			 * same scan.
+			 */
+			recorded = urcu_txn_add(m, slot, old_ptr, new_ptr,
+					tag, kind);
 		} else
 			recorded = urcu_txn__reconcile(txn, m, slot,
 					old_ptr, new_ptr, upgrade, tag, kind);
@@ -985,7 +1009,7 @@ int urcu_txn__record(struct urcu_txn *txn, void **slot,
 				return -ENOMEM;
 			}
 			txn->desc = m;
-			if (urcu_txn__eff_retry(txn) == 0)
+			if (urcu_txn__eff_retry(txn) == 0 || miss)
 				urcu_txn_add(m, slot, old_ptr, new_ptr,
 						tag, kind);
 			else
