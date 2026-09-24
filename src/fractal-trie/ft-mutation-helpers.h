@@ -3028,6 +3028,83 @@ static inline unsigned int ft_ll_trace_self(void)
 # endif
 #endif
 
+#ifdef FT_DEBUG_MISS_WASTE
+/*
+ * WASTE AFTER A MISSED TAKE, per site.  A per-member acquire that misses
+ * latches @acquire_miss and the op carries on recording into a txn that
+ * ft_flip_txn_commit can only DISCARD (it tests the bit first).  Harmless, but
+ * the records built after the miss are pure waste: credit them to the site
+ * that set the bit (for ft_flip_txn_lock_or_guard_parent_ex, its CALLER).
+ */
+# define FT_MISS_SITES	64
+static struct ft_miss_site {
+	const char *fn;
+	int line;
+	unsigned long attempts, wasted;
+} ft_miss_sites[FT_MISS_SITES];
+static unsigned long ft_miss_overflow;
+
+static inline unsigned int ft_miss_nr(const struct urcu_txn *mtxn)
+{
+	return (mtxn && mtxn->desc && mtxn->desc != URCU_TXN_ENOMEM) ?
+		mtxn->desc->nr : 0;
+}
+
+static void ft_miss_account(const char *fn, int line, unsigned int wasted)
+{
+	unsigned int i;
+
+	if (!fn)
+		fn = "(unnamed)";
+	for (i = 0; i < FT_MISS_SITES; i++) {
+		struct ft_miss_site *m = &ft_miss_sites[i];
+
+		if (m->fn == fn && m->line == line) {
+			uatomic_inc(&m->attempts);
+			uatomic_add(&m->wasted, wasted);
+			return;
+		}
+		if (!m->fn && uatomic_cmpxchg(&m->fn, NULL, fn) == NULL) {
+			m->line = line;
+			uatomic_inc(&m->attempts);
+			uatomic_add(&m->wasted, wasted);
+			return;
+		}
+	}
+	uatomic_inc(&ft_miss_overflow);
+}
+
+static __attribute__((destructor)) void ft_miss_report(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < FT_MISS_SITES; i++)
+		if (ft_miss_sites[i].fn)
+			fprintf(stderr, "FT MISS WASTE: %-40s:%-5d attempts %9lu  records after the miss %10lu\n",
+				ft_miss_sites[i].fn, ft_miss_sites[i].line,
+				ft_miss_sites[i].attempts, ft_miss_sites[i].wasted);
+	if (ft_miss_overflow)
+		fprintf(stderr, "FT MISS WASTE: %lu past the table\n",
+			ft_miss_overflow);
+}
+# define FT_MISS_NOTE(t, fn_, line_)					\
+	do {								\
+		if (!(t)->miss_fn) {					\
+			(t)->miss_fn = (fn_);				\
+			(t)->miss_line = (line_);			\
+			(t)->miss_nr0 = ft_miss_nr((t)->mtxn);		\
+		}							\
+	} while (0)
+# define FT_MISS_RESET(t)	((t)->miss_fn = NULL, (t)->miss_line = 0)
+# define FT_MISS_ACCOUNT(t)						\
+	ft_miss_account((t)->miss_fn, (t)->miss_line,			\
+		ft_miss_nr((t)->mtxn) - (t)->miss_nr0)
+#else
+# define FT_MISS_NOTE(t, fn_, line_)	do { } while (0)
+# define FT_MISS_RESET(t)		((void) 0)
+# define FT_MISS_ACCOUNT(t)		do { } while (0)
+#endif
+
 struct ft_flip_txn {
 	struct urcu_txn *mtxn;	/* the concurrent commit engine handle:
 					 * &own (standalone txn), or the op's
@@ -3190,6 +3267,12 @@ struct ft_flip_txn {
 	unsigned int nr_hidden;
 #endif
 	bool acquire_miss;
+#ifdef FT_DEBUG_MISS_WASTE
+	/* Who set @acquire_miss first, and the records the txn held then. */
+	const char *miss_fn;
+	int miss_line;
+	unsigned int miss_nr0;
+#endif
 	/*
 	 * The miss above was an ALLOCATION failure, not a peer.  The acquire
 	 * choke point builds a small txn of its own (ft_dlm_acquire_set_at), so
@@ -3926,6 +4009,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->trie_wide_sw = false;
 	t->ft = ft;
 	t->acquire_miss = false;
+	FT_MISS_RESET(t);
 	t->acquire_enomem = false;
 	FT_OWNER_ASSERT_SET_FT(t, ft);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
@@ -4200,6 +4284,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->trie_wide_sw = false;
 	t->ft = ft;
 	t->acquire_miss = false;
+	FT_MISS_RESET(t);
 	t->acquire_enomem = false;
 	FT_OWNER_ASSERT_SET_FT(t, ft);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
@@ -4307,6 +4392,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->trie_wide_sw = false;
 	t->ft = ft;
 	t->acquire_miss = false;
+	FT_MISS_RESET(t);
 	t->acquire_enomem = false;
 	FT_OWNER_ASSERT_SET_FT(t, ft);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
@@ -9363,6 +9449,8 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		 */
 		enum urcu_txn_status miss_st = t->acquire_enomem ?
 			URCU_TXN_STATUS_MEMORY_ERROR : URCU_TXN_STATUS_ABORT;
+
+		FT_MISS_ACCOUNT(t);
 
 		if (miss_st == URCU_TXN_STATUS_ABORT)
 			urcu_txn_conflict(t->mtxn);
@@ -15807,6 +15895,7 @@ int ft_flip_txn_lock_root(struct ft_flip_txn *t,
 		if (ft_dlm_acquire_set(rft, &lctx, set, 1)) {
 			FT_COW_RTAKE(MISS);
 			t->acquire_miss = true;
+			FT_MISS_NOTE(t, __func__, __LINE__);
 			return -EAGAIN;
 		}
 	}
@@ -15821,6 +15910,7 @@ int ft_flip_txn_lock_root(struct ft_flip_txn *t,
 	if (rcu_dereference(*slot) != expected_old) {
 		FT_COW_RTAKE(MOVED);
 		t->acquire_miss = true;	/* moved before we held it: re-plan */
+		FT_MISS_NOTE(t, __func__, __LINE__);
 		return -EAGAIN;
 	}
 	return 0;
@@ -17030,6 +17120,7 @@ void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 				fprintf(stderr, "  ...from %s:%d\n", fn, line);
 #endif
 			t->acquire_miss = true;
+			FT_MISS_NOTE(t, fn, line);
 			if (exit_ret)
 				*exit_ret = FT_LOG_EXIT_MISS;
 			goto guard;
@@ -17108,6 +17199,7 @@ void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 		 * shape identical between the hit and miss paths.
 		 */
 		t->acquire_miss = true;
+		FT_MISS_NOTE(t, fn, line);
 		if (exit_ret)
 			*exit_ret = FT_LOG_EXIT_MISS;
 		/*

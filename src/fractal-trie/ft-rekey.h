@@ -7968,6 +7968,7 @@ cells_done:
 		if (cds_ft_fault_commit_countdown == 0) {
 			cds_ft_fault_commit_countdown = -1;
 			txn->acquire_miss = true;
+			FT_MISS_NOTE(txn, __func__, __LINE__);
 		} else {
 			cds_ft_fault_commit_countdown--;
 		}
