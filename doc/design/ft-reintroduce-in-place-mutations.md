@@ -456,14 +456,26 @@ see the commit message for the leg table.
 
 ### 6.5 Open
 
-- **The DELETE tier** (`ft_detach_node`'s `@in_place` from the point removes)
-  is still `ft_in_place_excl_ok`. Its stores are records, arbitrated on the
-  holder's state word by the fused `nr_child--` CAS, so the conversion is a
-  predicate flip plus its own validation step. The first widening attempt (all
-  tiers at once) showed what that step must look at: a duplicate-chain walk
-  into freed memory in `inv_concurrent_same_key_removes` at exponential spacing
-  and a lost key in `inv_sibling_split_compress_unpinned` — neither reproduced
-  once the delete tier was held back, so they belong to that step.
+- ☑ **The DELETE tier LANDED on 2026-09-16** (the text that stood here said it
+  was still `ft_in_place_excl_ok`; it was not updated when the tier landed).
+  The three point-remove `ft_detach_node` calls pass `ft_in_place_ok(ft)`.  The
+  first widening attempt's two failures -- a duplicate-chain walk into freed
+  memory in `inv_concurrent_same_key_removes` at exponential spacing, and a
+  lost key in `inv_sibling_split_compress_unpinned` -- were root-caused before
+  it landed: a NULL plan expected-old the equality guard could not see and an
+  in-place arm that re-read the contended slot; a TORN (parent word, slot
+  offset) pair that made the delete clear a slot OUTSIDE the node it
+  decremented (refused per climb level); three NULL dereferences on stale
+  plans (`36354d84`); and the duplicate walk ignoring engine proxies.  The
+  lock-set inventory then made the pure leaf delete lock its holder before
+  reading the plan (`7e4e9d15`).
+  RE-VALIDATED 2026-09-23 on the in-place build (+ the SW stale-old audit and
+  lock detectors, THP off), with each test repeated in-process and pinned to 2
+  cpus with 2 competing spinners: 16 fine-locking concurrent tests x 550
+  repetitions at per-node AND at root-only -- 0 red, 0 detector signals; and
+  `inv_sibling_split_compress_unpinned`, unpinned, 275 repetitions per spacing
+  -- 0 lost, 0 transient at all three (pinned it trips its own per-writer
+  liveness assertion, also 0 lost).
 - The bulk reserves and the build-path wrapper stay exclusive-only; each needs
   its own lock-before-write before `ft_in_place_excl_ok` can retire.
 - The default build still compiles the tier out. Flipping
