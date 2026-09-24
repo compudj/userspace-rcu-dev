@@ -13267,7 +13267,7 @@ take:
 				 * covering hold's release may be recorded in
 				 * ANY frame's registry.
 				 */
-				for (hs__ = &ctx->held; hs__;
+				for (hs__ = ctx ? &ctx->held : NULL; hs__;
 						hs__ = hs__->outer) {
 					struct urcu_txn_desc *d__ =
 						hs__->txn ?
