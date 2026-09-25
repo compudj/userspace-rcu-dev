@@ -83,7 +83,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(133 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense */
+#define NR_TESTS	(134 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -14005,6 +14005,239 @@ static int inv_prefix_key_park_vs_holder_churn(void)
 
 /* ================================================================== */
 /*                                                                    */
+/*   A key and its ONE-BYTE EXTENSION, the shorter one under a        */
+/*   COMPRESSED holder                                                */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Two writers own one key each: P, and K = P plus one byte.  P ends a long
+ * single-child run, so its holder is a COMPRESSED node (P is cn->child).  An
+ * insert of K converts P into the prefix head of a fresh junction published
+ * into that slot (ft_insert_compressed_past_child); a remove of K folds it
+ * back.  A remove of P that took its position -- P at cn->child -- before
+ * that conversion and read the slot again after it saw the junction as "the
+ * detached child", promoted its external head (P itself, the key being
+ * removed) into the boundary slot and retired the junction with K inside:
+ * K lost, a removed P left reachable.  The inverse race (P back in the same
+ * slot by the time the remove re-checks) refused a present P as NOT_FOUND.
+ *
+ * Found by the DNS-name bench: "...churn041998.zone46" lost to a concurrent
+ * remove of "...churn041998.zone4".  The doc/design/ft-stale-disposal-rig.c
+ * two-key case ("ab" / "aba") never reaches it: keys that short form no
+ * compressed run, so the holder is never compressed.
+ *
+ * Oracles, all owner-only (no peer touches a writer's key): an insert that
+ * reported OK must be findable as the writer's own node; the owner's remove
+ * of its present key must return OK.
+ */
+#define PREFIX_PAIR_PAIRS_MAX	4	/* one P writer + one K writer each */
+#define PREFIX_PAIR_RUN		24	/* bytes of P: the compressed run + 1 */
+#define PREFIX_PAIR_MS		1000
+#define PREFIX_PAIR_STABLE	10	/* untouched keys under other root bytes */
+static unsigned long prefix_pair_lost, prefix_pair_refused, prefix_pair_stale;
+struct prefix_pair_arg {
+	struct cds_ft *ft;
+	unsigned int w;
+	int extension;
+	unsigned long ops;
+};
+
+static size_t prefix_pair_key(uint8_t *key, unsigned int w, int extension)
+{
+	static const char run[PREFIX_PAIR_RUN] = "-compressed-holder-runs";
+	size_t len;
+
+	key[0] = (uint8_t) (0x60 + w);	/* one root byte per pair */
+	memcpy(key + 1, run, PREFIX_PAIR_RUN - 1);
+	len = PREFIX_PAIR_RUN;
+	if (extension)
+		key[len++] = '6';
+	return len;
+}
+
+static void *prefix_pair_writer(void *arg)
+{
+	struct prefix_pair_arg *a = (struct prefix_pair_arg *) arg;
+	struct cds_ft_iter *iter;
+	uint8_t key[PREFIX_PAIR_RUN + 1];
+	size_t klen = prefix_pair_key(key, a->w, a->extension);
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(a->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		rcu_quiescent_state();
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		struct ft_test_node *n = node_alloc(a->w);
+		struct cds_ft_node *out = NULL;
+		enum cds_ft_status st;
+
+		/* An EAGER group: no speculative key copy, so @okey stays unused
+		 * (and at 8 bytes could not hold this key anyway). */
+		n->value = klen;
+		struct cds_ft_node *res = NULL;
+
+		/*
+		 * UNIQUE, and STOP at the first failure: the key is this
+		 * writer's alone and absent here, so a plain insert over a
+		 * leftover node would chain a DUPLICATE -- a different code
+		 * path this test does not mean to drive -- and every oracle
+		 * after that is about the duplicate, not the race.
+		 */
+		rcu_read_lock();
+		st = cds_ft_insert_unique(a->ft, key, klen, &n->node, &res);
+		rcu_read_unlock();
+		if (st != CDS_FT_STATUS_OK) {
+			node_free(n);
+			uatomic_inc(&prefix_pair_lost);	/* own absent key refused */
+			break;
+		}
+		rcu_read_lock();
+		if (cds_ft_eager_lookup_key(a->ft, key, klen, 0, &out)
+				!= CDS_FT_STATUS_OK || out != &n->node) {
+			rcu_read_unlock();
+			uatomic_inc(&prefix_pair_lost);
+			break;
+		}
+		cds_ft_iter_set_key(iter, key, klen);
+		if (cds_ft_lookup(a->ft, iter) != CDS_FT_STATUS_OK ||
+				cds_ft_iter_node(iter) != &n->node ||
+				cds_ft_remove(a->ft, iter, &n->node)
+					!= CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			uatomic_inc(&prefix_pair_refused);
+			break;
+		}
+		/*
+		 * A removed node must not stay reachable: not under its own key,
+		 * and not RESURRECTED as the peer's key -- the peer's collapse
+		 * promoting a head the peer already removed.  The removal mark
+		 * and the unlink commit in one flip, so a lookup that STARTS
+		 * after the mark is visible cannot legitimately return the
+		 * node.  The first lookup of the peer's key is no such lookup:
+		 * the peer's own remove may commit between it and the mark
+		 * load, so a marked node found there is only a candidate, and
+		 * it is confirmed by a second lookup.
+		 */
+		{
+			uint8_t pk[PREFIX_PAIR_RUN + 1];
+			size_t pkl = prefix_pair_key(pk, a->w, !a->extension);
+			struct cds_ft_node *o2 = NULL, *o3 = NULL;
+
+			if ((cds_ft_eager_lookup_key(a->ft, key, klen, 0, &o2)
+					== CDS_FT_STATUS_OK && o2 == &n->node) ||
+			    (cds_ft_eager_lookup_key(a->ft, pk, pkl, 0, &o2)
+					== CDS_FT_STATUS_OK && o2 &&
+					((uintptr_t) CMM_LOAD_SHARED(o2->next) &
+						CDS_FT_NODE_REMOVED_FLAG) &&
+					cds_ft_eager_lookup_key(a->ft, pk, pkl, 0,
+						&o3) == CDS_FT_STATUS_OK &&
+					o3 == o2)) {
+				rcu_read_unlock();
+				uatomic_inc(&prefix_pair_stale);
+				break;
+			}
+		}
+		node_free_rcu(n);
+		rcu_read_unlock();
+		a->ops++;
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_prefix_pair_compressed_holder(void)
+{
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft_ws(&group, &ws);
+	pthread_t th[PREFIX_PAIR_PAIRS_MAX * 2];
+	struct prefix_pair_arg a[PREFIX_PAIR_PAIRS_MAX * 2];
+	const char *env = getenv("FT_INV_PREFIX_PAIR_MS");
+	const char *penv = getenv("FT_INV_PREFIX_PAIR_PAIRS");
+	unsigned long long ms = env ? strtoull(env, NULL, 10) : PREFIX_PAIR_MS;
+	unsigned int pairs = penv ? (unsigned int) atoi(penv) : 1;
+	struct timespec t0;
+	unsigned int i;
+	unsigned long total = 0;
+	int ret = 0;
+
+	prefix_pair_lost = 0;
+	prefix_pair_refused = 0;
+	prefix_pair_stale = 0;
+	/*
+	 * Stable keys under OTHER root bytes, never touched: with the pair
+	 * alone in the trie the root carries nothing else (the rig this
+	 * reproduces also seeds stable keys).
+	 */
+	for (i = 0; i < PREFIX_PAIR_STABLE; i++) {
+		uint8_t sk[8] = { (uint8_t) (0x30 + i), 's', 't', 'a', 'b', 'l', 'e', 0 };
+		struct ft_test_node *n = node_alloc(8000 + i);
+
+		n->value = sizeof(sk);
+		if (cds_ft_insert(ft, sk, sizeof(sk), &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	if (pairs < 1 || pairs > PREFIX_PAIR_PAIRS_MAX)
+		pairs = 1;
+	for (i = 0; i < pairs * 2; i++) {
+		a[i].ft = ft;
+		a[i].w = i / 2;
+		a[i].extension = (int) (i % 2);
+		a[i].ops = 0;
+		pthread_create(&th[i], NULL, prefix_pair_writer, &a[i]);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < ms)
+		rcu_quiescent_state();
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	rcu_thread_offline();
+	for (i = 0; i < pairs * 2; i++) {
+		pthread_join(th[i], NULL);
+		total += a[i].ops;
+	}
+	rcu_thread_online();
+
+	fprintf(stderr, "# inv_prefix_pair_compressed_holder: %lu ops, %lu lost "
+		"inserts, %lu refused removes, %lu removed nodes reachable\n",
+		total, prefix_pair_lost, prefix_pair_refused, prefix_pair_stale);
+	if (prefix_pair_lost || prefix_pair_refused || prefix_pair_stale) {
+		fprintf(stderr, "inv_prefix_pair_compressed_holder: %lu insert(s) "
+			"reported OK but the key was not its own node, %lu remove(s) "
+			"of a present key refused, %lu removed node(s) still "
+			"reachable\n", prefix_pair_lost, prefix_pair_refused,
+			prefix_pair_stale);
+		ret = -1;
+	}
+	/* A run that did no work proves nothing; say so rather than pass. */
+	if (total == 0) {
+		fprintf(stderr, "inv_prefix_pair_compressed_holder: no ops\n");
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_prefix_pair_compressed_holder: verify "
+			"failed\n");
+		ret = -1;
+	}
+	drain_trie_keep_group(ft);
+	rcu_barrier();
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+
+/* ================================================================== */
+/*                                                                    */
 /*   TWO graft_swaps exchanging at ONE destination position           */
 /*                                                                    */
 /* ================================================================== */
@@ -27203,6 +27436,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_insert_unique_nolist);
 	RUN_TEST(inv_concurrent_insert_unique_coarse);
 	RUN_TEST(inv_concurrent_insert_unique_dense);
+	RUN_TEST(inv_prefix_pair_compressed_holder);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);

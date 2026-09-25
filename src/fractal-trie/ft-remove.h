@@ -7716,6 +7716,141 @@ bool ft_rm_holder_rehomed(struct cds_ft *ft, const struct cds_ft_node *node,
 }
 
 /*
+ * The other transient miss: the slot came BACK.  @fresh == @holder_flag says
+ * "not re-homed", but it cannot tell a miss from an ABA on the slot itself.
+ * A peer insert of a key EXTENDING @node republishes @head_slot with a junction
+ * carrying @node as its prefix head; that peer's remove then collapses the
+ * junction and puts @node back into the SAME holder's slot.  An identity read
+ * that landed in between saw the junction, and the back edge -- re-pointed and
+ * restored by those two commits -- names @holder_flag again.  @node never left
+ * the trie.  MEASURED: two writers toggling "...zone46" / "...zone4" through a
+ * compressed holder, 3 of 5 runs refused the live "...zone4" here within 10 s.
+ *
+ * A live @node back in @head_slot is a retry, charged to the peer's two
+ * committed writes; a removed one is still the real miss.  A NULL @head_slot
+ * -- the body arm's byte had no slot at all -- has nothing to come back to.
+ *
+ * ☠ AND ONLY IN A LIVE HOLDER.  A RETIRED holder's slots keep whatever they
+ * held when it was retired, so its slot "holds @node" forever: a remove
+ * bootstrapped from a stale back edge naming that corpse would retry on it
+ * without end (MEASURED: a lost "...zone46" whose remove spun alone at 100%
+ * CPU after its peer exited).  ft_rm_holder_rehomed already calls a
+ * tombstoned holder the real miss; this must agree with it.
+ */
+static inline
+bool ft_rm_slot_regained(const struct cds_ft *ft, const struct cds_ft_node *node,
+		struct cds_ft_inode_flag *holder_flag,
+		struct cds_ft_inode_flag **head_slot)
+{
+#ifdef FT_DEBUG_NO_SLOT_REGAINED
+	(void) ft; (void) node; (void) holder_flag; (void) head_slot;
+	return false;
+#else
+	if (!head_slot || ft_node_is_removed((struct cds_ft_node *) node) ||
+			ft_flag_tombstoned(ft, holder_flag))
+		return false;
+	return (const struct cds_ft_node *) ft_node_ptr(ft_resolve_flip_proxy(
+			rcu_dereference(*head_slot))) == node;
+#endif
+}
+
+/*
+ * ☠ A MISS IS CONFIRMED UNDER THE HOLDER'S LOCK.  The identity compare and the
+ * two predicates above are UNLOCKED reads, each answered at its own instant,
+ * and a peer toggling a key that EXTENDS @node can answer each one from a
+ * different tree: the compare sees the peer's junction in the slot, the back
+ * edge (read next) sees that junction already collapsed and @node back under
+ * @holder_flag, and the slot (read last) sees the peer's NEXT junction.  Three
+ * self-consistent reads, one wrong verdict: NOT_FOUND for a key that never left
+ * the trie (MEASURED: 5 of 32 two-writer runs, "...runs" vs "...runs6" through
+ * one compressed holder, refused the live "...runs" at the compressed arm; a
+ * lookup found it both before the remove and after the refusal).
+ *
+ * THE AUTHORITY IS THE KEY'S SLOT IN THE HOLDER, READ UNDER ITS LOCK -- not
+ * @node's back edge, which is updated LAZILY and can name a RETIRED holder
+ * while the forward path still reaches @node (the STALE BACK-EDGE arm in
+ * _cds_ft_remove_locked).  Holding @lock_flag's lock, the slot cannot move:
+ *
+ *  - it holds @node again                     -> retry (the slot came back);
+ *  - it holds an INTERNAL node (skip-encoded  -> retry: the key now goes
+ *    included: a skip word's low bits read       DEEPER, through a junction
+ *    as external, so ask that first)             a peer published here, and
+ *                                                 @node may hang below it;
+ *  - it is empty, or holds a DIFFERENT leaf   -> @node is not at its key's
+ *                                                 position: the miss is real,
+ *    unless the back edge names a LIVE other holder (a re-home this compare
+ *    cannot see), which is a retry.
+ *
+ * The slot is re-derived under the lock (@key_byte, or the compressed
+ * @lock_flag's child when negative): a packed body shifts its slots in place,
+ * so a pre-lock slot address is itself a plan read.  Taken and dropped here,
+ * with nothing built or reserved: this is not the op-wide hold measured and
+ * refuted above.
+ *
+ * Returns true when the op must retry.
+ */
+static inline
+bool ft_rm_miss_unconfirmed(struct cds_ft *ft, const struct ft_lock_ctx *lctx,
+		const struct cds_ft_node *node,
+		struct cds_ft_inode_flag *holder_flag,
+		struct cds_ft_inode_flag *lock_flag,
+		struct cds_ft_metadata *lock_meta, unsigned int holder_depth,
+		int key_byte)
+{
+#ifdef FT_DEBUG_NO_MISS_UNDER_LOCK
+	(void) ft; (void) lctx; (void) node; (void) holder_flag;
+	(void) lock_flag; (void) lock_meta; (void) holder_depth; (void) key_byte;
+	return false;
+#else
+	struct ft_held_anchor h = { 0 };
+	struct cds_ft_inode_flag *cur, **slot = NULL, *fresh;
+	bool retry;
+
+	if (!ft->lock_fine ||
+			ft_node_is_removed((struct cds_ft_node *) node))
+		return false;
+	/*
+	 * A RETIRED holder decides nothing: its slots keep what they held, and
+	 * @node may live on in its replacement behind a back edge that is only
+	 * LAZILY updated.  Re-derive: the retry's STALE BACK-EDGE arm descends
+	 * for the live holder by key, and a miss is then confirmed under THAT
+	 * holder's lock -- a live word, so the retry terminates.
+	 */
+	if (ft_flag_tombstoned(ft, lock_flag))
+		return true;
+	/*
+	 * Refused: a peer holds the word, or retired it after the test above.
+	 * Either way the tree is moving under the verdict: re-derive.
+	 */
+	if (ft_acquire_member(ft, lctx, lock_flag, lock_meta, holder_depth, &h))
+		return true;
+	if (ft_node_is_removed((struct cds_ft_node *) node)) {
+		retry = false;
+	} else {
+		if (key_byte < 0)
+			cur = ft_compressed_node_ptr(lock_flag)->child;
+		else
+			cur = ft_node_get_nth_skip(holder_flag, &slot,
+				(uint8_t) key_byte, FT_PF_NONE);
+		cur = ft_resolve_flip_proxy(cur);
+		if (cur && (ft_node_skip_compressed(cur) ||
+				!ft_node_external(cur) ||
+				(const struct cds_ft_node *) ft_node_ptr(cur) ==
+					node)) {
+			retry = true;
+		} else {
+			fresh = ft_node_holder(ft, (struct cds_ft_node *) node);
+			retry = fresh && fresh != holder_flag &&
+				!ft_flag_tombstoned(ft, fresh);
+		}
+	}
+	if (!h.shared && !h.txn_owned)
+		ft_meta_lock_release(h.lock);
+	return retry;
+#endif
+}
+
+/*
  * Drop the hoisted holder mark on every exit of _cds_ft_remove_locked.
  * ☞ The arms DEDUPE against it (ft_dlm_acquire_set_at -> ft_lock_ctx_holds)
  * rather than taking their own, so no arm's commit terminal releases it -- this
@@ -8552,7 +8687,13 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * See ft_rm_holder_rehomed: the liveness test is what
 			 * makes this terminate where the bare double-read spun.
 			 */
-			if (ft_rm_holder_rehomed(ft, node, holder_flag)) {
+			if (ft_rm_holder_rehomed(ft, node, holder_flag) ||
+					ft_rm_slot_regained(ft, node, holder_flag,
+						head_slot) ||
+					ft_rm_miss_unconfirmed(ft, &lctx, node,
+						holder_flag,
+						ft_compressed_node_flag(cn),
+						holder_meta, holder_depth, -1)) {
 				FT_DBG_RETRY_SITE();
 				*need_retry = true;
 				FT_RM_RELEASE();
@@ -8805,7 +8946,13 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * See ft_rm_holder_rehomed: the liveness test is what
 			 * makes this terminate where the bare double-read spun.
 			 */
-			if (ft_rm_holder_rehomed(ft, node, holder_flag)) {
+			if (ft_rm_holder_rehomed(ft, node, holder_flag) ||
+					ft_rm_slot_regained(ft, node, holder_flag,
+						head_slot) ||
+					ft_rm_miss_unconfirmed(ft, &lctx, node,
+						holder_flag, holder_flag,
+						holder_meta, holder_depth,
+						iter_key[key_len - 1])) {
 				FT_DBG_RETRY_SITE();
 				*need_retry = true;
 				FT_RM_RELEASE();
@@ -9597,10 +9744,30 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		chain_head = iter->node;
 	if (!chain_head) {
 		enum cds_ft_status s = (*ft->lookup_iter_fn)(ft, iter);
+		bool found = s == CDS_FT_STATUS_OK && iter->node;
 
-		if (s != CDS_FT_STATUS_OK || !iter->node ||
-		    !ft_locate_chain_head(ft, iter->node, iter_key, key_len,
-			    &holder_flag, &head_slot, &is_prefix)) {
+		if (!found || !ft_locate_chain_head(ft, iter->node, iter_key,
+				key_len, &holder_flag, &head_slot, &is_prefix)) {
+			/*
+			 * ☠ FOUND, THEN NOT LOCATED, IS NOT A MISS.  The lookup
+			 * just reached a live head; ft_locate_chain_head then
+			 * re-derives its position from two more UNHELD reads
+			 * (the back edge, then the holder's slot), and a peer
+			 * re-home between them -- an insert of a key extending
+			 * this one republishing the slot with a junction that
+			 * carries the head -- makes them disagree.  That is the
+			 * identity-bail shape _cds_ft_remove_locked confirms
+			 * under the holder's lock (ft_rm_miss_unconfirmed);
+			 * here nothing is held yet, so re-derive the attempt.
+			 */
+#ifndef FT_DEBUG_RA_LOCATE_MISS
+			if (found && !ft_node_is_removed(iter->node)) {
+				*result_node = NULL;
+				FT_DBG_RETRY_SITE();
+				*need_retry = true;
+				return CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+			}
+#endif
 			*result_node = NULL;
 #if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 			ft_dbg_rm_site = __LINE__;
