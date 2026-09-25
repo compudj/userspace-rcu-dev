@@ -83,7 +83,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(135 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder */
+#define NR_TESTS	(136 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -14293,6 +14293,149 @@ static int inv_prefix_siblings_compressed_holder(void)
 	return prefix_pair_run("inv_prefix_siblings_compressed_holder", true);
 }
 
+/*
+ * Same-key cds_ft_insert_unique racing at a PREFIX position: the key ends at
+ * an existing internal node (P, with P+'A' and P+'B' kept present below it)
+ * that has no head yet, so every insert takes the "new key at this internal
+ * node" arm and parks into that node's external_nodes.  The arm is chosen from
+ * an UNHELD read of external_nodes == NULL; if the park does not re-check it
+ * under the holder's lock, two writers both see NULL, the second overwrites
+ * the first's head, and BOTH report OK (the prefix-key twin of the pigeon
+ * FENCED ADD race inv_concurrent_insert_unique_dense covers for leaf slots --
+ * whose fixed 8-byte keys never end at an internal node).
+ *
+ * Oracle, owner-only: an insert_unique that reported OK must find its OWN node
+ * under the key, and its owner's remove must succeed.
+ */
+#define UNIQUE_PREFIX_WRITERS	4
+static unsigned long unique_prefix_lost;
+struct unique_prefix_arg {
+	struct cds_ft *ft;
+	unsigned int id;
+	unsigned long ops;
+};
+
+static void *unique_prefix_writer(void *arg)
+{
+	struct unique_prefix_arg *a = (struct unique_prefix_arg *) arg;
+	struct cds_ft_iter *iter;
+	uint8_t key[PREFIX_PAIR_RUN + 1];
+	size_t klen = prefix_pair_key(key, 0, 0);
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(a->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		rcu_quiescent_state();
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		struct ft_test_node *n = node_alloc(a->id);
+		struct cds_ft_node *res = NULL, *out = NULL;
+		enum cds_ft_status st;
+
+		n->value = klen;
+		rcu_read_lock();
+		st = cds_ft_insert_unique(a->ft, key, klen, &n->node, &res);
+		if (st != CDS_FT_STATUS_OK) {
+			/* A peer holds the key: never published, ours to free. */
+			rcu_read_unlock();
+			node_free(n);
+			rcu_quiescent_state();
+			continue;
+		}
+		cds_ft_iter_set_key(iter, key, klen);
+		if (cds_ft_eager_lookup_key(a->ft, key, klen, 0, &out)
+				!= CDS_FT_STATUS_OK || out != &n->node ||
+				cds_ft_lookup(a->ft, iter) != CDS_FT_STATUS_OK ||
+				cds_ft_iter_node(iter) != &n->node ||
+				cds_ft_remove(a->ft, iter, &n->node)
+					!= CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			uatomic_inc(&unique_prefix_lost);
+			break;
+		}
+		node_free_rcu(n);
+		rcu_read_unlock();
+		a->ops++;
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_concurrent_insert_unique_prefix(void)
+{
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft_ws(&group, &ws);
+	pthread_t th[UNIQUE_PREFIX_WRITERS];
+	struct unique_prefix_arg a[UNIQUE_PREFIX_WRITERS];
+	const char *env = getenv("FT_INV_PREFIX_PAIR_MS");
+	unsigned long long ms = env ? strtoull(env, NULL, 10) : PREFIX_PAIR_MS;
+	struct timespec t0;
+	unsigned long total = 0;
+	unsigned int i;
+	int ret = 0;
+
+	unique_prefix_lost = 0;
+	/* P+'A' and P+'B': P's position is an internal junction, no head. */
+	for (i = 0; i < 2; i++) {
+		uint8_t k[PREFIX_PAIR_RUN + 1];
+		size_t kl = prefix_pair_key(k, 0, 0);
+		struct ft_test_node *n = node_alloc(9100 + i);
+
+		k[kl++] = (uint8_t) ('A' + i);
+		n->value = kl;
+		if (cds_ft_insert(ft, k, kl, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < UNIQUE_PREFIX_WRITERS; i++) {
+		a[i].ft = ft;
+		a[i].id = i;
+		a[i].ops = 0;
+		pthread_create(&th[i], NULL, unique_prefix_writer, &a[i]);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < ms)
+		rcu_quiescent_state();
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	rcu_thread_offline();
+	for (i = 0; i < UNIQUE_PREFIX_WRITERS; i++) {
+		pthread_join(th[i], NULL);
+		total += a[i].ops;
+	}
+	rcu_thread_online();
+
+	fprintf(stderr, "# inv_concurrent_insert_unique_prefix: %lu ops, "
+		"%lu lost\n", total, unique_prefix_lost);
+	if (unique_prefix_lost) {
+		fprintf(stderr, "inv_concurrent_insert_unique_prefix: %lu "
+			"insert_unique(s) reported OK but the key was not the "
+			"writer's own node, or its remove failed\n",
+			unique_prefix_lost);
+		ret = -1;
+	}
+	if (total == 0) {
+		fprintf(stderr, "inv_concurrent_insert_unique_prefix: no ops\n");
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_concurrent_insert_unique_prefix: verify "
+			"failed\n");
+		ret = -1;
+	}
+	drain_trie_keep_group(ft);
+	rcu_barrier();
+	cds_ft_group_destroy(group);
+	return ret;
+}
 
 /* ================================================================== */
 /*                                                                    */
@@ -27496,6 +27639,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_insert_unique_dense);
 	RUN_TEST(inv_prefix_pair_compressed_holder);
 	RUN_TEST(inv_prefix_siblings_compressed_holder);
+	RUN_TEST(inv_concurrent_insert_unique_prefix);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);

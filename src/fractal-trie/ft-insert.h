@@ -1279,16 +1279,26 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
  * ft_dereference_external -- and the structural publish then commits atomically
  * with the ordinal-cell splice at the single MCAS flip commit.  No transient
  * half-spliced list state.  Settles direct (publish_to_parent false: there is
- * no parent child-slot to re-encode).  @ic must be armed.  Records old ==
- * @metadata->external_nodes read here, so it serves BOTH the fresh-key case
- * (old == NULL: a reader resolves the proxy to "no head" until the commit) AND
- * the chain-replace case (old == the chain being replaced -> @node).
+ * no parent child-slot to re-encode).  @ic must be armed.  @plan_old is the
+ * value the caller's arm was CHOSEN on: NULL for a fresh key (a reader resolves
+ * the proxy to "no head" until the commit), or the chain being replaced.
+ *
+ * ☠ THE PLAN VALUE IS CHECKED UNDER THE HOLDER'S LOCK, not re-read into the
+ * record.  The caller read @metadata->external_nodes with nothing held and
+ * picked its arm from it; recording the POST-lock value as the expected-old
+ * pinned nothing, and the record is a blind SW store once the holder is held
+ * anyway.  Two same-key inserts ending at one internal node both saw NULL,
+ * the first parked its head, the second overwrote it -- both reported OK,
+ * the first head and its cell orphaned (the prefix-key twin of the pigeon
+ * FENCED ADD, 0187c60c).  Returns -EAGAIN (re-descend) when the value under
+ * the lock is not @plan_old; the caller's done handler destroys ic->txn,
+ * which releases the holder.
  */
 static
-void ft_insert_park_external_nodes(struct cds_ft *ft,
+int ft_insert_park_external_nodes(struct cds_ft *ft,
 		const struct ft_descent *d,
 		struct cds_ft_metadata *metadata, struct cds_ft_node *node,
-		struct ft_insert_commit *ic)
+		struct cds_ft_node *plan_old, struct ft_insert_commit *ic)
 {
 	struct ft_lock_ctx lctx;
 
@@ -1322,11 +1332,16 @@ void ft_insert_park_external_nodes(struct cds_ft *ft,
 	ft_lock_ctx_init(&lctx, d, ic->txn, ic->op);
 	ft_flip_txn_lock_or_guard_parent(ft, ic->txn, &lctx, d->nf,
 		FT_DEPTH_FROM_DESCENT);
+#ifndef FT_DEBUG_PARK_NO_PLAN_CHECK
+	if (ft_dereference_external(metadata->external_nodes) != plan_old)
+		return -EAGAIN;
+#endif
 	ft_flip_txn_record_reserved(ic->txn, /*owner=*/ metadata,
 		(void **) &metadata->external_nodes,
-		(void *) metadata->external_nodes, (void *) node);
+		(void *) plan_old, (void *) node);
 	ic->slot = (struct cds_ft_inode_flag **) &metadata->external_nodes;
 	ic->publish_to_parent = false;
+	return 0;
 }
 
 /*
@@ -4163,8 +4178,10 @@ restart_attempt:
 					ft->rank_stats ? d.depth + 2 : 0);
 				if (ret)
 					goto insert_done;
-				ft_insert_park_external_nodes(ft, &d,
-					metadata, node, &ic);
+				ret = ft_insert_park_external_nodes(ft, &d,
+					metadata, node, NULL, &ic);
+				if (ret)
+					goto insert_done;
 				ic.count_from = d.nf;
 				/*
 				 * I1 (list on) / I2 (list off) count fold: @d.nf is
@@ -5446,8 +5463,10 @@ restart_replace_attempt:
 					ft->rank_stats ? d.depth + 2 : 0);
 				if (ret)
 					goto insert_replace_done;
-				ft_insert_park_external_nodes(ft, &d,
-					metadata, node, &ic);
+				ret = ft_insert_park_external_nodes(ft, &d,
+					metadata, node, NULL, &ic);
+				if (ret)
+					goto insert_replace_done;
 				ic.count_from = d.nf;
 				/* I1 (list on) / I2 (list off) count fold: see cds_ft_insert. */
 				ic.count_folded = true;
