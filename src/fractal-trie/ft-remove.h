@@ -6336,6 +6336,11 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			lctx.held.txn = NULL;
 			lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
+#ifndef FT_DEBUG_NO_FOLD_RENAME
+			if (wd_valid && old_recompacted_node)
+				ft_descent_rename(&wd, old_recompacted_node,
+					iter_node_flag);
+#endif
 			ft_canonicalize_chain_compress(ft, iter_node_flag,
 				cur_depth, &lctx, iter_meta);
 		}

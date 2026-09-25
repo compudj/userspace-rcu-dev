@@ -636,6 +636,45 @@ void ft_descent_anchor_validate(const struct ft_descent *d __attribute__((unused
  * table never saw, and such a caller must extend the descent rather than reach
  * deeper from here.
  */
+/*
+ * ft_descent_rename: @d was taken BEFORE this op's own commit, and that commit
+ * replaced @old by its recompacted copy @new_flag at the same position (same
+ * parent slot, same byte span).  Make @d describe the tree the commit left:
+ * every anchor entry and path node naming @old names @new_flag.
+ *
+ * ☠ WITHOUT IT A POST-COMMIT SECOND FLIP ANCHORS ON A RETIRED NODE.  Under a
+ * coarse spacing a member's lock is the anchor its descent recorded for the
+ * member's level; after the commit that anchor is the retired @old, whose word
+ * the op still counts as its own, so the second flip's acquire dedupes onto a
+ * dead word and takes nothing.  A peer descending the live tree anchors the
+ * same member on @new_flag and locks it: two ops, two words, one node -- they
+ * exclude nothing.  See ft_detach_node's post-detach canonicalize.
+ */
+static inline
+void ft_descent_rename(struct ft_descent *d, const struct cds_ft_inode *old,
+		struct cds_ft_inode_flag *new_flag)
+{
+	unsigned int i;
+
+#define FT_DESCENT_RENAME(f)						\
+	do {								\
+		if ((f) && !ft_node_external(f) &&			\
+		    !ft_node_skip_compressed(f) &&			\
+		    (const struct cds_ft_inode *) ft_node_ptr(f) == old)	\
+			(f) = new_flag;					\
+	} while (0)
+	for (i = 0; i < FT_LOCK_LEVEL_MAX; i++) {
+		FT_DESCENT_RENAME(d->anchor[i].cover);
+		FT_DESCENT_RENAME(d->anchor[i].bound);
+	}
+	FT_DESCENT_RENAME(d->nf);
+	FT_DESCENT_RENAME(d->nf_raw);
+	FT_DESCENT_RENAME(d->pnf);
+	FT_DESCENT_RENAME(d->ppnf);
+	FT_DESCENT_RENAME(d->pppnf);
+#undef FT_DESCENT_RENAME
+}
+
 static inline
 struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
 		struct cds_ft_inode_flag *nf, unsigned int depth)
