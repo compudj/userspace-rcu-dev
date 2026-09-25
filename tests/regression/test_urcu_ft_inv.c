@@ -14476,6 +14476,9 @@ struct zoo_arg {
 	size_t nr_grave, cap_grave;
 };
 
+/* FT_INV_ZOO_WIN_MS: writers park here while the main thread verifies. */
+static int zoo_pause, zoo_paused;
+
 static void zoo_bury(struct zoo_arg *a, struct cds_ft_node *n)
 {
 	if (a->nr_grave == a->cap_grave) {
@@ -14535,6 +14538,15 @@ static void *zoo_writer(void *arg)
 		rcu_quiescent_state();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	while (!test_stop) {
+		if (uatomic_read(&zoo_pause)) {
+			uatomic_inc(&zoo_paused);
+			rcu_thread_offline();
+			while (uatomic_read(&zoo_pause) && !test_stop)
+				caa_cpu_relax();
+			rcu_thread_online();
+			uatomic_dec(&zoo_paused);
+			continue;
+		}
 		unsigned int r = rand_r(&a->seed);
 		size_t klen = zoo_key(key, r & 1, (r >> 1) % ZOO_KEYS);
 		enum zoo_op op = (enum zoo_op) ((r >> 8) % ZOO_NR_OPS);
@@ -14656,6 +14668,39 @@ static int inv_prefix_shape_zoo(void)
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	test_go = 1;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
+	/*
+	 * FT_INV_ZOO_WIN_MS: verify every WIN ms, writers parked, and abort at
+	 * the first failing window -- the damage is then at most one window
+	 * old, which is what a flight-recorder snapshot needs to still hold its
+	 * producer.  Without it the run is verified once, at the join.
+	 */
+	if (getenv("FT_INV_ZOO_WIN_MS")) {
+		unsigned long long win = strtoull(getenv("FT_INV_ZOO_WIN_MS"),
+			NULL, 10);
+		unsigned long nwin = 0;
+
+		while (elapsed_ms(&t0) < ms) {
+			struct timespec tw;
+
+			clock_gettime(CLOCK_MONOTONIC, &tw);
+			while (elapsed_ms(&tw) < win)
+				rcu_quiescent_state();
+			uatomic_set(&zoo_pause, 1);
+			while (uatomic_read(&zoo_paused) != ZOO_WRITERS)
+				rcu_quiescent_state();
+			nwin++;
+			if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "inv_prefix_shape_zoo: window %lu failed verify\n",
+					nwin);
+				abort();
+			}
+			uatomic_set(&zoo_pause, 0);
+			while (uatomic_read(&zoo_paused) != 0)
+				rcu_quiescent_state();
+		}
+		fprintf(stderr, "# inv_prefix_shape_zoo: %lu windows verified\n",
+			nwin);
+	} else
 	while (elapsed_ms(&t0) < ms)
 		rcu_quiescent_state();
 	test_stop = 1;
