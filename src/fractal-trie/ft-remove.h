@@ -7328,6 +7328,32 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 						ft_meta_lock_release(h.lock);
 					return -EAGAIN;
 				}
+				/*
+				 * ☠ THE HEAD SLOT IS A PLAN READ TOO.  The caller
+				 * found @node in @head_slot before this lock, and
+				 * the promote / clear below records that slot with
+				 * @node as its expected-old -- a blind SW store now
+				 * that the holder is HELD.  A peer insert of a key
+				 * extending @node's republishes the slot IN PLACE
+				 * under this very lock (a compressed holder's child
+				 * becomes a junction carrying @node's chain as its
+				 * prefix head), @node itself untouched: the checks
+				 * above all pass, and the promote overwrote the
+				 * junction, the peer's key with it (MEASURED:
+				 * inv_prefix_dup_promote_vs_extension, 16 of 16
+				 * runs).  Re-read it here.
+				 */
+#ifndef FT_DEBUG_NO_HEAD_SLOT_RECHECK
+				if (head_slot && kind != FT_UNCHAIN_INTERIOR &&
+				    (struct cds_ft_node *) ft_node_ptr(
+					ft_resolve_flip_proxy(
+					(struct cds_ft_inode_flag *)
+					rcu_dereference(*head_slot))) != node) {
+					if (!h.shared && !h.txn_owned)
+						ft_meta_lock_release(h.lock);
+					return -EAGAIN;
+				}
+#endif
 			}
 		}
 	}

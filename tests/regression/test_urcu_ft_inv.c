@@ -83,7 +83,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(136 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix */
+#define NR_TESTS	(137 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -14280,6 +14280,9 @@ static int prefix_pair_run(const char *name, bool siblings)
 	drain_trie_keep_group(ft);
 	rcu_barrier();
 	cds_ft_group_destroy(group);
+	/* The drain freed them: no later user of prefix_pair_writer may see one. */
+	for (i = 0; i < PREFIX_PAIR_PAIRS_MAX; i++)
+		prefix_pair_anchor[i] = NULL;
 	return ret;
 }
 
@@ -14291,6 +14294,155 @@ static int inv_prefix_pair_compressed_holder(void)
 static int inv_prefix_siblings_compressed_holder(void)
 {
 	return prefix_pair_run("inv_prefix_siblings_compressed_holder", true);
+}
+
+/*
+ * A duplicate chain's HEAD PROMOTE racing an extension of its key: P keeps two
+ * duplicates, and its writer always removes the chain HEAD, so every remove
+ * promotes the successor into the holder's slot.  With the extension K = P+'6'
+ * absent, that slot is the compressed holder's cn->child; K's writer inserts K
+ * past it, which republishes cn->child IN PLACE with a junction carrying P's
+ * chain as its prefix head.  A promote planned against the old slot must not
+ * overwrite that junction.
+ *
+ * Oracles, owner-only: after each remove the writer's other node heads P; K's
+ * writer runs the prefix-pair oracles (its own node, its own remove).
+ */
+struct dup_promote_arg {
+	struct cds_ft *ft;
+	unsigned long ops;
+};
+
+static void *dup_promote_writer(void *arg)
+{
+	struct dup_promote_arg *a = (struct dup_promote_arg *) arg;
+	struct cds_ft_node *live[2];
+	struct cds_ft_iter *iter;
+	uint8_t key[PREFIX_PAIR_RUN + 1];
+	size_t klen = prefix_pair_key(key, 0, 0);
+	unsigned int i;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(a->ft, &iter) < 0)
+		abort();
+	for (i = 0; i < 2; i++) {
+		struct ft_test_node *n = node_alloc(7000 + i);
+
+		n->value = klen;
+		if (cds_ft_insert(a->ft, key, klen, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+		live[i] = &n->node;
+	}
+	while (!test_go)
+		rcu_quiescent_state();
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		struct cds_ft_node *h, *out = NULL;
+		struct ft_test_node *n;
+		unsigned int idx;
+
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, key, klen);
+		if (cds_ft_lookup(a->ft, iter) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			uatomic_inc(&prefix_pair_lost);
+			break;
+		}
+		h = cds_ft_iter_node(iter);
+		if (h != live[0] && h != live[1]) {
+			rcu_read_unlock();
+			uatomic_inc(&prefix_pair_lost);
+			break;
+		}
+		idx = h == live[0] ? 0 : 1;
+		if (cds_ft_remove(a->ft, iter, h) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			uatomic_inc(&prefix_pair_refused);
+			break;
+		}
+		if (cds_ft_eager_lookup_key(a->ft, key, klen, 0, &out)
+				!= CDS_FT_STATUS_OK || out != live[!idx]) {
+			rcu_read_unlock();
+			uatomic_inc(&prefix_pair_lost);
+			break;
+		}
+		node_free_rcu(to_test_node(h));
+		rcu_read_unlock();
+		n = node_alloc(7002);
+		n->value = klen;
+		if (cds_ft_insert(a->ft, key, klen, &n->node) != CDS_FT_STATUS_OK) {
+			node_free(n);
+			uatomic_inc(&prefix_pair_lost);
+			break;
+		}
+		live[idx] = &n->node;
+		a->ops++;
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_prefix_dup_promote_vs_extension(void)
+{
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_ord_ft_ws(&group, &ws);
+	const char *env = getenv("FT_INV_PREFIX_PAIR_MS");
+	unsigned long long ms = env ? strtoull(env, NULL, 10) : PREFIX_PAIR_MS;
+	struct dup_promote_arg da = { .ft = ft };
+	struct prefix_pair_arg ka = { .ft = ft, .w = 0, .extension = 1,
+		.peer_extension = 0 };
+	pthread_t dt, kt;
+	struct timespec t0;
+	int ret = 0;
+
+	prefix_pair_lost = 0;
+	prefix_pair_refused = 0;
+	prefix_pair_stale = 0;
+	/* P changes hands here: the K writer must not check a fixed anchor. */
+	memset(prefix_pair_anchor, 0, sizeof(prefix_pair_anchor));
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	pthread_create(&dt, NULL, dup_promote_writer, &da);
+	pthread_create(&kt, NULL, prefix_pair_writer, &ka);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < ms)
+		rcu_quiescent_state();
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	rcu_thread_offline();
+	pthread_join(dt, NULL);
+	pthread_join(kt, NULL);
+	rcu_thread_online();
+
+	fprintf(stderr, "# inv_prefix_dup_promote_vs_extension: %lu promotes, "
+		"%lu K ops, %lu lost, %lu refused removes, %lu removed nodes "
+		"reachable\n", da.ops, ka.ops, prefix_pair_lost,
+		prefix_pair_refused, prefix_pair_stale);
+	if (prefix_pair_lost || prefix_pair_refused || prefix_pair_stale) {
+		fprintf(stderr, "inv_prefix_dup_promote_vs_extension: %lu lost, "
+			"%lu refused, %lu stale\n", prefix_pair_lost,
+			prefix_pair_refused, prefix_pair_stale);
+		ret = -1;
+	}
+	if (da.ops == 0 || ka.ops == 0) {
+		fprintf(stderr, "inv_prefix_dup_promote_vs_extension: no ops\n");
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_prefix_dup_promote_vs_extension: verify "
+			"failed\n");
+		ret = -1;
+	}
+	drain_trie_keep_group(ft);
+	rcu_barrier();
+	cds_ft_group_destroy(group);
+	return ret;
 }
 
 /*
@@ -27640,6 +27792,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_prefix_pair_compressed_holder);
 	RUN_TEST(inv_prefix_siblings_compressed_holder);
 	RUN_TEST(inv_concurrent_insert_unique_prefix);
+	RUN_TEST(inv_prefix_dup_promote_vs_extension);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);
