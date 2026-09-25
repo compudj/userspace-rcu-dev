@@ -2050,6 +2050,15 @@ static unsigned long ft_dt_rec_foreign, ft_dt_rec_unowned, ft_dt_rec_swblind;
  * hook runs on the recording op's own stack, so a bucket keyed on the return
  * addresses past the engine frames names the site.  One sample backtrace per
  * bucket; resolve the offsets with addr2line.
+ *
+ * ★ FT_SW_STALE_ABORT=1 in the environment reports the FIRST live stale record
+ * AT DETECTION -- slot, expected-old, live word, new value and the producer's
+ * backtrace -- and aborts.  The per-bucket table is printed by a destructor, so
+ * a run that the defect it records then WEDGES never reports at all: a stale
+ * head-promote record lost a peer's key, the owner's remove of that key spun,
+ * the run timed out, and the audit said nothing.  At detection it named the
+ * record in 5 of 6 such runs (expected-old the removed head, live word the
+ * peer's junction).
  */
 #define FT_SWS_BUCKETS	64
 #define FT_SWS_DEPTH	12
@@ -2131,6 +2140,22 @@ static void ft_sw_stale_check(const struct urcu_txn_record *r)
 		return;
 	}
 	uatomic_inc(&ft_sws_stale);
+	{
+		static int report_now = -1;	/* benign race: same answer */
+
+		if (caa_unlikely(report_now < 0))
+			report_now = getenv("FT_SW_STALE_ABORT") != NULL;
+		if (report_now) {
+			fprintf(stderr, "FT SW STALE-OLD AT DETECTION: slot %p "
+				"expected-old %p live %p%s new %p\n",
+				(void *) r->slot, r->old_ptr, cur,
+				isproxy ? " (a peer's parked proxy)" : "",
+				r->new_ptr);
+			nbt = backtrace(bt, FT_SWS_DEPTH);
+			backtrace_symbols_fd(bt, nbt, 2);
+			abort();
+		}
+	}
 	nbt = backtrace(bt, FT_SWS_DEPTH);
 	for (i = 2; i < (unsigned int) nbt && i < 9; i++)
 		key = key * 1000003UL ^ (unsigned long) (uintptr_t) bt[i];
