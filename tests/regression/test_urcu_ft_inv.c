@@ -14634,6 +14634,10 @@ static int inv_prefix_shape_zoo(void)
 	struct zoo_arg a[ZOO_WRITERS];
 	const char *env = getenv("FT_INV_ZOO_MS");
 	const char *mask_env = getenv("FT_INV_ZOO_OPS");
+	const char *zoo_env = getenv("FT_INV_ZOO");
+	const char *win_env = getenv("FT_INV_ZOO_WIN_MS");
+	/* Default: verify every 5 ms; FT_INV_ZOO_WIN_MS=0 verifies at the join only. */
+	unsigned long long win = win_env ? strtoull(win_env, NULL, 10) : 5;
 	unsigned int ops_mask = mask_env ?
 		(unsigned int) strtoul(mask_env, NULL, 0) : (1U << ZOO_NR_OPS) - 1;
 	unsigned long long ms = env ? strtoull(env, NULL, 10) : PREFIX_PAIR_MS;
@@ -14643,15 +14647,15 @@ static int inv_prefix_shape_zoo(void)
 	int ret = 0;
 
 	/*
-	 * ☐ OPT-IN until its open reds are fixed (FT_INV_ZOO=1).  The full op
-	 * mix is clean at per-node on the strict, rcu-debug and in-place
-	 * builds, and at root-only on the strict one; it still livelocks an
-	 * insert_replace at exponential on the strict build, and trips the
-	 * ordered-cell TORN detector at root-only and exponential under
-	 * rcu-debug -- as a default row it would wedge gate legs.
+	 * A DEFAULT ROW (FT_INV_ZOO=0 skips it).  Every point update, at random,
+	 * by four writers over the shared prefix-shaped keys, clean on the
+	 * strict, rcu-debug and in-place builds at all three spacings.
+	 * ☐ KNOWN RESIDUAL: the owner assert in __ft_flip_txn_record_tag_ctx (a
+	 * record on a word the op does not own), about 1 run in 90, seen only
+	 * under rcu-debug at exponential spacing.
 	 */
-	if (!getenv("FT_INV_ZOO")) {
-		fprintf(stderr, "# inv_prefix_shape_zoo: skipped (set FT_INV_ZOO=1)\n");
+	if (zoo_env && !strcmp(zoo_env, "0")) {
+		fprintf(stderr, "# inv_prefix_shape_zoo: skipped (FT_INV_ZOO=0)\n");
 		drain_trie_keep_group(ft);
 		cds_ft_group_destroy(group);
 		return 0;
@@ -14670,14 +14674,12 @@ static int inv_prefix_shape_zoo(void)
 	test_go = 1;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	/*
-	 * FT_INV_ZOO_WIN_MS: verify every WIN ms, writers parked, and abort at
-	 * the first failing window -- the damage is then at most one window
-	 * old, which is what a flight-recorder snapshot needs to still hold its
-	 * producer.  Without it the run is verified once, at the join.
+	 * Verify every @win ms (FT_INV_ZOO_WIN_MS, default 5), writers parked,
+	 * and abort at the first failing window -- the damage is then at most
+	 * one window old, which is what a flight-recorder snapshot needs to
+	 * still hold its producer.  With 0 the run is verified once, at the join.
 	 */
-	if (getenv("FT_INV_ZOO_WIN_MS")) {
-		unsigned long long win = strtoull(getenv("FT_INV_ZOO_WIN_MS"),
-			NULL, 10);
+	if (win) {
 		unsigned long nwin = 0;
 
 		while (elapsed_ms(&t0) < ms) {
