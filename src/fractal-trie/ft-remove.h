@@ -290,6 +290,25 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				ft_flip_txn_record_release_lock(txn, cn_held.lock,
 					cn_held.lock_snap);
 			}
+			/*
+			 * ☠ @elevated_old_child IS A PLAN READ of cn->child,
+			 * taken before this lock, and the publish below records
+			 * it as the expected-old of a word the op now HOLDS --
+			 * a blind SW store (ft_flip_txn_record_tag's held_sw)
+			 * that pins nothing.  A peer insert of a longer key
+			 * republishes cn->child IN PLACE under this very word
+			 * (ft_insert_compressed_past_child) without moving
+			 * cn's state: re-read it here, under the lock.
+			 */
+#ifndef FT_DEBUG_NO_CN_CHILD_RECHECK
+			if (!record_only &&
+					ft_resolve_flip_proxy(rcu_dereference(
+						cn->child)) != elevated_old_child) {
+				FT_DBG_RETRY_SITE();
+				ft_flip_txn_destroy(txn);
+				return -EAGAIN;
+			}
+#endif
 		}
 		/* After the acquire: see the function header. */
 		if (freeze_leaf) {
@@ -713,6 +732,22 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 					set[1].held.lock, set[1].held.lock_snap);
 			}
 			dlm_a2 = true;
+			/*
+			 * The same plan read as the topmost arm's, and nothing
+			 * here records cn->child at all: retiring src_cn for an
+			 * EMPTY fresh node is only right while its child is
+			 * still the one the climb condemned.
+			 */
+#ifndef FT_DEBUG_NO_CN_CHILD_RECHECK
+			if (!record_only &&
+					ft_resolve_flip_proxy(rcu_dereference(
+						src_cn->child)) != elevated_old_child) {
+				FT_DBG_RETRY_SITE();
+				free_cds_ft_node_unpublished(ft, fresh);
+				ft_flip_txn_destroy(txn);
+				return -EAGAIN;
+			}
+#endif
 		}
 		/*
 		 * After the acquire: the leaf sits straight under @src_cn, which
@@ -1071,6 +1106,29 @@ int ft_detach_orphan_acquire_at(const char *fn, int line,
 #define ft_detach_orphan_acquire(ft, ctx, nf, depth, m, held)		\
 	ft_detach_orphan_acquire_at(__func__, __LINE__, (ft), (ctx),	\
 		(nf), (depth), (m), (held))
+
+/*
+ * The link below orphan @nf on a detach's downward walk: a compressed node's
+ * child, or an internal node's first (single) child.  Read it only once @nf is
+ * marked: the value is what the walk's verdict on the NEXT link rests on.
+ */
+static inline
+struct cds_ft_inode_flag *ft_detach_walk_next(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *nf)
+{
+	struct cds_ft_inode_flag *next = NULL;
+	unsigned int key;
+
+	if (ft_node_compressed(nf))
+		return ft_compressed_node_ptr(nf)->child;
+	for (key = 0; key < 256; key++) {
+		next = ft_node_get_nth(ft, nf, NULL, (uint8_t) key,
+			FT_PF_NONE);
+		if (next)
+			break;
+	}
+	return next;
+}
 
 static inline
 int ft_detach_orphan_planlock(const struct cds_ft *ft,
@@ -2854,6 +2912,8 @@ int ft_detach_node(struct cds_ft *ft,
 	bool retire_glue_fused = false;
 	bool freeze_leaf_fused = false;
 	struct cds_ft_node *topmost_external_nodes = NULL;
+	/* The node @topmost_external_nodes was lifted off (see the orphan walk). */
+	struct cds_ft_metadata *topmost_src_meta = NULL;
 	bool prev_external_nodes_found = false;
 	/*
 	 * Set when the pure-delete leaves the surviving boundary a non-root
@@ -3015,6 +3075,26 @@ int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag *detach_child = *detach_node_flag_ptr;
 
 		/*
+		 * ☠ THE SLOT MUST STILL HOLD THE CALLER'S LEAF.  Every destroy-
+		 * style caller is a remove that names the chain head it came to
+		 * clear (@freeze_leaf) and checked it at @detach_node_flag_ptr --
+		 * at an EARLIER instant.  A peer insert of a LONGER key through
+		 * that head (past-child: "zone46" under "zone4") republishes the
+		 * slot with a fresh junction that carries the head as its
+		 * external_nodes AND the peer's key as a child.  Read here, that
+		 * junction is "a detached internal node whose prefix head must be
+		 * promoted": the plan below drops the junction -- the peer's key
+		 * with it -- and republishes the head this op is REMOVING
+		 * (MEASURED: key loss within seconds with two writers, one key
+		 * each).  Nothing is built, locked or reserved yet: re-descend.
+		 */
+#ifndef FT_DEBUG_NO_LEAF_IDENTITY
+		if (freeze_leaf && caa_unlikely((struct cds_ft_node *)
+				ft_node_ptr(ft_resolve_flip_proxy(detach_child)) !=
+					freeze_leaf))
+			return -EAGAIN;
+#endif
+		/*
 		 * RESOLVE-THEN-SKIP, in that order (ft-helpers.h:1870, and the
 		 * entry-holder read below at :2373 does exactly this:
 		 * ft_reanchor_flag(ft, ft_resolve_flip_proxy(raw), ...)).
@@ -3062,9 +3142,11 @@ int ft_detach_node(struct cds_ft *ft,
 			 * item_to_metadata faults).  Mirror every ft_dereference_external
 			 * descent reader; the common no-splice case is one masked test.
 			 */
-			if (child_meta && child_meta->external_nodes)
+			if (child_meta && child_meta->external_nodes) {
 				topmost_external_nodes = ft_dereference_external(
 					child_meta->external_nodes);
+				topmost_src_meta = child_meta;
+			}
 		}
 	}
 
@@ -3188,6 +3270,19 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 #ifndef FT_DEBUG_NO_NULLPLAN
 	if (caa_unlikely(!plan_old_child))
+		return -EAGAIN;
+#endif
+	/*
+	 * The same identity, on the read the PLAN rests on.  The check above
+	 * is a separate, earlier load; the peer's publish can land between
+	 * the two, and then everything below -- climb, orphan walk, replace --
+	 * is coherent with the peer's junction and every expected-old matches.
+	 * Only the caller's leaf says the plan is about the wrong node.
+	 */
+#ifndef FT_DEBUG_NO_LEAF_IDENTITY
+	if (freeze_leaf && caa_unlikely((struct cds_ft_node *)
+			ft_node_ptr(ft_resolve_flip_proxy(plan_old_child)) !=
+				freeze_leaf))
 		return -EAGAIN;
 #endif
 	/*
@@ -3570,6 +3665,7 @@ int ft_detach_node(struct cds_ft *ft,
 		if (metadata->external_nodes && !topmost_external_nodes) {
 			topmost_external_nodes = ft_dereference_external(
 				metadata->external_nodes);
+			topmost_src_meta = metadata;
 			/*
 			 * The junction the prune empties.  Its head takes its
 			 * place in the boundary's slot, so the node itself is
@@ -4006,9 +4102,46 @@ int ft_detach_node(struct cds_ft *ft,
 							metadata_stack[nr_branch - 2])
 						FT_DT_INC(ft_dt_walk_first_ident);
 				}
+				/*
+				 * ☠ AND A HEAD THAT DEPARTED.  The rule above
+				 * accepts a first orphan with NO head, because the
+				 * promoted head usually came from an ancestor above
+				 * it -- but when it came off THIS node, "no head now"
+				 * means a peer REMOVED it after the climb read it,
+				 * pre-lock.  Promoting it anyway republishes a
+				 * removed node into the boundary slot (MEASURED: the
+				 * remove of "...zone46" resurrected a concurrently
+				 * removed "...zone4", next == REMOVED, both writers
+				 * then livelocked on it).  Under this orphan's lock
+				 * the node it was lifted off must still carry it.
+				 */
 				if ((!phase2_first && (nr_child > 1 || ext_nodes)) ||
 				    (phase2_first && ext_nodes &&
-					    ext_nodes != topmost_external_nodes)) {
+					    ext_nodes != topmost_external_nodes)
+#ifndef FT_DEBUG_NO_DEPARTED_HEAD
+				    || (ometa == topmost_src_meta &&
+					    ext_nodes != topmost_external_nodes)
+#endif
+#ifndef FT_DEBUG_NO_FIRST_ORPHAN_COUNT
+				    /*
+				     * ☠ THE FIRST ORPHAN IS THE TARGET ONLY WHEN
+				     * NOTHING WAS ELEVATED.  After a climb it is
+				     * the chain's top -- a link the climb scored
+				     * single-child from an UNHELD read -- and an
+				     * in-place insert (FEATURE_FT_INSERT_IN_PLACE)
+				     * grows it under this very lock without
+				     * retiring it: the walk then stops (no scan
+				     * past one child) and the drop retires the
+				     * link with the peer's new child inside
+				     * (MEASURED: inv_prefix_siblings_compressed_
+				     * holder, in-place legs, "ord-cell list longer
+				     * than trie").  Branch 2's phase 1 enforces
+				     * the same count under its planlock.
+				     */
+				    || (phase2_first && nr_elevated > 0 &&
+					    nr_child > 1)
+#endif
+				    ) {
 					if (ft->lock_fine && !owalk.shared)
 						ft_meta_lock_release(owalk.lock);
 #ifdef FT_ENABLE_TRACING
@@ -4449,28 +4582,18 @@ int ft_detach_node(struct cds_ft *ft,
 					continue;
 				}
 				if (ft_node_compressed(walk_nf)) {
-					struct cds_ft_compressed_node *cn;
-
-					cn = ft_compressed_node_ptr(walk_nf);
-					next = cn->child;
 					ometa = cds_ft_item_to_metadata(
-						(struct cds_ft_inode *) cn);
+						(struct cds_ft_inode *)
+						ft_compressed_node_ptr(walk_nf));
 					require_sc = false;	/* compressed: single-child */
 				} else {
-					unsigned int key;
-
-					for (key = 0; key < 256; key++) {
-						next = ft_node_get_nth(ft,
-							walk_nf, NULL,
-							(uint8_t) key,
-							FT_PF_NONE);
-						if (next)
-							break;
-					}
 					ometa = cds_ft_item_to_metadata(
 						ft_node_ptr(walk_nf));
 					require_sc = true;	/* elevated internal: nr_child==1 */
 				}
+#ifdef FT_DEBUG_ORPHAN_NEXT_BEFORE_LOCK
+				next = ft_detach_walk_next(ft, walk_nf);
+#endif
 				wlctx.held.txn = lctx.held.txn;
 				wlctx.held.nr_extra = (unsigned int) nr_orphan_locked;
 				if (ft->lock_fine && ft_detach_orphan_planlock(ft,
@@ -4481,6 +4604,27 @@ int ft_detach_node(struct cds_ft *ft,
 					goto end;
 				}
 				/*
+				 * ☠ THE NEXT LINK IS READ UNDER THE MARK, NOT
+				 * BEFORE IT.  A compressed link's count never moves
+				 * -- it holds exactly one child -- so the plan-lock
+				 * above validates nothing about WHICH child: a peer
+				 * insert of a longer key republishes @cn->child in
+				 * place, under this very word, from the head this op
+				 * is removing to a fresh junction carrying that head
+				 * AND the peer's key.  Read before the mark, the walk
+				 * followed the old head, found it external, and
+				 * stopped with the junction never looked at; the drop
+				 * then took the branch whole (MEASURED: the peer's key
+				 * lost within seconds, two writers, "...runs" vs
+				 * "...runs6" under one compressed node).  Read after
+				 * it, the walk reaches the junction and phase 2
+				 * refuses its head.  Phase 2 and the compressed-parent
+				 * walk already take the mark first.
+				 */
+#ifndef FT_DEBUG_ORPHAN_NEXT_BEFORE_LOCK
+				next = ft_detach_walk_next(ft, walk_nf);
+#endif
+				/*
 				 * A HEAD ON A CHAIN LINK THAT ARRIVED AFTER THE PLAN.
 				 * The keyless links carry none, and the chain's top may
 				 * carry exactly the one the climb lifted off it (the
@@ -4490,10 +4634,23 @@ int ft_detach_node(struct cds_ft *ft,
 				 * here under the mark taken just above (the plan-lock
 				 * validates the child count alone).
 				 */
-				if (ometa->external_nodes &&
+				if ((ometa->external_nodes &&
 						(nr_to_free != 0 ||
 						 ometa->external_nodes !=
-							topmost_external_nodes)) {
+							topmost_external_nodes))
+#ifndef FT_DEBUG_NO_DEPARTED_HEAD
+				    /*
+				     * ...and a head that DEPARTED from the link
+				     * the climb lifted it off: the compressed
+				     * arm's rule, which this walk lacked (the
+				     * same resurrection, reached through a plain
+				     * internal boundary).
+				     */
+				    || (ometa == topmost_src_meta &&
+					ometa->external_nodes !=
+						topmost_external_nodes)
+#endif
+				    ) {
 					ret = -EAGAIN;
 					goto end;
 				}
@@ -4577,7 +4734,12 @@ int ft_detach_node(struct cds_ft *ft,
 					if ((!phase2_first &&
 					     (nr_child > 1 || ext_nodes)) ||
 					    (phase2_first && ext_nodes &&
-						ext_nodes != topmost_external_nodes)) {
+						ext_nodes != topmost_external_nodes)
+#ifndef FT_DEBUG_NO_DEPARTED_HEAD
+					    || (ometa == topmost_src_meta &&
+						ext_nodes != topmost_external_nodes)
+#endif
+					    ) {
 						if (ft->lock_fine && !owalk.shared)
 							ft_meta_lock_release(
 								owalk.lock);
