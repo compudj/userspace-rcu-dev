@@ -954,12 +954,23 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  * afterwards, so that mark stays with the caller and costs no registry slot --
  * which is what keeps a FT_MAX_DEPTH orphan chain inside FT_FLIP_TXN_MAX_LOCKS,
  * and the per-node granularity byte-identical.
+ *
+ * @h_dies_first: @h is in a frame that returns before @txn's terminal runs --
+ * ft_detach_node's @orphan_held[] under a DEFERRED commit (@record_only: the
+ * rekey commits @shared_txn after the detach has returned).  The hand-off then
+ * links no silencer (ft_flip_txn_lock_own_frame): measured with
+ * -DFT_DEBUG_STACK_SILENCER, the terminal otherwise wrote through a pointer
+ * into the dead frame, once per ft_unit run at exponential spacing.
  */
 static inline
 void ft_detach_freeze_one(struct ft_flip_txn *txn,
 		const struct ft_lock_ctx *ctx,
-		struct ft_held_anchor *h, struct cds_ft_metadata *m)
+		struct ft_held_anchor *h, struct cds_ft_metadata *m,
+		bool h_dies_first)
 {
+#ifdef FT_DEBUG_FREEZE_SILENCER_ON_STACK
+	h_dies_first = false;	/* red control: link it anyway */
+#endif
 	if (!h->shared) {
 		unsigned int slot = 0;
 		bool owned = false;
@@ -967,7 +978,7 @@ void ft_detach_freeze_one(struct ft_flip_txn *txn,
 
 		/* Register BEFORE recording: the record asks who owns the word. */
 		if (h->lock != m) {
-			slot = ft_flip_txn_lock_own(txn, h);
+			slot = ft_flip_txn_lock_own_frame(txn, h, h_dies_first);
 			owned = true;
 		}
 		/*
@@ -989,7 +1000,8 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag **orphans, int nr_orphans,
 		struct cds_ft_inode_flag *trailing_skip_cn_flag,
 		struct ft_held_anchor *held,
-		struct ft_held_anchor *trailing_held)
+		struct ft_held_anchor *trailing_held,
+		bool held_dies_first)
 {
 	int i;
 
@@ -1010,7 +1022,8 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 			ft_meta_nr_child_load(m) <= 1);
 
 		if (held)
-			ft_detach_freeze_one(txn, ctx, &held[i], m);
+			ft_detach_freeze_one(txn, ctx, &held[i], m,
+				held_dies_first);
 		else if (txn)
 			ft_flip_txn_record_tombstone(txn, m);
 		else
@@ -1022,7 +1035,8 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 				trailing_skip_cn_flag));
 
 		if (held)
-			ft_detach_freeze_one(txn, ctx, trailing_held, m);
+			ft_detach_freeze_one(txn, ctx, trailing_held, m,
+				held_dies_first);
 		else if (txn)
 			ft_flip_txn_record_tombstone(txn, m);
 		else
@@ -2526,8 +2540,14 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			ft_flip_txn_record_retire_anchored(txn, ctx, &ccn_held,
 				cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) child_cn));
+		/*
+		 * @orphan_held is only ever ft_detach_node's own array, and
+		 * under @record_only @txn is its caller's: the array's frame
+		 * returns before this txn's terminal.
+		 */
 		ft_detach_freeze_orphans(ft, txn, ctx, orphans, nr_orphans,
-			trailing_orphan, orphan_held, trailing_orphan_held);
+			trailing_orphan, orphan_held, trailing_orphan_held,
+			record_only);
 		/*
 		 * PHASE B, STEP B3 -- THE ARM.  ft_detach_freeze_orphans above
 		 * holds this op's LAST ft_flip_txn_lock_register (an orphan
@@ -4335,7 +4355,7 @@ int ft_detach_node(struct cds_ft *ft,
 						: ft_node_ptr(to_free[fi]));
 				if (ft->lock_fine)
 					ft_detach_freeze_one(orphan_txn, &lctx,
-						&orphan_held[fi], m);
+						&orphan_held[fi], m, fold_replace);
 				else
 					ft_flip_txn_record_tombstone(orphan_txn, m);
 			}
@@ -4344,7 +4364,7 @@ int ft_detach_node(struct cds_ft *ft,
 					(struct cds_ft_inode *) trailing_skip_cn);
 				if (ft->lock_fine)
 					ft_detach_freeze_one(orphan_txn, &lctx,
-						orphan_trailing_held, m);
+						orphan_trailing_held, m, fold_replace);
 				else
 					ft_flip_txn_record_tombstone(orphan_txn, m);
 			}
@@ -5511,7 +5531,9 @@ int ft_detach_node(struct cds_ft *ft,
 					&lctx,
 					to_free, nr_to_free, trailing_skip_cn_flag,
 					ft->lock_fine ? orphan_held : NULL,
-					orphan_trailing_held);
+					orphan_trailing_held,
+					/* @commit_txn IS @shared_txn then */
+					record_only);
 			/*
 			 * A caller-supplied external retire set (@retire_glue: the
 			 * merge src-side glue's overlap-spine free-list, freed by the

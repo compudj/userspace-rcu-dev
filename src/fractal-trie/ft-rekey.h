@@ -2072,7 +2072,9 @@ chain_done:
 	ctx->held.nr_extra = (unsigned int) *nr_held;
 	ft_detach_freeze_orphans(ft, txn, ctx, rc->orphans, rc->nr_orphans,
 			NULL /*trailing skip-target: plain chain*/,
-			ft->lock_fine ? held : NULL, NULL);
+			ft->lock_fine ? held : NULL, NULL,
+			/* @held is the committing frame's own (fold_held[]) */
+			false);
 	return 0;
 refuse:
 	/* STRICT: a refusal commits nothing, so every mark left is ours. */

@@ -3268,7 +3268,10 @@ struct ft_flip_txn {
 		 * construction -- the frame extras are the OP's held set, and a
 		 * glue owns its txn, so ft_glue_fini (which frees the arrays the
 		 * freeze entries live in) runs strictly after the commit or
-		 * ft_flip_txn_destroy.
+		 * ft_flip_txn_destroy.  The one source that does NOT is a
+		 * callee's array handed to its caller's deferred txn
+		 * (ft_detach_node's @orphan_held under @record_only); that
+		 * hand-off links NULL instead (ft_flip_txn_lock_own_frame).
 		 */
 		bool *src_shared;
 		/*
@@ -7417,13 +7420,21 @@ unsigned int ft_flip_txn_lock_own_silenced(struct ft_flip_txn *t,
 	return t->nr_locks - 1;
 }
 
-/* The frame-extras form: @h's own @shared is what stops it answering. */
+/*
+ * The frame-extras form: @h's own @shared is what stops it answering.
+ *
+ * @h_dies_first: @h lives in a frame that RETURNS before @t's terminal -- a
+ * callee's stack array handed to its caller's deferred txn.  Then no silencer
+ * is linked: nothing can read @h once its frame is gone, so there is nothing
+ * to silence, and the terminal (or a destroy's scrub) would write through a
+ * dead frame.  The orphan sweep in ft_detach_node registers the same way.
+ */
 static inline
-unsigned int ft_flip_txn_lock_own(struct ft_flip_txn *t,
-		struct ft_held_anchor *h)
+unsigned int ft_flip_txn_lock_own_frame(struct ft_flip_txn *t,
+		struct ft_held_anchor *h, bool h_dies_first)
 {
 	unsigned int slot = ft_flip_txn_lock_own_silenced(t, h->lock,
-			h->lock_snap, &h->shared);
+			h->lock_snap, h_dies_first ? NULL : &h->shared);
 
 	/*
 	 * The hand-off carries the acquire's whole answer, so the entry keeps
@@ -7435,6 +7446,13 @@ unsigned int ft_flip_txn_lock_own(struct ft_flip_txn *t,
 	t->locks[slot].member = h->member;
 	h->txn_owned = true;
 	return slot;
+}
+
+static inline
+unsigned int ft_flip_txn_lock_own(struct ft_flip_txn *t,
+		struct ft_held_anchor *h)
+{
+	return ft_flip_txn_lock_own_frame(t, h, false);
 }
 
 /*
