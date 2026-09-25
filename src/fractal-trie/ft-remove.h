@@ -5764,6 +5764,30 @@ int ft_detach_node(struct cds_ft *ft,
 					ft_flip_txn_lock_or_guard_parent(ft,
 						commit_txn, &lctx,
 						iter_node_flag, cur_depth);
+					/*
+					 * ☠ A MISSED HOLDER ENDS THE ATTEMPT HERE.  A
+					 * peer holds @iter_node_flag's word (a parked
+					 * proxy on it counts), so the take latched
+					 * @acquire_miss and @commit_txn is doomed: its
+					 * commit would discard everything.  Carrying on
+					 * arms the per-op claim and records the promote
+					 * on @pub->slot -- a word this op does not own --
+					 * which the rcu-debug owner assert catches
+					 * (MEASURED: inv_prefix_shape_zoo, in-place
+					 * rcu-debug at exponential, remove_all's detach,
+					 * 2 of 128 pinned runs; the dump showed the
+					 * holder's state word carrying a peer's proxy).
+					 * Nothing is committed: @end destroys the unused
+					 * txn, releasing what it registered, as
+					 * insert_replace's and remove_all's arms do
+					 * (dbc41961, da4ac288).
+					 */
+#ifndef FT_DEBUG_DETACH_MISS_CARRIES_ON
+					if (caa_unlikely(commit_txn->acquire_miss)) {
+						ret = -EAGAIN;
+						goto end;
+					}
+#endif
 				}
 				/*
 				 * PHASE B, STEP B2 -- THE ARM.  The guard/release
