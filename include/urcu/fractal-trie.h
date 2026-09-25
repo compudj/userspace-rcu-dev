@@ -160,7 +160,8 @@
  *       readers, so holding the RCU read-side lock on its own
  *       does not protect against use-after-free in this mode.
  *
- * The library never calls rcu_read_lock() on the caller's behalf.
+ * The library never calls rcu_read_lock() on a READER's behalf.
+ * (Point updates differ: see "Mutation API" below.)
  * If FEATURE_FT_EXCL_VALIDATE is compiled in, the library
  * *validates* the discipline above and aborts on violation -- it
  * does not enforce the discipline.  Compliance is the caller's
@@ -1430,6 +1431,19 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * never a partial one.  It does NOT make an operation atomic against other
  * concurrent updates; each operation below states the caller's
  * mutual-exclusion requirement.
+ *
+ * RCU read side, point updates (cds_ft_insert, cds_ft_insert_unique,
+ * cds_ft_insert_replace, cds_ft_replace, cds_ft_remove, cds_ft_remove_all):
+ * each one takes read-side critical sections of the trie's flavor
+ * internally around its accesses to the shared structure; the caller need
+ * not hold one, and a section the caller does hold simply nests.  The
+ * exceptions are the caller-owned references: cds_ft_remove and
+ * cds_ft_replace dereference the node passed in, and a CDS_FT_ITER_CACHED
+ * iterator carries a node from a previous lookup, so the caller must have
+ * held the read-side lock continuously since obtaining it (see each
+ * function).  Bulk operations (graft, graft_swap, detach, merge, rekey) wait
+ * for grace periods and must NOT be called inside a read-side critical
+ * section.
  */
 
 /*

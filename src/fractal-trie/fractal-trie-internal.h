@@ -3451,12 +3451,36 @@ void ft_writer_lock_park(struct cds_ft *ft)
 /* Defined below with the rest of the bulk gate; needed by the scope enter. */
 static inline bool ft_bulk_active(const struct cds_ft *ft);
 
+/*
+ * The writer scopes' own read sections this thread holds (see
+ * ft_writer_lock_scope_enter), and the flavor they were taken with.
+ * ft_writer_lock_gp_wait drops them across its grace period, exactly as it
+ * drops the FT-wide lock: a writer scope that waits for a grace period outside
+ * a bulk gate (cds_ft_make_exclusive) would otherwise wait for itself.
+ */
+static __thread unsigned long ft_wscope_rcu_held;
+static __thread const struct rcu_flavor_struct *ft_wscope_rcu_flavor;
+#ifdef URCU_FRACTAL_TRIE_DEBUG_LOCKING
+/*
+ * Those sections would also blind CDS_FT_ASSERT_RCU_READ_LOCKED at the point
+ * ops that require the CALLER to hold one (a cached iterator's node must stay
+ * live): the library's section satisfies read_ongoing().  So record the
+ * caller's state at the outermost such section, and have those sites ask it
+ * (CDS_FT_ASSERT_CALLER_RCU_READ_LOCKED).
+ */
+static __thread int ft_wscope_caller_reading;
+#endif
+
+/*
+ * Returns true when the scope holds a read-side section of @ft's flavor,
+ * which ft_writer_lock_scope_exit's caller must drop (see the FINE arm).
+ */
 static inline
-void ft_writer_lock_scope_enter(struct cds_ft *ft)
+bool ft_writer_lock_scope_enter(struct cds_ft *ft)
 {
 	if (ft_wlock_held == ft) {
 		ft_wlock_depth++;		/* reentry on the trie we hold */
-		return;
+		return false;
 	}
 	if (ft->external_sync) {
 		/*
@@ -3470,7 +3494,7 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		 * reason: ft_writer_lock_scope_exit keys its release off
 		 * @ft_wlock_held IDENTITY, never a re-read of either flag.
 		 */
-		return;
+		return false;
 	}
 	if (ft->exclusive) {
 		/*
@@ -3489,7 +3513,7 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		 * @ft_wlock_held identity -- never a re-read of @exclusive --
 		 * so a mid-scope flip of the flag cannot unbalance the lock.
 		 */
-		return;
+		return false;
 	}
 #ifdef FT_RED_REKEY_NOLOCK
 	/*
@@ -3510,7 +3534,7 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		 * does.  Measured 68,655 on inv_rekey_coarse_mixed_writers.
 		 */
 		uatomic_inc(&ft_red_rekey_nolock_taken);
-		return;
+		return false;
 	}
 #endif
 #ifdef FT_DEBUG_BULK_ELEV
@@ -3521,53 +3545,100 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		uatomic_inc(ft_bulk_gate_depth ? &ft_bulk_elev_self
 			: &ft_bulk_elev_peer);
 #endif
-	if (ft->lock_fine &&
-			!(FT_BULK_WIDE_LOCK && caa_unlikely(ft_bulk_active(ft)))) {
-		/*
-		 * ☑ G5.25 -- AND THE ONE CASE THAT TAKES IT BACK.  While a BULK
-		 * op is live, a FINE trie RE-TAKES the FT-wide lock, so bulk and
-		 * point writers arbitrate on one word again.  That is the whole
-		 * of G5.5's exclusion, obtained by NOT dropping a lock that
-		 * already exists rather than by widening every point op's
-		 * lock-set to the root:
-		 *   - no ancestor ledger to consume, no up-walk to date members;
-		 *   - NO RELEASE-OWNER PROBLEM AT ALL -- a scoped mutex has no
-		 *     registry, no reservation to size, and no "acquire before
-		 *     the txn exists" blocker (the four sites that defeated the
-		 *     widening's coverage);
-		 *   - and it QUEUES.  The widened DLM acquire spins
-		 *     URCU_TXN_WAIT_PATIENCE and then ABORTS, which is the
-		 *     retry-storm hazard; cds_fair_mutex is FIFO.
-		 * ★ Sound against the seam rule for free: ft_writer_lock_gp_wait
-		 * DROPS this lock across every grace period (@writer_lock: "the
-		 * GP always sits at a seam BETWEEN two distinct commits, so
-		 * releasing there costs no atomicity").
-		 * ★ And the sample races nothing: a point op that read the gate
-		 * as clear is inside the read section urcu_txn_begin took, which
-		 * is exactly what the gate's publish-then-one-GP waits for.
-		 * ☠ The cost is honest and accepted (2026-08-29): while any bulk
-		 * op is live, point ops serialize trie-wide.  At level 0 the
-		 * widening serialized them on the ROOT's lock anyway, so this
-		 * trades an equivalent exclusion for far less machinery.
-		 */
-		/*
-		 * FT-WIDE-LOCK DROP (§11 drop-mechanics, MCAS-first): a FINE trie's
-		 * op-domains are ALL converted to per-node lock-sets (LOCK
-		 * try-locks) that arbitrate writers directly, so the FT-wide mutex
-		 * is redundant -- SKIP it and let the per-node locks be the sole
-		 * exclusion.  Dropped ALL-AT-ONCE for FINE (not op-domain by
-		 * op-domain): the FT-wide lock sits at the per-OP writer scope, not
-		 * a per-domain sub-scope, and one MCAS-abort-safe net covers every
-		 * domain uniformly.  Residual §11.1 under-count sites (I-1
-		 * in-place nr_child, I-4b skip-dual P, §8.3 word-sharing) stay
-		 * MCAS-abort-safe here: expected-old catches the race as a spurious
-		 * retry, not a lost update (that safety net is what the later sw
-		 * cutover removes, where full lock-set completeness becomes
-		 * mandatory).  ft_writer_lock_scope_exit no-ops (keys off
-		 * @ft_wlock_held identity, never set) and ft_writer_lock_gp_wait
-		 * degrades to a plain synchronize_rcu (held == NULL).
-		 */
-		return;
+	/*
+	 * ☠ THE GATE IS SAMPLED INSIDE A READ SECTION THAT SPANS THE OP.  The
+	 * bulk gate publishes @bulk_state and then waits ONE grace period, so it
+	 * excludes exactly the point ops that were inside a read-side section
+	 * when they read it as clear.  The per-attempt section urcu_txn_begin
+	 * takes opens only AFTER this sample, and closes between attempts -- and
+	 * a caller need not hold one of its own (cds_ft_insert and friends
+	 * require none).  Under QSBR an online thread is a reader throughout, so
+	 * that gap was invisible; under memb / mb / bp it let a point op that
+	 * sampled "clear" run LOCK-FREE through a bulk body.  MEASURED with a
+	 * memb build of inv_rekey_fine_mixed_writers (rekeys paced 2 ms apart)
+	 * and a probe flagging a point attempt that starts unlocked while a bulk
+	 * op holds the FT-wide lock past its gate: up to 2 per run as is, and
+	 * 17-166 in 6 of 6 runs with a 2 ms preemption injected after the
+	 * sample; 0 in 6 of 6 with the section taken first.
+	 *
+	 * So take the section BEFORE the sample.  Clear: keep it until the scope
+	 * exits -- every attempt's own section nests inside it.  Raised: drop it
+	 * and take the FT-wide lock, the exclusion that case uses.  That branch
+	 * is also the one a BULK op's own scope takes (its gate is up), so a
+	 * bulk op, which waits for grace periods, never holds this section.  A
+	 * point op holding it never waits on anything a GP-waiting bulk op holds:
+	 * the gate's GP runs before the bulk op takes any lock, and
+	 * ft_writer_lock_gp_wait drops the FT-wide lock across every later one.
+	 */
+	if (ft->lock_fine) {
+#ifndef FT_DEBUG_NO_SCOPE_READ_SECTION
+#ifdef URCU_FRACTAL_TRIE_DEBUG_LOCKING
+		if (!ft_wscope_rcu_held)
+			ft_wscope_caller_reading =
+				ft->group->flavor->read_ongoing();
+#endif
+		ft->group->flavor->read_lock();
+#endif
+		if (!(FT_BULK_WIDE_LOCK && caa_unlikely(ft_bulk_active(ft)))) {
+			/*
+			 * ☑ G5.25 -- AND THE ONE CASE THAT TAKES IT BACK.  While a BULK
+			 * op is live, a FINE trie RE-TAKES the FT-wide lock, so bulk and
+			 * point writers arbitrate on one word again.  That is the whole
+			 * of G5.5's exclusion, obtained by NOT dropping a lock that
+			 * already exists rather than by widening every point op's
+			 * lock-set to the root:
+			 *   - no ancestor ledger to consume, no up-walk to date members;
+			 *   - NO RELEASE-OWNER PROBLEM AT ALL -- a scoped mutex has no
+			 *     registry, no reservation to size, and no "acquire before
+			 *     the txn exists" blocker (the four sites that defeated the
+			 *     widening's coverage);
+			 *   - and it QUEUES.  The widened DLM acquire spins
+			 *     URCU_TXN_WAIT_PATIENCE and then ABORTS, which is the
+			 *     retry-storm hazard; cds_fair_mutex is FIFO.
+			 * ★ Sound against the seam rule for free: ft_writer_lock_gp_wait
+			 * DROPS this lock across every grace period (@writer_lock: "the
+			 * GP always sits at a seam BETWEEN two distinct commits, so
+			 * releasing there costs no atomicity").
+			 * ★ And the sample races nothing: a point op that read the gate
+			 * as clear is inside the read section taken just above (NOT the
+			 * one urcu_txn_begin takes later -- see above), which is exactly
+			 * what the gate's publish-then-one-GP waits for.
+			 * ☠ The cost is honest and accepted (2026-08-29): while any bulk
+			 * op is live, point ops serialize trie-wide.  At level 0 the
+			 * widening serialized them on the ROOT's lock anyway, so this
+			 * trades an equivalent exclusion for far less machinery.
+			 */
+			/*
+			 * FT-WIDE-LOCK DROP (§11 drop-mechanics, MCAS-first): a FINE trie's
+			 * op-domains are ALL converted to per-node lock-sets (LOCK
+			 * try-locks) that arbitrate writers directly, so the FT-wide mutex
+			 * is redundant -- SKIP it and let the per-node locks be the sole
+			 * exclusion.  Dropped ALL-AT-ONCE for FINE (not op-domain by
+			 * op-domain): the FT-wide lock sits at the per-OP writer scope, not
+			 * a per-domain sub-scope, and one MCAS-abort-safe net covers every
+			 * domain uniformly.  Residual §11.1 under-count sites (I-1
+			 * in-place nr_child, I-4b skip-dual P, §8.3 word-sharing) stay
+			 * MCAS-abort-safe here: expected-old catches the race as a spurious
+			 * retry, not a lost update (that safety net is what the later sw
+			 * cutover removes, where full lock-set completeness becomes
+			 * mandatory).  ft_writer_lock_scope_exit no-ops (keys off
+			 * @ft_wlock_held identity, never set) and ft_writer_lock_gp_wait
+			 * degrades to a plain synchronize_rcu (held == NULL).
+			 */
+#ifndef FT_DEBUG_NO_SCOPE_READ_SECTION
+			/* Nested sections of one thread share one flavor. */
+			assert(!ft_wscope_rcu_held ||
+				ft_wscope_rcu_flavor == ft->group->flavor);
+			if (!ft_wscope_rcu_held++)
+				ft_wscope_rcu_flavor = ft->group->flavor;
+			return true;
+#else
+			return false;
+#endif
+		}
+#ifndef FT_DEBUG_NO_SCOPE_READ_SECTION
+		ft->group->flavor->read_unlock();
+#endif
 	}
 	if (caa_unlikely(ft_wlock_held != NULL)) {
 		/*
@@ -3589,6 +3660,7 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 	ft_writer_lock_take(ft);
 	ft_wlock_held = ft;
 	ft_wlock_depth = 1;
+	return false;
 }
 
 /* Release at the OUTERMOST scope only; a nested exit just unwinds the depth. */
@@ -4178,6 +4250,26 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 #ifdef FEATURE_FT_HOLD_TRACE
 	ft_seam_check("ft_writer_lock_gp_wait");
 #endif
+	/*
+	 * And NEVER a grace period inside this thread's own writer-scope read
+	 * sections: drop them for the wait and re-take them after, as the lock
+	 * above.  Only a scope that waits for a grace period WITHOUT a bulk gate
+	 * holds one here (cds_ft_make_exclusive on a FINE trie); a bulk op's own
+	 * scope never takes it (see ft_writer_lock_scope_enter).
+	 */
+	unsigned long nsec = ft_wscope_rcu_held;
+	unsigned long isec;
+
+	/*
+	 * A scope that keeps a section never takes the FT-wide lock, so the
+	 * re-acquire below (OFFLINE, ft_writer_lock_park) never runs with one.
+	 */
+	assert(!(held && nsec));
+#ifdef FT_DEBUG_GP_KEEPS_SCOPE_SECTIONS
+	nsec = 0;	/* red control: wait inside them */
+#endif
+	for (isec = 0; isec < nsec; isec++)
+		ft_wscope_rcu_flavor->read_unlock();
 #ifdef FT_DEBUG_BULK_WINDOW
 	{
 		uint64_t t0__ = ft_bw_now();
@@ -4189,6 +4281,8 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 #else
 	ft->group->flavor->update_synchronize_rcu();
 #endif
+	for (isec = 0; isec < nsec; isec++)
+		ft_wscope_rcu_flavor->read_lock();
 	if (held) {
 		/*
 		 * OFFLINE for the re-acquire, or the drop above buys nothing when
@@ -4529,6 +4623,11 @@ void ft_bulk_gate_enter_gp(struct cds_ft *ft, enum ft_bulk_kind kind)
 		 * still believe they are in the old mode, so let them finish.
 		 */
 		assert(!urcu_txn_in_fallback());	/* see gp_wait */
+		/*
+		 * A bulk op enters its gate before any writer scope, so it
+		 * holds none of the scope read sections this GP would wait on.
+		 */
+		assert(!ft_wscope_rcu_held);
 #ifdef FEATURE_FT_HOLD_TRACE
 		ft_seam_check("ft_bulk_gate_enter");
 #endif
@@ -4860,17 +4959,18 @@ unsigned long ft_excl_self_writers(const struct cds_ft *ft)
 }
 
 static inline
-void ft_excl_writer_enter(struct cds_ft *ft)
+bool ft_excl_writer_enter(struct cds_ft *ft)
 {
 	unsigned long self = (unsigned long) pthread_self();
 	unsigned long prev, nr;
+	bool rcu;
 
 	/*
 	 * MW lock-mode: take the FT-wide writer lock at the outermost scope
 	 * before the discipline checks, so they run single-writer.  No-op on an
 	 * optimistic trie.
 	 */
-	ft_writer_lock_scope_enter(ft);
+	rcu = ft_writer_lock_scope_enter(ft);
 	ft_excl_self_any++;
 	if (ft_excl_self_ft == ft) {
 		ft_excl_self_depth++;
@@ -4905,7 +5005,7 @@ void ft_excl_writer_enter(struct cds_ft *ft)
 				/* Reentry from the same thread (e.g. graft_swap
 				 * delegating to graft). */
 				ft->excl_writer_depth++;
-				return;
+				return rcu;
 			}
 			ft_excl_abort("cds_ft=%p: writer conflict -- owner 0x%lx, entering thread 0x%lx\n",
 				(void *) ft, prev, self);
@@ -4924,6 +5024,7 @@ void ft_excl_writer_enter(struct cds_ft *ft)
 		ft_excl_abort("cds_ft=%p: writer 0x%lx entering with %lu concurrent reader(s) (%s mode)\n",
 			(void *) ft, self, nr,
 			ft->exclusive ? "exclusive" : "concurrent without RCU read-side lock");
+	return rcu;
 }
 
 static inline
@@ -4992,10 +5093,10 @@ void ft_excl_reader_exit_scope(const struct ft_excl_reader_scope *scope)
 
 #else /* !FEATURE_FT_EXCL_VALIDATE */
 
-static inline void ft_excl_writer_enter(struct cds_ft *ft)
+static inline bool ft_excl_writer_enter(struct cds_ft *ft)
 {
 	/* MW lock-mode FT-wide lock; no-op on an optimistic trie. */
-	ft_writer_lock_scope_enter(ft);
+	return ft_writer_lock_scope_enter(ft);
 }
 static inline void ft_excl_writer_exit(struct cds_ft *ft)  { (void) ft; }
 static inline
@@ -5013,24 +5114,51 @@ void ft_excl_reader_exit_scope(const struct ft_excl_reader_scope *scope)
 
 #endif /* FEATURE_FT_EXCL_VALIDATE */
 
+/*
+ * One writer scope: the trie, and whether its enter took a read-side section of
+ * the trie's flavor (ft_writer_lock_scope_enter's FINE arm).  Carried in the
+ * scope object rather than re-derived at exit, so the exit drops exactly what
+ * this enter took, whatever the gate reads by then.
+ */
+struct ft_writer_scope {
+	struct cds_ft *ft;
+	bool rcu;
+};
+
 static inline
-void ft_excl_writer_scope_exit(struct cds_ft **ft)
+struct ft_writer_scope ft_excl_writer_scope_enter(struct cds_ft *ft)
 {
+	struct ft_writer_scope scope = { .ft = ft };
+
+	scope.rcu = ft_excl_writer_enter(ft);
+	return scope;
+}
+
+static inline
+void ft_excl_writer_scope_exit(struct ft_writer_scope *scope)
+{
+	struct cds_ft *ft = scope->ft;
+
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
 	 * Verify before releasing the writer claim so a concurrent
 	 * writer cannot start mutating while we walk the trie.  Runs under
 	 * the FT-wide lock (released last, below).
 	 */
-	ft_writer_scope_verify(*ft);
+	ft_writer_scope_verify(ft);
 #endif
-	ft_excl_writer_exit(*ft);
+	ft_excl_writer_exit(ft);
 	/*
 	 * MW lock-mode: release the FT-wide writer lock at the outermost
 	 * scope, after the discipline checks / verify walked the trie under
 	 * it.  No-op on an optimistic trie.
 	 */
-	ft_writer_lock_scope_exit(*ft);
+	ft_writer_lock_scope_exit(ft);
+	/* Last out: the section the enter took first. */
+	if (scope->rcu) {
+		ft_wscope_rcu_held--;
+		ft->group->flavor->read_unlock();
+	}
 }
 static inline
 void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
@@ -5048,10 +5176,10 @@ void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
 #define CDS_FT_CAT_(a, b) CDS_FT_CAT2_(a, b)
 
 #define CDS_FT_SCOPED_WRITER(ft)					\
-	struct cds_ft *CDS_FT_CAT_(_ft_excl_scope_, __COUNTER__)	\
+	struct ft_writer_scope CDS_FT_CAT_(_ft_excl_scope_, __COUNTER__)	\
 		__attribute__((unused,					\
 			cleanup(ft_excl_writer_scope_exit))) =		\
-		(ft_excl_writer_enter(ft), (ft))
+		ft_excl_writer_scope_enter(ft)
 
 #define CDS_FT_SCOPED_READER(ft)					\
 	struct ft_excl_reader_scope CDS_FT_CAT_(_ft_excl_scope_, __COUNTER__) \
@@ -5654,8 +5782,27 @@ static inline void ft_delay_seam(enum ft_delay_site site) { (void) site; }
 			abort();                                               \
 		}                                                              \
 	} while (0)
+/*
+ * The same check for the point ops whose CONTRACT puts the section on the
+ * CALLER (a cached iterator's node must stay live): asked of the caller's state
+ * recorded when the writer scope took its own section, which would otherwise
+ * satisfy read_ongoing() on the caller's behalf.
+ */
+# define CDS_FT_ASSERT_CALLER_RCU_READ_LOCKED(ft)                              \
+	do {                                                                   \
+		if (caa_unlikely(!(ft_wscope_rcu_held ?                        \
+				ft_wscope_caller_reading :                     \
+				(ft)->group->flavor->read_ongoing()))) {       \
+			fprintf(stderr, "[Fatal] Fractal Trie API violation: " \
+					"RCU read-side lock not held by the "  \
+					"caller at %s:%d\n", __FILE__,         \
+					__LINE__);                             \
+			abort();                                               \
+		}                                                              \
+	} while (0)
 #else
 # define CDS_FT_ASSERT_RCU_READ_LOCKED(ft) do { } while (0)
+# define CDS_FT_ASSERT_CALLER_RCU_READ_LOCKED(ft) do { } while (0)
 #endif
 
 /*

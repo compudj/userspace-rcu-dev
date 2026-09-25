@@ -6265,7 +6265,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	 * be held.
 	 */
 	if (iter->cache_valid)
-		CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+		CDS_FT_ASSERT_CALLER_RCU_READ_LOCKED(ft);
 	iter_debug_path_check(iter);
 
 	if (!valid_external_node(old_node) || !valid_external_node(new_node)
