@@ -3851,6 +3851,45 @@ int ft_detach_node(struct cds_ft *ft,
 		return -EAGAIN;	/* holder gone: re-descend */
 	}
 	/*
+	 * ☠ THE HOLDER IS THE NODE THE CLIMB ENDED AT, OR THE PLAN IS VOID.
+	 * @detach_node_flag_ptr is a slot INSIDE the climb's boundary (its last
+	 * @cur, metadata_stack[nr_branch - 1]), and every write below goes
+	 * through it -- but @iter_node_flag is a FRESH read of the slot above
+	 * it, and a peer that republished the boundary since (a compressed
+	 * split's fresh junction, a recompaction's copy) hands back a node the
+	 * slot does not live in.  Nothing downstream re-asks: the op locks
+	 * THAT node, which is live, and its record lands on the RETIRED
+	 * boundary's slot, whose body still holds the plan's value, so even an
+	 * MW expected-old matches.  The live copy keeps naming the child this
+	 * commit then retires.
+	 *
+	 * MEASURED (LTTng, inv_prefix_shape_zoo insert/remove_all): the climb
+	 * condemned H, a junction whose only content left was its prefix head
+	 * N, under the compressed boundary CN.  A peer split CN into a fresh
+	 * junction J still carrying H, and committed; this op read J here,
+	 * locked it, recorded CN->child: H -> N, and retired H.  J still named
+	 * H: a tombstoned node reachable from a live one, and every remove of
+	 * N's key then spun on it (50,000 consecutive retries).
+	 *
+	 * The leaf hoist below states this same test for its own arm; the
+	 * promote arm had none.  With identity established here, the holder's
+	 * acquire (which refuses a tombstone) is what keeps it: under that lock
+	 * the boundary is live, so its slot is too.  Nothing is built, locked
+	 * or reserved yet: re-descend.
+	 *
+	 * An EXTERNAL word is the same stale plan -- a peer collapsed the
+	 * boundary into the bare leaf it carried -- and has no metadata to
+	 * compare: refuse it first (MEASURED: 2 of 12 runs SEGV'd resolving
+	 * one).  SKIP before EXTERNAL: a SKIP_X word carries its child's tag.
+	 */
+#ifndef FT_DEBUG_NO_HOLDER_IDENTITY
+	if (caa_unlikely((!ft_node_skip_compressed(iter_node_flag) &&
+				ft_node_external(iter_node_flag)) ||
+			ft_flag_to_metadata(ft, iter_node_flag) !=
+				metadata_stack[nr_branch - 1]))
+		return -EAGAIN;	/* boundary republished: re-descend */
+#endif
+	/*
 	 * PLAN EXPECTED-OLD, enforced (see @plan_old_child): everything below --
 	 * the orphan set walked from @elevated_old_child, the count fold, and the
 	 * drop itself -- names the subtree the climb condemned.  A peer that
