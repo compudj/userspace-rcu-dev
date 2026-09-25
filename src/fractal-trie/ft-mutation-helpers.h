@@ -15811,23 +15811,35 @@ void ft_cell_pair_check_held(const struct cds_ft *ft,
 		const struct ft_ord_cell *pred, const struct ft_ord_cell *succ)
 {
 	const struct ft_ord_cell *pn, *sp;
+	bool pd, sd;
 
 	if (!pred || !succ)
 		return;
 	pn = ft_ord_cell_resolve_ord(&pred->lnode.next);
 	sp = ft_ord_cell_resolve_ord(&succ->lnode.prev);
-	if (caa_unlikely(sp == pred && pn && pn != succ && ft_cell_deleted(pn)))
+	/*
+	 * ☠ ONLY A LIVE CELL'S WORD CAN TEAR.  Each signature reads one word --
+	 * @pred's next (T1, T3) or @succ's prev (T2, T4) -- and a DELETED cell's
+	 * words are frozen at its unlink: they keep naming whatever they named,
+	 * which may itself have been deleted since.  A plan whose two cells are
+	 * both dead is therefore STALE, not torn, and the staleness answer below
+	 * re-plans it.  MEASURED: 13 of 13 reports on inv_prefix_shape_zoo's
+	 * full mix (rcu-debug, root-only and exponential) had BOTH cells marked.
+	 */
+	pd = !ft_ord_is_end(ft, pred) && ft_cell_deleted(pred);
+	sd = !ft_ord_is_end(ft, succ) && ft_cell_deleted(succ);
+	if (caa_unlikely(sp == pred && !pd && pn && pn != succ &&
+			ft_cell_deleted(pn)))
 		ft_cell_torn(ft, "T1: succ->prev names pred, but pred->next names a DELETED cell",
 			pred, succ, pn);
-	if (caa_unlikely(pn == succ && sp && sp != pred && ft_cell_deleted(sp)))
+	if (caa_unlikely(pn == succ && !sd && sp && sp != pred &&
+			ft_cell_deleted(sp)))
 		ft_cell_torn(ft, "T2: pred->next names succ, but succ->prev names a DELETED cell",
 			succ, pred, sp);
-	if (caa_unlikely(pn == succ && !ft_ord_is_end(ft, succ) &&
-			ft_cell_deleted(succ)))
+	if (caa_unlikely(pn == succ && !pd && sd))
 		ft_cell_torn(ft, "T3: pred->next names succ, which is DELETED",
 			pred, succ, succ);
-	if (caa_unlikely(sp == pred && !ft_ord_is_end(ft, pred) &&
-			ft_cell_deleted(pred)))
+	if (caa_unlikely(sp == pred && !sd && pd))
 		ft_cell_torn(ft, "T4: succ->prev names pred, which is DELETED",
 			succ, pred, pred);
 }
