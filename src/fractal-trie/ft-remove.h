@@ -9964,16 +9964,30 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	 * member whose depth is not itself a lock level has no anchor without the
 	 * descent table -- ft_anchor_meta asserts `d` for exactly that case.
 	 * (Measured: ft_inv is 148/148 at per-node and root-only, and aborts here
-	 * at exponential.  Neither of those two needs the table -- per-node takes
-	 * no descent at all, and root-only names the trie root directly -- which
-	 * is why the gate is on the one spacing that does.)
+	 * at exponential.)
+	 *
+	 * ☠ ROOT-ONLY NEEDS THE DATE TOO.  "Root-only names the trie root
+	 * directly" is true of every member dated below the root -- and FALSE of
+	 * depth 0, which is the ROOT CLAIM: ft_anchor_meta anchors a depth-0
+	 * member on ITSELF, and asserts it has no parent (standing since
+	 * 1c288c07).  Left undated, @holder_depth is its initializer 0, so a
+	 * stale plan arrives claiming its holder is the root: the assert fires
+	 * under a debug build, and a release build anchors the holder on itself
+	 * while every other op anchors it on the root -- the two exclude
+	 * nothing.  MEASURED: inv_prefix_shape_zoo's full mix at root-only, 5 of
+	 * 6 runs on that assert, from this call's lock take.  Only per-node,
+	 * which takes no descent, has no date to lose.
 	 *
 	 * Bail RETRIABLY: nothing is reserved yet and nothing is published, and
 	 * the cache is dropped so the next attempt re-seeds through a fresh
 	 * lookup rather than re-deriving from the same stale @iter->node.
 	 */
 	if (!have_descent &&
+#ifdef FT_DEBUG_RA_ROOT_ONLY_UNDATED
 	    ft->lock_spacing == CDS_FT_LOCK_SPACING_EXPONENTIAL) {
+#else
+	    ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
+#endif
 		/*
 		 * ☠ MATERIALIZE BEFORE DROPPING.  The next attempt re-seeds
 		 * "through a fresh lookup" -- from @iter's KEY -- and on a
