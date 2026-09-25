@@ -998,6 +998,16 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 			? cds_ft_item_to_metadata((struct cds_ft_inode *)
 				ft_compressed_node_ptr(orphans[i]))
 			: cds_ft_item_to_metadata(ft_node_ptr(orphans[i]));
+		/*
+		 * An orphan is a LINK of the condemned chain -- keyless and
+		 * single-child, or the one junction whose head the climb
+		 * promoted -- and it is held here: a second child means the
+		 * walk that collected it left the plan, and retiring it
+		 * takes a live key with it (the phase-2 target check in
+		 * ft_detach_node is the measured instance).
+		 */
+		urcu_assert_debug(ft_node_compressed(orphans[i]) ||
+			ft_meta_nr_child_load(m) <= 1);
 
 		if (held)
 			ft_detach_freeze_one(txn, ctx, &held[i], m);
@@ -2968,6 +2978,12 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	struct cds_ft_inode_flag *plan_old_child;
 	/*
+	 * The detach TARGET as the entry read it (@plan_old_child before the
+	 * climb re-anchors it): the node the orphan walk must arrive at once it
+	 * has walked the @nr_elevated links the climb counted.
+	 */
+	struct cds_ft_inode_flag *entry_target;
+	/*
 	 * The holder slot the climb starts from, and the ONE raw value it read
 	 * there -- the value @cur was resolved from.  When the climb elevates, that
 	 * slot becomes the drop target, so this pair IS its plan expected-old.
@@ -3244,6 +3260,7 @@ int ft_detach_node(struct cds_ft *ft,
 	/* Plan expected-old for a detach that never elevates (see @plan_old_child). */
 	plan_old_child = (struct cds_ft_inode_flag *)
 		rcu_dereference(*detach_node_flag_ptr);
+	entry_target = ft_resolve_flip_proxy(plan_old_child);
 	FT_DT_INC(ft_dt_cap0_reach);
 	if (!plan_old_child)
 		FT_DT_INC(ft_dt_cap0_null);
@@ -4705,6 +4722,41 @@ int ft_detach_node(struct cds_ft *ft,
 			/* Phase 2: target and chain below. */
 			if (free_detached_subtree) {
 				bool phase2_first = true;
+
+				/*
+				 * ☠ PHASE 2 STARTS AT THE TARGET, OR NOT AT ALL.
+				 * Its first node is exempt from the nr_child > 1
+				 * test below -- it is the target, whose count the
+				 * detach itself is changing -- but nothing asked
+				 * whether it IS the target.  Phase 1 follows each
+				 * link's child as read UNDER that link's lock, so it
+				 * walks the tree as it is NOW, not as the climb
+				 * counted it: a peer insert that split a compressed
+				 * link of the chain (a fresh run over a fresh
+				 * junction carrying the old continuation AND the
+				 * peer's key) is walked through, and the fresh
+				 * junction lands here -- exempt -- and is retired
+				 * with both keys inside.  MEASURED (LTTng + an
+				 * orphan-count abort, inv_prefix_shape_zoo
+				 * insert/remove_all): 6 of 6 runs, orphan[3] of 4,
+				 * nr_child 2, cds_ft_verify then "ord-cell list
+				 * longer than trie" with a never-removed key gone.
+				 *
+				 * Every destroy-style caller is a remove whose
+				 * target is the chain head the entry pinned
+				 * (@freeze_leaf): an EXTERNAL node, where this loop
+				 * does not run.  An internal node here that is not
+				 * the entry's target means the chain moved under the
+				 * walk: re-descend.  Nothing of this walk's is
+				 * recorded yet; its held links release at @end.
+				 */
+#ifndef FT_DEBUG_NO_PHASE2_TARGET
+				if (walk_nf && !ft_node_external(walk_nf) &&
+						walk_nf != entry_target) {
+					ret = -EAGAIN;
+					goto end;
+				}
+#endif
 
 				while (walk_nf &&
 				       !ft_node_external(walk_nf) &&
