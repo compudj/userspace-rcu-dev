@@ -6628,8 +6628,15 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		 * (@new_node still carries its zeroed links, @old_node is intact).
 		 */
 		if (old_cell) {
+			/* Resolved, not raw: see ft_promote_head's copy. */
+#ifndef FT_DEBUG_NO_CELL_PARENT_RESOLVE
+			new_cell_flag = ft_ord_cell_alloc(ft, new_node,
+				ft_resolve_flip_proxy(
+					rcu_dereference(old_cell->parent)));
+#else
 			new_cell_flag = ft_ord_cell_alloc(ft, new_node,
 				old_cell->parent);
+#endif
 			if (!new_cell_flag) {
 				s = CDS_FT_STATUS_MEMORY_ERROR;
 				return ft_replace_exit(&hm, s);

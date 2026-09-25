@@ -6698,8 +6698,28 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * on OOM: that would commit a reader-visible store outside the
 		 * descriptor protocol.
 		 */
+		/*
+		 * ☠ RESOLVE THE PARENT BEFORE COPYING IT.  The holder's lock is
+		 * held, but a re-home INTO that holder can still be settling:
+		 * the peer that published the holder fresh (its born lock) has
+		 * already released it while its record on this very cell's
+		 * parent still parks a proxy, the descriptor SUCCEEDED.  Copied
+		 * raw, the proxy names a record of ANOTHER slot that no settle
+		 * rewrites, and the new cell's parent stays a proxy for ever
+		 * (MEASURED: inv_prefix_dup_promote_vs_extension at exponential
+		 * spacing, the rcu-debug "FT CELL PARENT COPY" abort in 2 of 4
+		 * full-suite runs; a probe at this line saw the holder live and
+		 * held, the head slot naming @node, and the record re-homing the
+		 * head from the compressed node to that holder).  Decided and
+		 * holder-held, the resolved value is the parent.
+		 */
+#ifndef FT_DEBUG_NO_CELL_PARENT_RESOLVE
+		void *new_cell_flag = ft_ord_cell_alloc(ft, next_node,
+			ft_resolve_flip_proxy(rcu_dereference(old_cell->parent)));
+#else
 		void *new_cell_flag = ft_ord_cell_alloc(ft, next_node,
 			old_cell->parent);
+#endif
 		struct ft_ord_cell *new_cell;
 		struct ft_flip_txn *txn;
 
