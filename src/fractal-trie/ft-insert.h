@@ -5259,6 +5259,35 @@ restart_replace_attempt:
 						 * untouched structure.
 						 */
 						FT_IRH_PROBE(ft, 0, d.nf, displaced, NULL);
+#ifndef FT_DEBUG_NO_DISPLACED_HEAD_RECHECK
+						/*
+						 * ☠ THE DISPLACED HEAD IS A PLAN READ.
+						 * @displaced was read with nothing held;
+						 * the holder is held now, and the swap
+						 * below records it as external_nodes'
+						 * expected-old -- a blind SW store.  A
+						 * same-key replace that committed in
+						 * between installed its own head and
+						 * froze this chain; the chain check
+						 * below ACCEPTS a frozen tail by design,
+						 * so the swap overwrote the peer's head,
+						 * orphaning it and its ordered cell
+						 * (MEASURED: inv_prefix_shape_zoo, four
+						 * writers of insert_replace, the stale-old
+						 * audit naming the second freeze of one
+						 * chain in 3 of 3 runs).  The holder must
+						 * still name it, and it must be live.
+						 */
+						if (ft_dereference_external(
+								metadata->external_nodes) !=
+								displaced ||
+						    ft_node_is_removed(displaced)) {
+							FT_HLIST_PLAN_BAIL();
+							ft_flip_txn_destroy(txn);
+							ret = -EAGAIN;
+							goto insert_replace_done;
+						}
+#endif
 						if (!ft_hlist_chain_plan_ok(ft,
 								ft_flip_txn_handle(txn),
 								displaced, nr_disp)) {
@@ -5455,6 +5484,35 @@ restart_replace_attempt:
 						 * untouched structure.
 						 */
 						FT_IRH_PROBE(ft, 1, d.nf, displaced, NULL);
+#ifndef FT_DEBUG_NO_DISPLACED_HEAD_RECHECK
+						/*
+						 * ☠ THE DISPLACED HEAD IS A PLAN READ.
+						 * @displaced was read with nothing held;
+						 * the holder is held now, and the swap
+						 * below records it as external_nodes'
+						 * expected-old -- a blind SW store.  A
+						 * same-key replace that committed in
+						 * between installed its own head and
+						 * froze this chain; the chain check
+						 * below ACCEPTS a frozen tail by design,
+						 * so the swap overwrote the peer's head,
+						 * orphaning it and its ordered cell
+						 * (MEASURED: inv_prefix_shape_zoo, four
+						 * writers of insert_replace, the stale-old
+						 * audit naming the second freeze of one
+						 * chain in 3 of 3 runs).  The holder must
+						 * still name it, and it must be live.
+						 */
+						if (ft_dereference_external(
+								metadata->external_nodes) !=
+								displaced ||
+						    ft_node_is_removed(displaced)) {
+							FT_HLIST_PLAN_BAIL();
+							ft_flip_txn_destroy(txn);
+							ret = -EAGAIN;
+							goto insert_replace_done;
+						}
+#endif
 						if (!ft_hlist_chain_plan_ok(ft,
 								ft_flip_txn_handle(txn),
 								displaced, nr_disp)) {
