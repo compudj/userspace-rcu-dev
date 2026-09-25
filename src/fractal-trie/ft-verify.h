@@ -567,6 +567,19 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 		return -1;
 	}
 	/*
+	 * A REACHABLE node is never retired.  FT_STATE_TOMBSTONE is set by the
+	 * commit that unlinks the node (freeze-on-free, doc §4.B), so a tombstone
+	 * found by a walk from the root is a node some commit retired while a
+	 * slot still names it -- the reclaim will free it under that slot, and
+	 * every op that reaches it is refused (or, before the refusal, misled).
+	 */
+	if (cn_meta->state & FT_STATE_TOMBSTONE) {
+		if (out)
+			fprintf(out, "ft_verify: depth %u: compressed node %p is RETIRED (tombstone) yet reachable\n",
+				depth, node_flag);
+		return -1;
+	}
+	/*
 	 * cn->child / nr_child bookkeeping must agree:
 	 *   nr_child == 1 implies cn->child is non-NULL (the one child);
 	 *   nr_child == 0 implies cn->child is NULL.
@@ -930,6 +943,13 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		if (metadata->state & FT_STATE_LOCK) {
 			if (out)
 				fprintf(out, "ft_verify: depth %u: internal node %p node lock set at rest (leaked lock)\n",
+					depth, node_flag);
+			return -1;
+		}
+		/* Reachable yet retired: see the compressed-node check. */
+		if (metadata->state & FT_STATE_TOMBSTONE) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: internal node %p is RETIRED (tombstone) yet reachable\n",
 					depth, node_flag);
 			return -1;
 		}
