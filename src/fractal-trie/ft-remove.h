@@ -10072,6 +10072,25 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				 * value-swap target (§10.5). */
 				ft_flip_txn_lock_or_guard_parent(ft, txn, &lctx,
 					holder_flag, holder_depth);
+				/*
+				 * ☞ A MISSED TAKE ENDS THE ATTEMPT HERE, before the
+				 * count walk and the chain freeze are recorded into a
+				 * txn the commit is bound to discard: the freeze's
+				 * chain records are SW whoever holds the word, so each
+				 * is a stale plan against the holder's own in-flight
+				 * freeze of the same chain (the SW stale-old audit on
+				 * inv_prefix_shape_zoo, the peer's record on the same
+				 * slot, SUCCEEDED).  Same exit as the plan bail below.
+				 */
+				if (caa_unlikely(txn->acquire_miss)) {
+					ft_flip_txn_destroy(txn);
+					if (unsplice_txn)
+						ft_flip_txn_destroy(unsplice_txn);
+					*result_node = NULL;
+					FT_DBG_RETRY_SITE();
+					*need_retry = true;
+					return CDS_FT_STATUS_OK;
+				}
 				ft_flip_txn_record_count_parent(ft, txn,
 					holder_flag, -1);
 				/*

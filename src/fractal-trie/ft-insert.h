@@ -5156,6 +5156,23 @@ restart_replace_attempt:
 					ft_lock_ctx_init(&actx, &d, txn, &optxn);
 					ft_flip_txn_lock_or_guard_parent(ft, txn, &actx, d.nf,
 						FT_DEPTH_FROM_DESCENT);
+					/*
+					 * ☞ A MISSED TAKE ENDS THE ATTEMPT HERE, as in
+					 * the leaf arms (dbc41961): carrying on builds the
+					 * swap and the chain freeze into a txn the commit
+					 * is bound to discard -- and the freeze's chain
+					 * records are SW whoever holds the word, so each
+					 * is a stale plan against the lock holder's own
+					 * in-flight freeze of the same chain (the audit's
+					 * report on inv_prefix_shape_zoo, the peer's
+					 * record on the same slot, SUCCEEDED).  Nothing is
+					 * recorded on @txn yet.
+					 */
+					if (caa_unlikely(txn->acquire_miss)) {
+						(void) ft_flip_txn_commit(ft, txn);
+						ret = -EAGAIN;
+						goto insert_replace_done;
+					}
 					ft_replace_fault_arm_abort(txn);
 					/*
 					 * On a peer-conflict ABORT the commit installs
@@ -5342,6 +5359,23 @@ restart_replace_attempt:
 					ft_lock_ctx_init(&actx, &d, txn, &optxn);
 					ft_flip_txn_lock_or_guard_parent(ft, txn, &actx, d.nf,
 						FT_DEPTH_FROM_DESCENT);
+					/*
+					 * ☞ A MISSED TAKE ENDS THE ATTEMPT HERE, as in
+					 * the leaf arms (dbc41961): carrying on builds the
+					 * swap and the chain freeze into a txn the commit
+					 * is bound to discard -- and the freeze's chain
+					 * records are SW whoever holds the word, so each
+					 * is a stale plan against the lock holder's own
+					 * in-flight freeze of the same chain (the audit's
+					 * report on inv_prefix_shape_zoo, the peer's
+					 * record on the same slot, SUCCEEDED).  Nothing is
+					 * recorded on @txn yet.
+					 */
+					if (caa_unlikely(txn->acquire_miss)) {
+						(void) ft_flip_txn_commit(ft, txn);
+						ret = -EAGAIN;
+						goto insert_replace_done;
+					}
 					ft_replace_fault_arm_abort(txn);
 					/* Installs nothing on either failure, as the
 					 * head arm: ABORT -> -EAGAIN (retry),
