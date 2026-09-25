@@ -2151,6 +2151,19 @@ static void ft_sw_stale_check(const struct urcu_txn_record *r)
 				(void *) r->slot, r->old_ptr, cur,
 				isproxy ? " (a peer's parked proxy)" : "",
 				r->new_ptr);
+			if (isproxy) {
+				/* Name the peer: its record and its commit's state. */
+				struct urcu_txn_record *pr =
+					urcu_txn_untag(cur, r->proxy_tag);
+
+				fprintf(stderr, "FT SW STALE-OLD AT DETECTION: the "
+					"peer's record: slot %p old %p new %p kind %d, "
+					"descriptor %p status %lu\n",
+					(void *) pr->slot, pr->old_ptr, pr->new_ptr,
+					(int) pr->kind, (void *) pr->desc,
+					pr->desc ? (unsigned long) uatomic_load(
+						&pr->desc->status, CMM_RELAXED) : 99UL);
+			}
 			nbt = backtrace(bt, FT_SWS_DEPTH);
 			backtrace_symbols_fd(bt, nbt, 2);
 			abort();
