@@ -1757,6 +1757,8 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 		const bool seed_from_node,
 		struct ft_visit_witness *wit)	/* NULL = no coherence witness */
 {
+	struct ft_ord_cell *cur = NULL;
+
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
 	/*
@@ -1770,8 +1772,9 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 			(mode == FT_LOOKUP_GT || mode == FT_LOOKUP_LT) &&
 			limit == FT_LOOKUP_LIMIT_NONE &&
 			iter->cache_valid && iter->node &&
-			ft_ord_cell_fastpath_ok(ft, iter)) {
-		struct ft_ord_cell *cur = ft_ord_cell_cursor(iter);
+			ft_ord_cell_fastpath_ok(ft, iter) &&
+			/* No cell to hop from: the descent below re-derives. */
+			(cur = ft_ord_cell_cursor(iter)) != NULL) {
 		struct ft_ord_cell *nxt = (mode == FT_LOOKUP_GT) ?
 			ft_ord_cell_resolve_ord(&cur->lnode.next) :
 			ft_ord_cell_resolve_ord(&cur->lnode.prev);

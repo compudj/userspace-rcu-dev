@@ -51,14 +51,40 @@ bool ft_iter_key_referenced(const struct cds_ft_iter *iter)
 /*
  * Resolve the current head's cell for a cell-walk step: use the cached cursor
  * when it still refers to iter->node (no leaf touch), else re-enter the walk
- * via the head's prev (one leaf load -- the per-walk-entry cost).
+ * via the head's prev (one leaf load -- the per-walk-entry cost).  NULL when
+ * there is no cell to re-enter from.
+ *
+ * ☠ A CHAIN MEMBER'S prev IS A NODE, NOT A CELL.  @iter->node was a head when
+ * the reader found it, but a concurrent same-parent rekey merge splices a
+ * moved head into an existing chain and so DEMOTES it in place: its prev
+ * becomes the new predecessor node.  Cast as a cell, that node's bytes gave
+ * the up-walk a NULL "parent" and a heap address as the cell, and
+ * cds_ft_item_to_metadata faulted on it (MEASURED:
+ * inv_rekey_merge_same_parent_coherent_readers, SIGSEGV in a reader on every
+ * run).  A member carries its head's key, so the head's cell is the member's
+ * position: hop to it, bounded exactly as ft_ext_head_word bounds the walk.
  */
 static inline_lookup
 struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter)
 {
+	struct cds_ft_node *cur = iter->node;
+	void *prev;
+	unsigned long hops = 0;
+
 	if (iter->ord_cell_node == iter->node)
 		return iter->ord_cell;
-	return ft_ord_cell_ptr(ft_dereference_prev_resolved(iter->node));
+	prev = ft_dereference_prev_resolved(cur);
+#ifndef FT_DEBUG_NO_CURSOR_MEMBER_HOP
+	while (prev && ft_node_external((struct cds_ft_inode_flag *) prev)) {
+		if (++hops > FT_EXT_CHAIN_HOPS_MAX)
+			return NULL;
+		cur = (struct cds_ft_node *) prev;
+		prev = ft_dereference_prev_resolved(cur);
+	}
+#else
+	(void) hops;
+#endif
+	return prev ? ft_ord_cell_ptr(prev) : NULL;
 }
 
 /*
