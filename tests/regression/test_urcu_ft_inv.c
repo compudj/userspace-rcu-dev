@@ -14650,9 +14650,6 @@ static int inv_prefix_shape_zoo(void)
 	 * A DEFAULT ROW (FT_INV_ZOO=0 skips it).  Every point update, at random,
 	 * by four writers over the shared prefix-shaped keys, clean on the
 	 * strict, rcu-debug and in-place builds at all three spacings.
-	 * ☐ KNOWN RESIDUAL: the owner assert in __ft_flip_txn_record_tag_ctx (a
-	 * record on a word the op does not own), about 1 run in 90, seen only
-	 * under rcu-debug at exponential spacing.
 	 */
 	if (zoo_env && !strcmp(zoo_env, "0")) {
 		fprintf(stderr, "# inv_prefix_shape_zoo: skipped (FT_INV_ZOO=0)\n");
