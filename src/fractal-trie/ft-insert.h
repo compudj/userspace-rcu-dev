@@ -1332,6 +1332,17 @@ int ft_insert_park_external_nodes(struct cds_ft *ft,
 	ft_lock_ctx_init(&lctx, d, ic->txn, ic->op);
 	ft_flip_txn_lock_or_guard_parent(ft, ic->txn, &lctx, d->nf,
 		FT_DEPTH_FROM_DESCENT);
+#ifndef FT_DEBUG_PARK_MISS_CARRIES_ON
+	/*
+	 * A MISSED TAKE ENDS THE ATTEMPT HERE, through the plan check's exit
+	 * below: the caller destroys the txn and restarts.  Carrying on parked
+	 * the head and let the caller build the rest of a commit that could only
+	 * be discarded -- ~5 records per miss, 118-158k misses per ft_inv leg.
+	 * An allocation failure inside the acquire stays a memory error.
+	 */
+	if (ic->txn && caa_unlikely(ic->txn->acquire_miss))
+		return ic->txn->acquire_enomem ? -ENOMEM : -EAGAIN;
+#endif
 #ifndef FT_DEBUG_PARK_NO_PLAN_CHECK
 	if (ft_dereference_external(metadata->external_nodes) != plan_old)
 		return -EAGAIN;
@@ -3071,6 +3082,18 @@ int ft_attach_node(struct cds_ft *ft,
 			 */
 			ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx,
 				gp_nf, FT_DEPTH_FROM_DESCENT);
+#ifndef FT_DEBUG_ATTACH_MISS_CARRIES_ON
+			/*
+			 * ...and it re-descends HERE, not at the commit: the
+			 * resolver mismatch's own exit, before the count walk
+			 * below is recorded into a txn that can only be
+			 * discarded.
+			 */
+			if (ic->txn && caa_unlikely(ic->txn->acquire_miss)) {
+				ret = ic->txn->acquire_enomem ? -ENOMEM : -EAGAIN;
+				goto check_error;
+			}
+#endif
 #ifdef FEATURE_FT_PROBE_EMPTY_INSERT
 			__atomic_fetch_add(&cds_ft_probe_reach_attach, 1,
 				__ATOMIC_RELAXED);

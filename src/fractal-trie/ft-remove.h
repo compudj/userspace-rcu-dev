@@ -9050,13 +9050,30 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					 * clear empties -- value-swap target (§10.5). */
 					ft_flip_txn_lock_or_guard_parent(ft, txn, &lctx,
 					holder_flag, holder_depth);
-					ft_flip_txn_record_count_parent(ft, txn,
-						holder_flag, -1);
-					ret = ft_remove_one_commit(ft,
-						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
-						holder_meta,
-						(struct cds_ft_inode_flag *) node, NULL,
-						NULL, dead_cell, NULL, txn, node, false);
+#ifndef FT_DEBUG_RM_PREFIX_MISS_CARRIES_ON
+					/*
+					 * A MISSED TAKE ENDS THE ATTEMPT HERE.  Carrying on
+					 * recorded the count walk, took @dead_cell's lock-set
+					 * and built the unsplice and freeze edges into a txn
+					 * ft_flip_txn_commit can only discard -- 9 records per
+					 * miss, 21-43k misses per ft_inv leg.  Run that discard
+					 * now: the same call ft_ord_cell_flip_into ends in, so
+					 * the same aging, the same errno and the same exit.
+					 */
+					if (caa_unlikely(txn->acquire_miss)) {
+						ret = ft_flip_status_to_errno(
+							ft_flip_txn_commit(ft, txn));
+					} else
+#endif
+					{
+						ft_flip_txn_record_count_parent(ft, txn,
+							holder_flag, -1);
+						ret = ft_remove_one_commit(ft,
+							(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
+							holder_meta,
+							(struct cds_ft_inode_flag *) node, NULL,
+							NULL, dead_cell, NULL, txn, node, false);
+					}
 					if (ret == 0 && fuse_remove)
 						pub.armed = true;
 				} else {
