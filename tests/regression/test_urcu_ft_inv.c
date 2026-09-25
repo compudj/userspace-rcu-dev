@@ -83,7 +83,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(138 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+#define NR_TESTS	(139 + NR_TESTS_REKEY_DLM)	/* +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -14755,6 +14755,276 @@ static int inv_prefix_shape_zoo(void)
 }
 
 /*
+ * TWO WRITERS, DISJOINT KEYS, PREFIX-DENSE.  Keys are 1..10 bytes over {a, b},
+ * so nearly every key is a PREFIX of another: removes collapse junctions into
+ * skip-compressed runs, and one writer's remove races the collapse of a
+ * junction whose prefix key belongs to the other writer.  Each writer OWNS its
+ * keys, so every answer about one of them is a claim the oracle can check:
+ *
+ *   - before an insert the key is absent (else a removed node came back);
+ *   - a remove's lookup finds the owner's own node;
+ *   - right after an OK remove, that node is no longer found.
+ *
+ * A stable set, inserted once and never touched, keeps junctions alive.  The
+ * shared-key zoo cannot ask any of this: there a peer may legitimately insert
+ * or remove the same key, so a stale answer reads as a peer's op.
+ *
+ * Found by a standalone two-writer harness: ft_detach_node's climb took each
+ * elevation's plan from a re-read of the slot, so a peer's collapse landed
+ * between the pair check and the elevation and the promote republished a key
+ * that peer had just removed.  FT_INV_OWNED_MS sets the duration,
+ * FT_INV_OWNED_LIST=1 runs it with the ordered list on.
+ */
+#define OWNED_WRITERS	2
+#define OWNED_STABLE	200
+#define OWNED_CHURN	200
+#define OWNED_MAXLEN	10
+
+struct owned_key {
+	uint8_t b[OWNED_MAXLEN];
+	unsigned int len;
+	struct ft_test_node *cur;	/* the owner's node while present */
+};
+
+struct owned_arg {
+	struct cds_ft *ft;
+	struct owned_key *keys;
+	unsigned int nr_keys;
+	unsigned long ops;
+	int *stop_all;
+	int failed;
+};
+
+static uint64_t owned_rnd(uint64_t *s)
+{
+	*s ^= *s << 13;
+	*s ^= *s >> 7;
+	*s ^= *s << 17;
+	return *s;
+}
+
+static bool owned_key_eq(const struct owned_key *x, const struct owned_key *y)
+{
+	return x->len == y->len && !memcmp(x->b, y->b, x->len);
+}
+
+/* @n distinct keys, none equal to one of @avoid[0..@navoid). */
+static void owned_mkkeys(struct owned_key *dst, unsigned int n,
+		const struct owned_key *avoid, unsigned int navoid, uint64_t *s)
+{
+	unsigned int i = 0, j;
+
+	while (i < n) {
+		struct owned_key k;
+		bool dup = false;
+
+		memset(&k, 0, sizeof(k));
+		k.len = 1 + (unsigned int) (owned_rnd(s) % OWNED_MAXLEN);
+		for (j = 0; j < k.len; j++)
+			k.b[j] = (uint8_t) ('a' + (owned_rnd(s) & 1));
+		for (j = 0; j < i && !dup; j++)
+			dup = owned_key_eq(&dst[j], &k);
+		for (j = 0; j < navoid && !dup; j++)
+			dup = owned_key_eq(&avoid[j], &k);
+		if (!dup)
+			dst[i++] = k;
+	}
+}
+
+static struct cds_ft_node *owned_find(struct cds_ft *ft,
+		const struct owned_key *k)
+{
+	struct cds_ft_node *out = NULL;
+
+	if (cds_ft_eager_lookup_key(ft, k->b, k->len, 0, &out) !=
+			CDS_FT_STATUS_OK)
+		return NULL;
+	return out;
+}
+
+static void owned_fail(struct owned_arg *a, const char *what,
+		const struct owned_key *k, const void *node)
+{
+	fprintf(stderr, "inv_owned_prefix_dense: %s key=%.*s node=%p\n",
+		what, (int) k->len, (const char *) k->b, node);
+	a->failed = 1;
+	*a->stop_all = 1;
+	mw_violation_snapshot();
+}
+
+static void *owned_writer(void *arg)
+{
+	struct owned_arg *a = (struct owned_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int i;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(a->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		rcu_quiescent_state();
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop && !*a->stop_all) {
+		for (i = 0; i < a->nr_keys && !test_stop && !*a->stop_all; i++) {
+			struct owned_key *k = &a->keys[i];
+			struct ft_test_node *n;
+			struct cds_ft_node *o;
+
+			rcu_read_lock();
+			o = owned_find(a->ft, k);
+			if (o && !k->cur) {
+				owned_fail(a, "a removed key is found again",
+					k, o);
+				rcu_read_unlock();
+				break;
+			}
+			if (!k->cur) {
+				n = node_alloc(0);
+				if (cds_ft_insert(a->ft, k->b, k->len,
+						&n->node) == CDS_FT_STATUS_OK)
+					k->cur = n;
+				else
+					node_free(n);
+			}
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			a->ops++;
+		}
+		for (i = 0; i < a->nr_keys && !test_stop && !*a->stop_all; i++) {
+			struct owned_key *k = &a->keys[i];
+			struct cds_ft_node *o;
+
+			if (!k->cur)
+				continue;
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k->b, k->len);
+			if (cds_ft_lookup(a->ft, iter) != CDS_FT_STATUS_OK ||
+					cds_ft_iter_node(iter) != &k->cur->node) {
+				owned_fail(a, "a present key is not its owner's node",
+					k, cds_ft_iter_node(iter));
+				rcu_read_unlock();
+				break;
+			}
+			if (cds_ft_remove(a->ft, iter, &k->cur->node) !=
+					CDS_FT_STATUS_OK) {
+				owned_fail(a, "the owner's remove failed",
+					k, &k->cur->node);
+				rcu_read_unlock();
+				break;
+			}
+			o = owned_find(a->ft, k);
+			if (o == &k->cur->node) {
+				owned_fail(a, "an OK remove left its node found",
+					k, o);
+				rcu_read_unlock();
+				break;
+			}
+			node_free_rcu(k->cur);
+			k->cur = NULL;
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			a->ops++;
+		}
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_owned_prefix_dense(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct owned_key *stable, *churn;
+	struct owned_arg a[OWNED_WRITERS];
+	pthread_t th[OWNED_WRITERS];
+	const char *ms_env = getenv("FT_INV_OWNED_MS");
+	const char *list_env = getenv("FT_INV_OWNED_LIST");
+	unsigned long long ms = ms_env ? strtoull(ms_env, NULL, 10) :
+		PREFIX_PAIR_MS;
+	uint64_t s = 0x5eedf00dULL;
+	struct timespec t0;
+	unsigned int i, per = OWNED_CHURN / OWNED_WRITERS;
+	int ret = 0, stop_all = 0;
+
+	/*
+	 * The DEFAULT group, as an application gets it -- no creator knobs:
+	 * skip compression on (the failure needs it), fine locking, rekey
+	 * off.  Ordered list off unless asked, where the failure was densest.
+	 */
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (!(list_env && !strcmp(list_env, "1")) &&
+			cds_ft_group_attr_set_ordered_list(attr, false) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+
+	stable = (struct owned_key *) calloc(OWNED_STABLE, sizeof(*stable));
+	churn = (struct owned_key *) calloc(OWNED_CHURN, sizeof(*churn));
+	if (!stable || !churn)
+		abort();
+	owned_mkkeys(stable, OWNED_STABLE, NULL, 0, &s);
+	owned_mkkeys(churn, OWNED_CHURN, stable, OWNED_STABLE, &s);
+	rcu_read_lock();
+	for (i = 0; i < OWNED_STABLE; i++)
+		if (cds_ft_insert(ft, stable[i].b, stable[i].len,
+				&node_alloc(0)->node) != CDS_FT_STATUS_OK)
+			abort();
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < OWNED_WRITERS; i++) {
+		memset(&a[i], 0, sizeof(a[i]));
+		a[i].ft = ft;
+		a[i].keys = churn + i * per;
+		a[i].nr_keys = per;
+		a[i].stop_all = &stop_all;
+		pthread_create(&th[i], NULL, owned_writer, &a[i]);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < ms && !stop_all)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < OWNED_WRITERS; i++)
+		pthread_join(th[i], NULL);
+	rcu_thread_online();
+
+	for (i = 0; i < OWNED_WRITERS; i++) {
+		if (a[i].failed)
+			ret = -1;
+		if (!a[i].ops) {
+			fprintf(stderr, "inv_owned_prefix_dense: writer %u made no progress\n",
+				i);
+			ret = -1;
+		}
+	}
+	fprintf(stderr, "# inv_owned_prefix_dense: %lu + %lu ops\n",
+		a[0].ops, a[1].ops);
+	rcu_read_lock();
+	if (verify_or_dump(ft, "inv_owned_prefix_dense"))
+		ret = -1;
+	rcu_read_unlock();
+	/* The drain frees every node still reachable, the churn heads included. */
+	drain_trie_keep_group(ft);
+	rcu_barrier();
+	cds_ft_group_destroy(group);
+	free(stable);
+	free(churn);
+	return ret;
+}
+
+/*
  * Same-key cds_ft_insert_unique racing at a PREFIX position: the key ends at
  * an existing internal node (P, with P+'A' and P+'B' kept present below it)
  * that has no head yet, so every insert takes the "new key at this internal
@@ -28103,6 +28373,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_insert_unique_prefix);
 	RUN_TEST(inv_prefix_dup_promote_vs_extension);
 	RUN_TEST(inv_prefix_shape_zoo);
+	RUN_TEST(inv_owned_prefix_dense);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);
