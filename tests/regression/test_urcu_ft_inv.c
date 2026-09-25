@@ -14643,11 +14643,12 @@ static int inv_prefix_shape_zoo(void)
 	int ret = 0;
 
 	/*
-	 * ☐ OPT-IN until its open reds are fixed (FT_INV_ZOO=1): the full op
-	 * mix still ends with an ordered cell outliving its key under
-	 * rcu-debug and hangs the release build, so as a default row it would
-	 * only wedge every gate leg.  Its insert_replace-only mix
-	 * (FT_INV_ZOO_OPS=0x04) is clean.
+	 * ☐ OPT-IN until its open reds are fixed (FT_INV_ZOO=1).  The full op
+	 * mix is clean at per-node on the strict, rcu-debug and in-place
+	 * builds, and at root-only on the strict one; it still livelocks an
+	 * insert_replace at exponential on the strict build, and trips the
+	 * ordered-cell TORN detector at root-only and exponential under
+	 * rcu-debug -- as a default row it would wedge gate legs.
 	 */
 	if (!getenv("FT_INV_ZOO")) {
 		fprintf(stderr, "# inv_prefix_shape_zoo: skipped (set FT_INV_ZOO=1)\n");
