@@ -2995,8 +2995,22 @@ int ft_detach_node(struct cds_ft *ft,
 	 * The FIRST elevation is the load-bearing one and gets its value from the
 	 * SAME load that produced @cur (@entry_holder_raw below), not from a second
 	 * read: the two are ~300 ns apart and a peer publish lands between them.
+	 *
+	 * ☠ AND SO DOES EVERY LATER ONE (@pair_held).  Each level's pair check
+	 * has just proved that the slot holding @cur resolves to @cur, and that
+	 * load -- not a re-read at the elevation -- is the level's plan.  The
+	 * re-read let a peer's commit land between the two: a remove of the
+	 * junction's prefix key collapsed the junction into a skip pointer to
+	 * its surviving leaf, the climb read the junction's external (the key
+	 * that remove had just frozen) as @topmost_external_nodes, and the
+	 * re-read then named the peer's fresh skip node -- so the orphan walk
+	 * locked the NEW chain, never the junction, and the promote published
+	 * the frozen key back into the slot (the two-writer harness:
+	 * STALE-AFTER-RM, LTTng-traced).
 	 */
 	struct cds_ft_inode_flag *plan_old_child;
+	/* This level's pair-checked load of the slot holding @cur. */
+	struct cds_ft_inode_flag *pair_held = NULL;
 	/*
 	 * The detach TARGET as the entry read it (@plan_old_child before the
 	 * climb re-anchors it): the node the orphan walk must arrive at once it
@@ -3350,6 +3364,7 @@ int ft_detach_node(struct cds_ft *ft,
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(cur));
 		metadata_stack[nr_metadata++] = metadata;
+		pair_held = NULL;
 		/*
 		 * ONE proxy-resolved snapshot of this ancestor's parent
 		 * back-pointer, consumed by every use below (the is_root
@@ -3486,6 +3501,8 @@ int ft_detach_node(struct cds_ft *ft,
 				else if (caa_unlikely(ft_node_ptr(held_res) !=
 						ft_node_ptr(cur)))
 					pair_bad = 4;
+				if (!pair_bad)
+					pair_held = held;
 			}
 			if (caa_unlikely(pair_bad)) {
 #ifdef FT_DEBUG_DEL_TOMB
@@ -3809,8 +3826,12 @@ int ft_detach_node(struct cds_ft *ft,
 				plan_old_child = detach_node_flag_ptr ==
 						entry_holder_slot ?
 					entry_holder_raw :
+#ifndef FT_DEBUG_CLIMB_PLAN_REREAD
+					pair_held;
+#else
 					(struct cds_ft_inode_flag *)
 						rcu_dereference(*detach_node_flag_ptr);
+#endif
 				FT_DT_INC(ft_dt_cap1_reach);
 				if (!plan_old_child)
 					FT_DT_INC(ft_dt_cap1_null);
