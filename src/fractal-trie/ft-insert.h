@@ -3237,19 +3237,63 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		return ret;	/* nothing built yet */
 
 	/*
+	 * ☠ TAKE @cn FIRST, THEN READ ITS CHILD -- the split arm's order
+	 * (ft_insert_dlm_acquire_split re-reads cn->child against its plan
+	 * under the lock), which this arm lacked.  The dispatcher classified
+	 * cn->child EXTERNAL from an unheld read, and a peer past-child insert
+	 * of a SIBLING extension republishes that slot IN PLACE, under @cn's
+	 * lock, with a junction carrying the same head; @cn's state word does
+	 * not move (a compressed node always has one child).  Read before the
+	 * lock, the snapshot was either that junction -- wired below as the
+	 * branch's external_nodes, an INTERNAL node posing as a prefix head --
+	 * or the old head, whose expected-old no longer arbitrates anything:
+	 * the op holds @cn by the time it records the slot, so the record is a
+	 * blind SW store (ft_flip_txn_record_tag's held_sw) and overwrites the
+	 * peer's junction, key and all.  MEASURED with
+	 * inv_prefix_siblings_compressed_holder: lost inserts, "ord-cell list
+	 * longer than trie", hangs -- 16 of 16 runs, pre-existing at adeef9a9.
+	 *
+	 * Held here and handed to ft_insert_publish_or_park exactly as the
+	 * split hands P over (@parent_locked_holder / _snap / _shared), so the
+	 * publish registers the release instead of taking the word again.
+	 */
+	struct cds_ft_inode_flag *old_child_flag;
+
+#ifndef FT_DEBUG_PAST_CHILD_NO_PREHOLD
+	if (ft->lock_fine) {
+		struct ft_lock_ctx actx;
+		struct ft_held_anchor held;
+
+		ft_lock_ctx_init(&actx, d, NULL, ic->op);
+		if (ft_acquire_member(ft, &actx, d->nf,
+				cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
+				d->depth, &held)) {
+			ret = -EAGAIN;
+			goto arm_unwind;	/* nothing acquired */
+		}
+		old_child_flag = ft_cn_child_dereference_acquire_prefetch(cn);
+		if (!old_child_flag || ft_node_skip_compressed(old_child_flag) ||
+				!ft_node_external(old_child_flag)) {
+			if (!held.shared)
+				ft_meta_lock_release(held.lock);
+			ret = -EAGAIN;
+			goto arm_unwind;	/* stale plan: re-descend */
+		}
+		ic->parent_lock_shared = held.shared;
+		ic->parent_locked_holder = held.shared ? NULL : held.lock;
+		ic->parent_locked_snap = held.lock_snap;
+	} else
+#endif
+	/*
 	 * ONE resolved snapshot of the live external child, consumed by both
 	 * the branch's external_nodes wiring and the parked live re-parent
-	 * below.  The dispatcher classified cn->child external, but a peer may
-	 * park a flip-proxy on it (re-parenting that external head) before these
-	 * reads: a RAW read would publish the proxy as the branch's external
-	 * head / @ic->live_child and ft_park_live_parent_edge would dereference
-	 * the latch memory at commit.  Resolve once, like the sibling split
-	 * builders (ft_split_compressed_diverge / _key_shorter); a post-snapshot
-	 * peer commit is caught by the §4.B guard on @d->nf that
-	 * ft_insert_publish_or_park records (ABORT -> re-descend).
+	 * below.  A peer may park a flip-proxy on it (re-parenting that
+	 * external head): a RAW read would publish the proxy as the branch's
+	 * external head / @ic->live_child and ft_park_live_parent_edge would
+	 * dereference the latch memory at commit.  Resolve once, like the
+	 * sibling split builders (ft_split_compressed_diverge / _key_shorter).
 	 */
-	struct cds_ft_inode_flag *old_child_flag =
-		ft_cn_child_dereference_acquire_prefetch(cn);
+	old_child_flag = ft_cn_child_dereference_acquire_prefetch(cn);
 
 	/*
 	 * Case 1 (external at END of compressed path): build a
@@ -3344,6 +3388,8 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	ic->count_folded = true;
 	return 0;
 arm_unwind:
+	/* The pre-held @cn, not yet registered into ic->txn (a no-op if not held). */
+	ft_insert_dlm_release_parent(ic);
 	if (ic->txn) {
 		ft_flip_txn_destroy(ic->txn);
 		ic->txn = NULL;
@@ -3626,19 +3672,47 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 	cmp = cn->len < remaining ? cn->len : remaining;
 	j = ft_match_compressed_key(*iter_key_p, cn, cmp);
 	if (j == cmp && cn->len <= remaining) {
+		/*
+		 * ONE RESOLVED READ classifies the child.  A peer's parked flip
+		 * proxy carries FT_INTERNAL_MASK, so a raw cn->child read as
+		 * "internal" whatever it resolves to.
+		 */
+		struct cds_ft_inode_flag *child =
+			ft_resolve_flip_proxy(rcu_dereference(cn->child));
+
 		/* Full match: traverse through if child is internal,
 		 * compressed, or skip-compressed (which encodes another
 		 * compressed node deeper in the chain). */
-		if (cn->child &&
-		    (ft_node_skip_compressed(cn->child) ||
-		     ft_node_internal(cn->child) ||
-		     ft_node_compressed(cn->child))) {
+		if (child &&
+		    (ft_node_skip_compressed(child) ||
+		     ft_node_internal(child) ||
+		     ft_node_compressed(child))) {
 			ft_snapshot_push(snapshot, snapshot_depth,
 				*nr_snapshot_p, d->nf, d->depth);
 			ft_descent_traverse_compressed(ft, d, cn, iter_key_p);
+			/*
+			 * ☠ THE TRAVERSAL READS cn->child AGAIN.  A sibling's
+			 * remove that folded its junction back to the head in
+			 * between leaves the cursor on an EXTERNAL leaf with the
+			 * key continuing -- the past-child shape, which only
+			 * this dispatcher can route.  Returned as CONTINUE, the
+			 * caller's loop breaks on the external and attaches
+			 * under d->pnf == this COMPRESSED node, which has no
+			 * byte slot (ft_attach_node's `slot_ptr` assert,
+			 * MEASURED under two sibling-extension writers).
+			 * Nothing is built yet: re-descend.
+			 */
+#ifndef FT_DEBUG_NO_TRAVERSE_RECHECK
+			if (d->nf && !ft_node_skip_compressed(d->nf) &&
+					ft_node_external(d->nf) &&
+					cn->len < remaining) {
+				*ret_p = -EAGAIN;
+				return FT_DESCENT_END;
+			}
+#endif
 			return FT_DESCENT_CONTINUE;
 		}
-		if (!cn->child) {
+		if (!child) {
 			struct cds_ft_metadata *cn_meta =
 				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 			fprintf(stderr, "BUG: cn->child NULL, cn=%p cn->len=%u depth=%u external_nodes=%p nr_child=%u\n",

@@ -83,7 +83,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(134 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder */
+#define NR_TESTS	(135 + NR_TESTS_REKEY_DLM)	/* +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -14030,16 +14030,25 @@ static int inv_prefix_key_park_vs_holder_churn(void)
  * Oracles, all owner-only (no peer touches a writer's key): an insert that
  * reported OK must be findable as the writer's own node; the owner's remove
  * of its present key must return OK.
+ *
+ * The SIBLINGS variant keeps P present for the whole run and races two
+ * EXTENSIONS of it, P+'6' and P+'7': with both absent the compressed holder's
+ * child is P itself, so both inserts take the past-child arm on the same
+ * slot, and the one that publishes second must not overwrite the first's
+ * junction.  P, never removed, must stay findable throughout.
  */
 #define PREFIX_PAIR_PAIRS_MAX	4	/* one P writer + one K writer each */
 #define PREFIX_PAIR_RUN		24	/* bytes of P: the compressed run + 1 */
 #define PREFIX_PAIR_MS		1000
 #define PREFIX_PAIR_STABLE	10	/* untouched keys under other root bytes */
 static unsigned long prefix_pair_lost, prefix_pair_refused, prefix_pair_stale;
+/* Siblings variant: each root byte's P, inserted once and never removed. */
+static struct cds_ft_node *prefix_pair_anchor[PREFIX_PAIR_PAIRS_MAX];
 struct prefix_pair_arg {
 	struct cds_ft *ft;
 	unsigned int w;
-	int extension;
+	int extension;		/* 0: P, 1: P+'6', 2: P+'7' */
+	int peer_extension;
 	unsigned long ops;
 };
 
@@ -14052,7 +14061,7 @@ static size_t prefix_pair_key(uint8_t *key, unsigned int w, int extension)
 	memcpy(key + 1, run, PREFIX_PAIR_RUN - 1);
 	len = PREFIX_PAIR_RUN;
 	if (extension)
-		key[len++] = '6';
+		key[len++] = extension == 2 ? '7' : '6';
 	return len;
 }
 
@@ -14101,6 +14110,19 @@ static void *prefix_pair_writer(void *arg)
 			uatomic_inc(&prefix_pair_lost);
 			break;
 		}
+		if (prefix_pair_anchor[a->w]) {
+			uint8_t ak[PREFIX_PAIR_RUN + 1];
+			size_t akl = prefix_pair_key(ak, a->w, 0);
+			struct cds_ft_node *ao = NULL;
+
+			if (cds_ft_eager_lookup_key(a->ft, ak, akl, 0, &ao)
+					!= CDS_FT_STATUS_OK ||
+					ao != prefix_pair_anchor[a->w]) {
+				rcu_read_unlock();
+				uatomic_inc(&prefix_pair_lost);	/* P lost */
+				break;
+			}
+		}
 		cds_ft_iter_set_key(iter, key, klen);
 		if (cds_ft_lookup(a->ft, iter) != CDS_FT_STATUS_OK ||
 				cds_ft_iter_node(iter) != &n->node ||
@@ -14123,7 +14145,7 @@ static void *prefix_pair_writer(void *arg)
 		 */
 		{
 			uint8_t pk[PREFIX_PAIR_RUN + 1];
-			size_t pkl = prefix_pair_key(pk, a->w, !a->extension);
+			size_t pkl = prefix_pair_key(pk, a->w, a->peer_extension);
 			struct cds_ft_node *o2 = NULL, *o3 = NULL;
 
 			if ((cds_ft_eager_lookup_key(a->ft, key, klen, 0, &o2)
@@ -14150,7 +14172,7 @@ static void *prefix_pair_writer(void *arg)
 	return NULL;
 }
 
-static int inv_prefix_pair_compressed_holder(void)
+static int prefix_pair_run(const char *name, bool siblings)
 {
 	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
 	struct cds_ft_group *group;
@@ -14187,10 +14209,26 @@ static int inv_prefix_pair_compressed_holder(void)
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	if (pairs < 1 || pairs > PREFIX_PAIR_PAIRS_MAX)
 		pairs = 1;
+	for (i = 0; i < PREFIX_PAIR_PAIRS_MAX; i++) {
+		uint8_t pk[PREFIX_PAIR_RUN + 1];
+		size_t pkl = prefix_pair_key(pk, i, 0);
+		struct ft_test_node *n;
+
+		prefix_pair_anchor[i] = NULL;
+		if (!siblings || i >= pairs)
+			continue;
+		n = node_alloc(9000 + i);
+		n->value = pkl;
+		if (cds_ft_insert(ft, pk, pkl, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+		prefix_pair_anchor[i] = &n->node;
+	}
 	for (i = 0; i < pairs * 2; i++) {
 		a[i].ft = ft;
 		a[i].w = i / 2;
-		a[i].extension = (int) (i % 2);
+		a[i].extension = (int) (i % 2) + (siblings ? 1 : 0);
+		a[i].peer_extension = siblings ? 3 - a[i].extension :
+			!a[i].extension;
 		a[i].ops = 0;
 		pthread_create(&th[i], NULL, prefix_pair_writer, &a[i]);
 	}
@@ -14208,31 +14246,51 @@ static int inv_prefix_pair_compressed_holder(void)
 	}
 	rcu_thread_online();
 
-	fprintf(stderr, "# inv_prefix_pair_compressed_holder: %lu ops, %lu lost "
-		"inserts, %lu refused removes, %lu removed nodes reachable\n",
+	for (i = 0; i < pairs; i++) {
+		uint8_t pk[PREFIX_PAIR_RUN + 1];
+		size_t pkl = prefix_pair_key(pk, i, 0);
+		struct cds_ft_node *ao = NULL;
+
+		if (prefix_pair_anchor[i] &&
+				(cds_ft_eager_lookup_key(ft, pk, pkl, 0, &ao)
+					!= CDS_FT_STATUS_OK ||
+				 ao != prefix_pair_anchor[i]))
+			prefix_pair_lost++;
+	}
+	fprintf(stderr, "# %s: %lu ops, %lu lost inserts, %lu refused "
+		"removes, %lu removed nodes reachable\n", name,
 		total, prefix_pair_lost, prefix_pair_refused, prefix_pair_stale);
 	if (prefix_pair_lost || prefix_pair_refused || prefix_pair_stale) {
-		fprintf(stderr, "inv_prefix_pair_compressed_holder: %lu insert(s) "
-			"reported OK but the key was not its own node, %lu remove(s) "
-			"of a present key refused, %lu removed node(s) still "
-			"reachable\n", prefix_pair_lost, prefix_pair_refused,
-			prefix_pair_stale);
+		fprintf(stderr, "%s: %lu insert(s) reported OK but the key was "
+			"not its own node (or P was lost), %lu remove(s) of a "
+			"present key refused, %lu removed node(s) still "
+			"reachable\n", name, prefix_pair_lost,
+			prefix_pair_refused, prefix_pair_stale);
 		ret = -1;
 	}
 	/* A run that did no work proves nothing; say so rather than pass. */
 	if (total == 0) {
-		fprintf(stderr, "inv_prefix_pair_compressed_holder: no ops\n");
+		fprintf(stderr, "%s: no ops\n", name);
 		ret = -1;
 	}
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "inv_prefix_pair_compressed_holder: verify "
-			"failed\n");
+		fprintf(stderr, "%s: verify failed\n", name);
 		ret = -1;
 	}
 	drain_trie_keep_group(ft);
 	rcu_barrier();
 	cds_ft_group_destroy(group);
 	return ret;
+}
+
+static int inv_prefix_pair_compressed_holder(void)
+{
+	return prefix_pair_run("inv_prefix_pair_compressed_holder", false);
+}
+
+static int inv_prefix_siblings_compressed_holder(void)
+{
+	return prefix_pair_run("inv_prefix_siblings_compressed_holder", true);
 }
 
 
@@ -27437,6 +27495,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_insert_unique_coarse);
 	RUN_TEST(inv_concurrent_insert_unique_dense);
 	RUN_TEST(inv_prefix_pair_compressed_holder);
+	RUN_TEST(inv_prefix_siblings_compressed_holder);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);
