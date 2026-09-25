@@ -18936,7 +18936,27 @@ int ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
 	pred_head = cds_ft_iter_node(it);
 	if (!pred_head)
 		return -EAGAIN;	/* OK without a node: defensive, never a pred claim */
-	*pred_ret = ft_ord_cell_ptr(rcu_dereference(pred_head->prev));
+	/*
+	 * ☠ RESOLVE THE HEAD'S PREV BEFORE CASTING IT TO A CELL.  The word can
+	 * hold a peer's parked flip proxy (a committed-but-unsettled record on
+	 * the head's back edge), and ft_ord_cell_ptr of a proxy is a descriptor
+	 * address, not a cell: the splice's lock take then maps it to arena
+	 * metadata and faults.  MEASURED (inv_prefix_shape_zoo full mix,
+	 * rcu-debug, exponential): raw read 3 of 24 runs SIGSEGV in
+	 * ft_cell_word_lock from ft_insert_one_commit's pred; resolved 0 of 36.
+	 * A head removed under the lookup has no cell: re-plan.
+	 */
+	{
+#ifndef FT_DEBUG_RAW_PRED_PREV
+		void *prev = ft_dereference_prev_resolved(pred_head);
+#else
+		void *prev = (void *) rcu_dereference(pred_head->prev);
+#endif
+
+		if (!prev)
+			return -EAGAIN;
+		*pred_ret = ft_ord_cell_ptr(prev);
+	}
 	return 0;
 }
 
