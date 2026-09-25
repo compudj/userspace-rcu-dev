@@ -3984,7 +3984,14 @@ restart_attempt:
 
 			assert(!ft_node_compressed(d.nf));
 			metadata = cds_ft_item_to_metadata(ft_node_ptr(d.nf));
-			external_nodes = metadata->external_nodes;
+			/*
+			 * RESOLVED, as every other external_nodes reader: a peer's
+			 * in-flight head park or swap parks a flip proxy here, and a
+			 * raw proxy taken as the chain head sends the tail walk (and
+			 * the verdict) into descriptor memory.
+			 */
+			external_nodes = ft_dereference_external(
+				metadata->external_nodes);
 			/*
 			 * CAPTURE -> ACQUIRE window (-DFT_DELAY_INJECT only).
 			 * @external_nodes is read here with NOTHING held; the holder
@@ -4072,7 +4079,8 @@ restart_attempt:
 					 */
 					{
 						bool stale__ =
-							metadata->external_nodes !=
+							ft_dereference_external(
+								metadata->external_nodes) !=
 							external_nodes ||
 							ft_node_is_removed(
 								external_nodes);
@@ -5061,7 +5069,17 @@ restart_replace_attempt:
 
 			assert(!ft_node_compressed(d.nf));
 			metadata = cds_ft_item_to_metadata(ft_node_ptr(d.nf));
-			external_nodes = metadata->external_nodes;
+			/*
+			 * ☠ RESOLVED, NOT RAW.  A concurrent same-key insert_replace
+			 * or head park parks a flip proxy in external_nodes for the
+			 * length of its commit; taken raw, the proxy became the
+			 * "displaced chain" -- ft_hlist_chain_len walked descriptor
+			 * memory (MEASURED: SIGSEGV at 0xf08 in 3 of 3 runs of
+			 * inv_prefix_shape_zoo restricted to insert_replace) -- and
+			 * was handed back as *@old_node_ret.
+			 */
+			external_nodes = ft_dereference_external(
+				metadata->external_nodes);
 			if (external_nodes) {
 				dbg_printf("_cds_ft_insert_replace: replacing internal metadata chain %p\n",
 						external_nodes);
