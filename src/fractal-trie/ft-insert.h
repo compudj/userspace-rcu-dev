@@ -5013,6 +5013,24 @@ restart_replace_attempt:
 	for (; d.depth < key_depth - 1; ) {
 		uint8_t key_value;
 
+#ifndef FT_DEBUG_IR_IGNORE_SKIP_CONFLICT
+		/*
+		 * The same re-descend cds_ft_insert takes: a reanchoring step that
+		 * landed shallower (a peer chain-merge moved the encoded position
+		 * up) left d.nf and d.depth at different levels.  Carrying on
+		 * mis-filed the key: a descent that read a stale skip pointer
+		 * (length 3) and the merged run behind it (length 4) arrived one
+		 * level too deep, found "the key ends HERE", and parked a leaf
+		 * key's node as the external of an internal node one byte
+		 * shorter -- insert_replace reported OK with no prior entry while
+		 * the key's own node sat untouched one level down (two-writer
+		 * owned-key harness, exponential spacing, LTTng-traced).
+		 */
+		if (caa_unlikely(d.skip_conflict)) {
+			ret = -EAGAIN;
+			goto insert_replace_done;
+		}
+#endif
 		if (!d.nf)
 			break;
 		/* Resolve skip-compressed pointer. */
@@ -5039,6 +5057,13 @@ restart_replace_attempt:
 		key_value = *(iter_key++);
 		ft_descent_step(ft, &d, key_value);
 	}
+#ifndef FT_DEBUG_IR_IGNORE_SKIP_CONFLICT
+	/* A final reanchoring step that exited the loop: honour it here too. */
+	if (caa_unlikely(d.skip_conflict)) {
+		ret = -EAGAIN;
+		goto insert_replace_done;
+	}
+#endif
 
 	/*
 	 * Resolve any skip-compressed pointer left in d.nf by a final
