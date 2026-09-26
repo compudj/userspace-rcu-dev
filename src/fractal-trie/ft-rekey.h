@@ -3014,7 +3014,7 @@ static
 int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
 		const uint8_t *dst_key, size_t dst_len,
-		bool require_empty, struct urcu_txn *optxn)
+		bool require_empty, bool len_fits, struct urcu_txn *optxn)
 {
 	uint8_t src_ord[FT_MAX_KEY_LEN], dst_ord[FT_MAX_KEY_LEN];
 	struct cds_ft_inode_flag *s_top, *s_top_prime = NULL, *attached_nf = NULL;
@@ -3373,7 +3373,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	if (src_len != dst_len) {
 		if (ft->group->key_len != CDS_FT_LEN_VARIABLE)
 			return FT_REKEY_UNCOVERED;
-		if (ft_rekey_len_change_overflows(ft, src_len, dst_len))
+		if (!len_fits &&
+		    ft_rekey_len_change_overflows(ft, src_len, dst_len))
 			return FT_REKEY_UNCOVERED;
 	}
 
@@ -8407,6 +8408,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * indeterminate local into a trace field.
 	 */
 	struct urcu_txn optxn;
+	bool len_fits;
 	int ret = 0;
 
 	/*
@@ -8512,6 +8514,19 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		(void) ft_recompute_max_used_key_len(ft);
 		flavor->read_unlock();
 	}
+	/*
+	 * WHERE THE HINT STILL REFUSES, ASK THE MOVED KEYS.  Past the repair the
+	 * hint is exact for the TRIE, and a genuinely long key elsewhere still
+	 * refuses a short subtree's move that fits -- a false OVERFLOW_ERROR.
+	 * Decided once, outside the retry loop: the writer scope above keeps
+	 * every writer but this one out of the trie for the whole call, so the
+	 * moved keys cannot change between attempts.
+	 */
+	len_fits = src_len != dst_len &&
+		ft->group->key_len == CDS_FT_LEN_VARIABLE &&
+		ft_rekey_len_change_overflows(ft, src_len, dst_len) &&
+		!ft_moved_keys_overflow(ft, src_key, src_len, dst_len,
+			ft->group->max_key_len);
 
 #ifdef FT_DEBUG_REKEY_RETRY_CAP
 	ft_rekey_attempts = 0;		/* per MOVE, not per thread lifetime */
@@ -8577,7 +8592,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 */
 		flavor->read_lock();
 		ret = ft_rekey_graft_simple_attempt(ft, src_key, src_len,
-			dst_key, dst_len, require_empty, &optxn);
+			dst_key, dst_len, require_empty, len_fits, &optxn);
 		flavor->read_unlock();
 		if (ret != -EAGAIN && ret != -EIO)
 			break;
@@ -10326,27 +10341,6 @@ static enum cds_ft_status ft_rekey_at_inner(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 	/*
-	 * Combined-length overflow validation (mirrors cds_ft_graft): a moved
-	 * key K becomes dst_key || (K - src_key prefix), of length
-	 * dst_key_len + len(K) - src_key_len.  Bound len(K) by the source's
-	 * max_used_key_len; without this check a variable-length merge with
-	 * dst_key_len > src_key_len could create keys exceeding the group's
-	 * max_key_len, overflowing the fixed-size key buffers downstream
-	 * (the spine's compressed-wrap kbuf, the iterator buffers).
-	 */
-	{
-		size_t src_max = uatomic_load(&src_ft->max_used_key_len,
-				CMM_RELAXED);
-
-		if (src_max > src_key_len &&
-				src_max - src_key_len >
-				dst_ft->group->max_key_len - dst_key_len) {
-			FT_TP(merge_exit, (int) CDS_FT_STATUS_OVERFLOW_ERROR);
-			return CDS_FT_STATUS_OVERFLOW_ERROR;
-		}
-	}
-
-	/*
 	 * MW LOCK_FINE (step 6, §9.5): a CROSS-trie merge consumes @src_ft, so it
 	 * must be EXCLUSIVE -- an exclusive source skips its FT-wide lock, leaving
 	 * only dst's lock (one lock, no cross-trie deadlock).  A live (lock-mode,
@@ -10378,6 +10372,28 @@ static enum cds_ft_status ft_rekey_at_inner(struct cds_ft *dst_ft,
 	ft_crosstrie_lock_mode_guard(dst_ft, src_ft);
 	CDS_FT_SCOPED_WRITER(dst_ft);
 	CDS_FT_SCOPED_WRITER(src_ft);
+
+	/*
+	 * Combined-length overflow validation (mirrors cds_ft_graft): a moved
+	 * key K becomes dst_key || (K - src_key prefix), of length
+	 * dst_key_len + len(K) - src_key_len; without this check a
+	 * variable-length merge with dst_key_len > src_key_len could create keys
+	 * exceeding the group's max_key_len, overflowing the fixed-size key
+	 * buffers downstream (the spine's compressed-wrap kbuf, the iterator
+	 * buffers).  ft_moved_keys_overflow bounds len(K) exactly.
+	 *
+	 * ☞ UNDER THE LOCKS.  A same-trie rekey's point writers take this
+	 * trie's FT-wide writer lock while the move gate is up -- the gate's own
+	 * bulk lock does not exclude them -- so a moved-keys walk taken before
+	 * the scopes above could miss a longer key inserted under @src_key
+	 * after it, and admit a move that overflows.  Across tries the source
+	 * is EXCLUSIVE and a live one was refused BUSY just above.
+	 */
+	if (ft_moved_keys_overflow(src_ft, src_key, src_key_len,
+			dst_key_len, dst_ft->group->max_key_len)) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_OVERFLOW_ERROR);
+		return CDS_FT_STATUS_OVERFLOW_ERROR;
+	}
 
 	/*
 	 * Convert both keys to ORDINAL form ONCE; every internal consumer

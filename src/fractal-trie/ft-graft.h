@@ -1911,6 +1911,107 @@ enum ft_graft_prep ft_graft_build(struct cds_ft *ft,
 	return FT_GRAFT_PREP_NOSPLIT;
 }
 
+/* ft-lifecycle.h is included after this unit: one declaration, one TU. */
+static enum cds_ft_status ft_recompute_max_used_key_len(struct cds_ft *ft);
+
+/*
+ * The longest key a move of @src_key would carry: every key of @src_ft that
+ * has @src_key as a prefix, walked in key order from the first one at or
+ * after it.  O(moved keys) -- ask it only where the hint refuses.  Needs a
+ * read section; the caller keeps writers out of the moved keys (the move gate
+ * and the FT-wide lock on a same-trie rekey, an EXCLUSIVE source across
+ * tries).  Returns 0, or -ENOMEM when no iterator can be had.
+ */
+static
+int ft_moved_keys_max_len(struct cds_ft *src_ft, const uint8_t *src_key,
+		size_t src_len, size_t *max_len)
+{
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+	uint8_t k[FT_MAX_KEY_LEN];
+	size_t klen, max = 0;
+
+	if (cds_ft_iter_create(src_ft, &iter) != CDS_FT_STATUS_OK)
+		return -ENOMEM;
+	cds_ft_iter_set_key(iter, src_key, src_len);
+	for (s = cds_ft_lookup_ge(src_ft, iter); s == CDS_FT_STATUS_OK;
+			s = cds_ft_next(src_ft, iter)) {
+		if (cds_ft_iter_get_key(iter, k, sizeof(k), &klen) !=
+				CDS_FT_STATUS_OK ||
+		    klen < src_len || memcmp(k, src_key, src_len))
+			break;		/* past the moved keys */
+		if (klen > max)
+			max = klen;
+	}
+	cds_ft_iter_destroy(iter);
+	*max_len = max;
+	return 0;
+}
+
+/*
+ * WOULD A MOVE PUSH ONE OF ITS KEYS PAST THE GROUP'S LIMIT?
+ *
+ * A moved key K becomes @dst_key || (K minus the @src_key prefix), and the
+ * public contract of an OVERFLOW_ERROR refusal is "a moved key would exceed
+ * the group maximum".  @src_ft's max_used_key_len hint bounds len(K) for free
+ * and answers every move it admits.  Where it refuses, two cases differ:
+ *
+ *  - @src_len == 0, the WHOLE source moves (graft, merge, graft_swap, a
+ *    root merge_at): the hint bounds exactly the keys that move, so a stale
+ *    one is repaired -- the walk cds_ft_recompute_stats runs -- and asked
+ *    again.  Only on an EXCLUSIVE source, which every bulk op requires: the
+ *    repair LOWERS the hint, and a writer raising it between the walk and
+ *    the store would be lost, so the guard stays as the one thing that makes
+ *    the store safe should a live source ever reach here.  And only once per
+ *    staleness: a hint still at the value the last walk produced
+ *    (max_used_key_len_walked) is exact, and its refusal true.
+ *
+ *  - @src_key names a SUBTREE (a same-trie rekey, a keyed merge_at): even an
+ *    exact hint bounds the whole trie, and one long key elsewhere refused
+ *    every lengthening move of a short subtree -- measured, 38 of 788
+ *    refusals over random tries of keys of up to 250 bytes were false, and a
+ *    src with no keys under it was refused too.  No recompute can fix that,
+ *    so walk the moved keys and decide on their real lengths.
+ *
+ * -DFT_DEBUG_MOVED_KEYS_HINT_ONLY answers from the hint alone (red control).
+ * Takes its own read section for the walk.
+ */
+static
+bool ft_moved_keys_overflow(struct cds_ft *src_ft, const uint8_t *src_key,
+		size_t src_len, size_t dst_len, size_t max_key_len)
+{
+	size_t hint = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
+	size_t smax;
+	int ret;
+
+	if (dst_len > max_key_len)
+		return true;
+	if (hint <= src_len || hint - src_len <= max_key_len - dst_len)
+		return false;
+#ifdef FT_DEBUG_MOVED_KEYS_HINT_ONLY
+	return true;
+#endif
+	if (!src_len) {
+		if (!src_ft->exclusive ||
+		    hint == uatomic_load(&src_ft->max_used_key_len_walked,
+				CMM_RELAXED))
+			return true;
+		src_ft->group->flavor->read_lock();
+		ret = (int) ft_recompute_max_used_key_len(src_ft);
+		src_ft->group->flavor->read_unlock();
+		if (ret)
+			return true;
+		hint = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
+		return hint > max_key_len - dst_len;
+	}
+	src_ft->group->flavor->read_lock();
+	ret = ft_moved_keys_max_len(src_ft, src_key, src_len, &smax);
+	src_ft->group->flavor->read_unlock();
+	if (ret)
+		return true;	/* no answer: keep the conservative one */
+	return smax > src_len && smax - src_len > max_key_len - dst_len;
+}
+
 /*
  * ft_graft_keylen - Internal graft helper.
  *
@@ -1950,7 +2051,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	 */
 	struct urcu_txn optxn;
 	struct cds_ft_metadata *src_rmeta;
-	size_t src_max;
 
 	/*
 	 * MW LOCK_FINE (step 6, §9.5): a cross-trie graft CONSUMES the whole
@@ -1981,6 +2081,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	CDS_FT_SCOPED_WRITER(dst_ft);
 	CDS_FT_SCOPED_WRITER(src_ft);
 
+	size_t src_max;
 	const struct cds_ft_key_map *km = &dst_ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
 	const uint8_t *key;
@@ -1992,9 +2093,11 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		key = ordinal_buf;
 	}
 
-	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
-	if (key_len > 0 && src_max > dst_ft->group->max_key_len - key_len)
+	if (ft_moved_keys_overflow(src_ft, NULL, 0, key_len,
+			dst_ft->group->max_key_len))
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
+	/* After the check: a repair there may have lowered it. */
+	src_max = uatomic_load(&src_ft->max_used_key_len, CMM_RELAXED);
 
 	src_rmeta = ft_root_metadata(src_ft);
 
@@ -3556,11 +3659,13 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		key = ordinal_buf;
 	}
 
-	swap_max = uatomic_load(&swap_ft->max_used_key_len, CMM_RELAXED);
-	if (key_len > 0 && swap_max > dst_ft->group->max_key_len - key_len) {
+	if (ft_moved_keys_overflow(swap_ft, NULL, 0, key_len,
+			dst_ft->group->max_key_len)) {
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_OVERFLOW_ERROR);
 		return CDS_FT_STATUS_OVERFLOW_ERROR;
 	}
+	/* After the check: a repair there may have lowered it. */
+	swap_max = uatomic_load(&swap_ft->max_used_key_len, CMM_RELAXED);
 
 	if (key_len == 0) {
 		/*

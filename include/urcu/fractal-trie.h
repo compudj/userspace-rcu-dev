@@ -2592,11 +2592,16 @@ unsigned long cds_ft_count_entries(struct cds_ft *ft);
  * updated on insert but not decremented on remove or detach.
  * Use cds_ft_recompute_stats() to obtain the exact value.
  *
- * One case does lower it: a same-trie rekey whose own overflow gate
+ * Two cases lower it: a same-trie rekey whose own overflow gate
  * finds the estimate too coarse to answer recomputes it exactly
  * first, so a successful unequal-length cds_ft_rekey_* may leave a
- * SMALLER value than it found. The result is still an upper bound on
- * every key present, which is all any caller may rely on.
+ * SMALLER value than it found; and a bulk operation (cds_ft_graft,
+ * cds_ft_graft_swap, cds_ft_merge_at at the source's root) whose
+ * EXCLUSIVE source this estimate would refuse with
+ * CDS_FT_STATUS_OVERFLOW_ERROR recomputes the source's value before
+ * answering, so a caller no longer needs cds_ft_recompute_stats()
+ * for that. The result is still an upper bound on every key present,
+ * which is all any caller may rely on.
  *
  * Returns 0 if the trie is empty or has never had a key inserted.
  *

@@ -3259,22 +3259,16 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	/*
 	 * Combined-length overflow validation (mirrors cds_ft_graft): a moved
 	 * key K becomes dst_key || (K - src_key prefix), of length
-	 * dst_key_len + len(K) - src_key_len.  Bound len(K) by the source's
-	 * max_used_key_len; without this check a variable-length merge with
+	 * dst_key_len + len(K) - src_key_len.  Bound len(K) exactly
+	 * (ft_moved_keys_overflow); without this check a variable-length merge with
 	 * dst_key_len > src_key_len could create keys exceeding the group's
 	 * max_key_len, overflowing the fixed-size key buffers downstream
 	 * (the spine's compressed-wrap kbuf, the iterator buffers).
 	 */
-	{
-		size_t src_max = uatomic_load(&src_ft->max_used_key_len,
-				CMM_RELAXED);
-
-		if (src_max > src_key_len &&
-				src_max - src_key_len >
-				dst_ft->group->max_key_len - dst_key_len) {
-			FT_TP(merge_exit, (int) CDS_FT_STATUS_OVERFLOW_ERROR);
-			return CDS_FT_STATUS_OVERFLOW_ERROR;
-		}
+	if (ft_moved_keys_overflow(src_ft, src_key, src_key_len, dst_key_len,
+			dst_ft->group->max_key_len)) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_OVERFLOW_ERROR);
+		return CDS_FT_STATUS_OVERFLOW_ERROR;
 	}
 
 	/*
