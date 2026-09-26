@@ -387,6 +387,21 @@ int ft_query_process_mempolicy_mode(void)
 }
 
 /*
+ * The process-wide position in the per-2 MiB-chunk node rotation.  A
+ * per-REGION rotation restarted at the first allowed node every time, so
+ * every region's first chunk was hard-bound to that one node -- and a
+ * process whose arenas are mostly small (many groups, or node orders that
+ * never grow past their first chunk) piled onto it under a strict
+ * MPOL_BIND.  Measured 2026-09-26 on a 24-node box: 24 processes creating
+ * groups in a loop filled node 0 (30 GB) while ~700 GB stayed free on the
+ * other nodes, and the kernel's policy-constrained OOM killer took
+ * processes machine-wide (a VM included).  Each region now reserves a
+ * contiguous slice of one shared counter, so the chunks keep rotating
+ * across regions, groups and threads.
+ */
+static unsigned long ft_interleave_next_chunk;
+
+/*
  * Apply the configured NUMA placement policy to the @size bytes at
  * @base.  Three policies, all subject to the CDS_FT_NUMA_INTERLEAVE=0
  * env var (which forces a skip):
@@ -399,7 +414,9 @@ int ft_query_process_mempolicy_mode(void)
  *     the measured win.  (FT pages stay 4 KiB; THP is disabled, see
  *     ft_apply_thp_policy.)  Falls back to whole-region MPOL_INTERLEAVE at
  *     native page granularity when @base isn't 2 MiB-aligned, the region
- *     is smaller than 2 MiB, or only one node is allowed.
+ *     is smaller than 2 MiB, or only one node is allowed.  The rotation is
+ *     PROCESS-WIDE (ft_interleave_next_chunk): each region takes the next
+ *     slice of it, so region after region continues across the nodes.
  *
  *   - CDS_FT_NUMA_LOCAL: single mbind(MPOL_LOCAL) over the whole
  *     region.  Pages allocated within @base land on the local node
@@ -495,11 +512,14 @@ void ft_apply_interleave(void *base, size_t size,
 	if (nr_allowed > 1 &&
 	    ((uintptr_t) base & (FT_HUGEPAGE_SIZE - 1)) == 0 &&
 	    size >= FT_HUGEPAGE_SIZE) {
-		unsigned int chunk = 0;
+		unsigned long nr_chunks = size / FT_HUGEPAGE_SIZE;
+		unsigned long chunk = uatomic_add_return(
+			&ft_interleave_next_chunk, nr_chunks) - nr_chunks;
+
 		for (off = 0; off + FT_HUGEPAGE_SIZE <= size;
 				off += FT_HUGEPAGE_SIZE, chunk++) {
 			unsigned long single[FT_NODEMASK_LONGS] = { 0 };
-			int node = allowed_nodes[chunk % (unsigned) nr_allowed];
+			int node = allowed_nodes[chunk % (unsigned long) nr_allowed];
 			single[node / FT_NODEMASK_BITS_PER_LONG] =
 				1UL << (node % FT_NODEMASK_BITS_PER_LONG);
 			(void) syscall(__NR_mbind,
