@@ -4652,10 +4652,28 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  * retries, which is the conservative answer.
  */
 static inline
-bool ft_insert_replace_leaf_plan_ok(struct cds_ft_inode_flag **nfp,
-		struct cds_ft_inode_flag *nf)
+bool ft_insert_replace_leaf_plan_ok(const struct cds_ft *ft,
+		struct cds_ft_inode_flag **nfp, struct cds_ft_inode_flag *nf,
+		bool head_prefix)
 {
-	return ft_node_ptr_raw(rcu_dereference(*nfp)) == ft_node_ptr_raw(nf);
+	if (ft_node_ptr_raw(rcu_dereference(*nfp)) != ft_node_ptr_raw(nf))
+		return false;
+#ifndef FT_DEBUG_IR_HEAD_PREFIX_UNCHECKED
+	/*
+	 * THE SLOT'S VALUE IS NOT THE HEAD'S SHAPE.  The new head inherits
+	 * the old one's prefix answer, read from its parent word at plan
+	 * time with no lock held.  A peer that splits the old head into a
+	 * fresh node's prefix key and then promotes it back leaves the SAME
+	 * head in the SAME slot -- the compare above passes -- while the
+	 * answer this op read in between was the split's.  LTTng-traced: the
+	 * new head published into a body slot carrying prefix-head=1, which
+	 * cds_ft_verify refuses.  The holder is held here, so ask again.
+	 */
+	if (ft_head_is_prefix(ft, (struct cds_ft_node *) ft_node_ptr(nf)) !=
+			head_prefix)
+		return false;
+#endif
+	return true;
 }
 
 static
@@ -4926,6 +4944,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	 * LIVE chain.  Only the two arms that actually unlink one record here.
 	 */
 	struct cds_ft_node *displaced = NULL;
+	/* The displaced head's prefix answer the new head inherits. */
+	bool head_prefix = false;
 	struct ft_insert_commit ic = { 0 };
 	/*
 	 * The attach's recompactions lock {C, P, GP}; @d dates them and @ic.txn
@@ -5642,9 +5662,8 @@ restart_replace_attempt:
 			 * old head's own answer instead of re-deriving it from @d.pnf
 			 * mid-op (FT_PARENT_PREFIX_HEAD).
 			 */
-			ft_external_head_set_parent(ft, node, d.pnf,
-				ft_head_is_prefix(ft, (struct cds_ft_node *)
-					ft_node_ptr(d.nf)));
+			head_prefix = ft_head_is_prefix(ft, displaced);
+			ft_external_head_set_parent(ft, node, d.pnf, head_prefix);
 			node->next = NULL;
 			{
 				/*
@@ -5760,7 +5779,8 @@ restart_replace_attempt:
 					gp_held = ft_lock_skip_dual_gp(ft, &actx, txn, d.pnf,
 						txn->mtxn);
 					/* The pre-commit terminal, as the chain-plan bail below. */
-					if (!ft_insert_replace_leaf_plan_ok(d.nfp, d.nf)) {
+					if (!ft_insert_replace_leaf_plan_ok(ft, d.nfp,
+							d.nf, head_prefix)) {
 						ft_flip_txn_destroy(txn);
 						ret = -EAGAIN;
 						goto insert_replace_done;
@@ -5981,7 +6001,8 @@ restart_replace_attempt:
 					gp_held = ft_lock_skip_dual_gp(ft, &actx, txn, d.pnf,
 						txn->mtxn);
 					/* The pre-commit terminal, as the chain-plan bail below. */
-					if (!ft_insert_replace_leaf_plan_ok(d.nfp, d.nf)) {
+					if (!ft_insert_replace_leaf_plan_ok(ft, d.nfp,
+							d.nf, head_prefix)) {
 						ft_flip_txn_destroy(txn);
 						ret = -EAGAIN;
 						goto insert_replace_done;
