@@ -4676,6 +4676,32 @@ bool ft_insert_replace_leaf_plan_ok(const struct cds_ft *ft,
 	return true;
 }
 
+/*
+ * The displaced head's cell, for insert_replace's ordered-list arms -- read
+ * UNDER the holder's lock, never at plan time.
+ *
+ * A peer promoting @head (removing the head before it in its chain) parks a
+ * flip proxy on @head->prev for the length of its commit.  Read raw at plan
+ * time, ft_ord_cell_ptr() masked the proxy's tag and returned DESCRIPTOR
+ * memory as a cell; the plan's re-checks passed once the peer committed, and
+ * the cell lock take then followed that "cell"'s neighbours into unmapped
+ * memory (10 of 10 cores of inv_prefix_shape_zoo: an old_cell ending in 0xe).
+ * Every producer of a parked prev holds the chain holder, which is held here,
+ * so this read is settled; resolve it anyway, as cds_ft_replace does.
+ *
+ * NULL when @head's prev names a predecessor -- it is not a head any more, and
+ * the caller re-plans.
+ */
+static inline
+struct ft_ord_cell *ft_insert_replace_head_cell(struct cds_ft_node *head)
+{
+	void *prev = ft_dereference_prev_resolved(head);
+
+	if (ft_node_external((struct cds_ft_inode_flag *) prev))
+		return NULL;
+	return ft_ord_cell_ptr(prev);
+}
+
 static
 unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
 		struct urcu_txn *mtxn, struct cds_ft_inode_flag *pnf,
@@ -5164,8 +5190,12 @@ restart_replace_attempt:
 				 * List off: a plain publish, no cell.
 				 */
 				if (ft->ordered_list) {
+#ifdef FT_DEBUG_IR_PLAN_CELL
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr(external_nodes->prev);
+#else
+					struct ft_ord_cell *old_cell = NULL;
+#endif
 					struct ft_ord_cell_edge sedge = {
 						.slot = (struct ft_ord_cell **)
 							&metadata->external_nodes,
@@ -5351,6 +5381,16 @@ restart_replace_attempt:
 								displaced ||
 						    ft_node_is_removed(displaced)) {
 							FT_HLIST_PLAN_BAIL();
+							ft_flip_txn_destroy(txn);
+							ret = -EAGAIN;
+							goto insert_replace_done;
+						}
+#endif
+#ifndef FT_DEBUG_IR_PLAN_CELL
+						/* Its cell, now that the holder is held. */
+						old_cell = ft_insert_replace_head_cell(
+							displaced);
+						if (!old_cell) {
 							ft_flip_txn_destroy(txn);
 							ret = -EAGAIN;
 							goto insert_replace_done;
@@ -5702,8 +5742,12 @@ restart_replace_attempt:
 					 * failure nothing is applied, the old head's cell is
 					 * NOT freed and the replace aborts retriably.
 					 */
+#ifdef FT_DEBUG_IR_PLAN_CELL
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr((*old_node_ret)->prev);
+#else
+					struct ft_ord_cell *old_cell = NULL;
+#endif
 					unsigned int nr_disp = displaced ?
 						ft_hlist_chain_len(displaced) : 0;
 					struct ft_flip_txn *txn =
@@ -5785,6 +5829,16 @@ restart_replace_attempt:
 						ret = -EAGAIN;
 						goto insert_replace_done;
 					}
+#ifndef FT_DEBUG_IR_PLAN_CELL
+					/* Its cell, now that the holder is held. */
+					old_cell = ft_insert_replace_head_cell(
+						*old_node_ret);
+					if (!old_cell) {
+						ft_flip_txn_destroy(txn);
+						ret = -EAGAIN;
+						goto insert_replace_done;
+					}
+#endif
 					n_sedge = ft_insert_replace_leaf_sedges(ft,
 						txn->mtxn, d.pnf, d.nfp, d.nf, node, sedges,
 						gp_held);
