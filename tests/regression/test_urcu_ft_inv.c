@@ -83,7 +83,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(141 + NR_TESTS_REKEY_DLM)	/* +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+#define NR_TESTS	(142 + NR_TESTS_REKEY_DLM)	/* +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -14904,6 +14904,7 @@ static void owned_fail(struct owned_arg *a, const char *what,
  * and DUPLICATE_FOUND with the owner's own node otherwise.
  */
 static int owned_plain_insert;
+static int owned_remove_all;	/* FT_INV_OWNED_REMOVE_ALL=1 */
 
 static int owned_replace_one(struct owned_arg *a, struct cds_ft_iter *iter,
 		struct owned_key *k)
@@ -14961,12 +14962,17 @@ static int owned_replace_one(struct owned_arg *a, struct cds_ft_iter *iter,
 			return -1;
 		}
 	} else if (want) {
-		op = "remove";
+		struct cds_ft_node *head = NULL;
+
+		op = owned_remove_all ? "remove_all" : "remove";
 		cds_ft_iter_set_key(iter, k->b, k->len);
 		if (cds_ft_lookup(a->ft, iter) != CDS_FT_STATUS_OK ||
 				cds_ft_iter_node(iter) != want ||
-				cds_ft_remove(a->ft, iter, want) !=
-					CDS_FT_STATUS_OK) {
+				(owned_remove_all ?
+				 cds_ft_remove_all(a->ft, iter, &head) !=
+					CDS_FT_STATUS_OK || head != want :
+				 cds_ft_remove(a->ft, iter, want) !=
+					CDS_FT_STATUS_OK)) {
 			owned_fail(a, "the owner's remove failed", k, want);
 			return -1;
 		}
@@ -15223,7 +15229,7 @@ static void *owned_writer(void *arg)
 }
 
 static int owned_body(const char *name, unsigned int nwriters,
-		unsigned int maxlen, bool replace)
+		unsigned int maxlen, bool replace, bool remove_all)
 {
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
@@ -15243,6 +15249,8 @@ static int owned_body(const char *name, unsigned int nwriters,
 	int ret = 0, stop_all = 0;
 
 	owned_plain_insert = getenv("FT_INV_OWNED_PLAIN_INSERT") != NULL;
+	owned_remove_all = remove_all ||
+		getenv("FT_INV_OWNED_REMOVE_ALL") != NULL;
 	/* Under a per-process capture, let the launcher start the session. */
 	if (getenv("FT_TRACE_SESSION"))
 		sleep(3);
@@ -15407,7 +15415,7 @@ static int owned_body(const char *name, unsigned int nwriters,
 
 static int inv_owned_prefix_dense(void)
 {
-	return owned_body("inv_owned_prefix_dense", 2, 10, false);
+	return owned_body("inv_owned_prefix_dense", 2, 10, false, false);
 }
 
 /*
@@ -15420,7 +15428,20 @@ static int inv_owned_prefix_dense(void)
  */
 static int inv_owned_prefix_dense_replace(void)
 {
-	return owned_body("inv_owned_prefix_dense_replace", 4, 16, true);
+	return owned_body("inv_owned_prefix_dense_replace", 4, 16, true, false);
+}
+
+/*
+ * The same, removing through cds_ft_remove_all, whose prefix-key clear chose
+ * the plain clear from an unheld child count: a peer that removed a child
+ * first left the holder with one child and no key.  Measured without the
+ * under-lock re-check, 5 s with 2 ms windows: 10/24 runs at root-only, 2/24
+ * per-node, 20/24 exponential (where writers also wedge on the shape).
+ */
+static int inv_owned_prefix_dense_remove_all(void)
+{
+	return owned_body("inv_owned_prefix_dense_remove_all", 4, 16, true,
+		true);
 }
 
 /*
@@ -28941,6 +28962,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_prefix_shape_zoo);
 	RUN_TEST(inv_owned_prefix_dense);
 	RUN_TEST(inv_owned_prefix_dense_replace);
+	RUN_TEST(inv_owned_prefix_dense_remove_all);
 	RUN_TEST(inv_ir_prefix_roundtrip);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
