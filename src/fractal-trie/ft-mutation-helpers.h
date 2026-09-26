@@ -23878,6 +23878,29 @@ void ft_glue_defer_edge(struct cds_ft *ft, struct ft_glue *g,
 }
 
 /*
+ * Re-aim @child's QUEUED edge at (@parent, @slot), keeping its origin and
+ * liveness -- for a producer that replaces the node the entry names as parent
+ * before the commit applies it.  Returns false when @child has no queued edge
+ * (a fresh child is stored at defer time, never queued).
+ */
+static
+bool ft_glue_reaim_edge(struct ft_glue *g, struct cds_ft_inode_flag *child,
+		struct cds_ft_inode_flag *parent,
+		struct cds_ft_inode_flag **slot)
+{
+	int i;
+
+	for (i = 0; i < g->nr_deferred; i++) {
+		if (g->deferred[i].child == child) {
+			g->deferred[i].parent = parent;
+			g->deferred[i].slot = slot;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
  * Record the single forward publish that splices the built cluster into
  * dst, and wire the cluster top's back-pointer into its (live)
  * publish_parent.  The builders call this once the cluster is fully

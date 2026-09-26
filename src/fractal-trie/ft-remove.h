@@ -1486,10 +1486,12 @@ bool ft_chain_compress_deep_pending(struct cds_ft_inode_flag *survivor,
  * re-aim its cluster's deferred edges".  The first half is the answer, not the
  * obstacle -- a node that was NEVER PUBLISHED is not retired at all: it is
  * untracked from the glue and freed outright, with no grace period, because no
- * reader ever had a path to it.  And there are NO deferred edges to re-aim: a
- * deferred edge names the branch or the suffix as its parent, and the pending
- * top's own child is the FRESH cluster node below it, whose back-pointer is a
- * plain store into a private body.
+ * reader ever had a path to it.  The second half holds for ONE edge: when the
+ * pending top's child is the FRESH cluster node below it, its back-pointer is a
+ * plain store into a private body and nothing is queued.  When that child is
+ * LIVE -- the dst's own head, handed back by a duplicate-chain merge at the
+ * run's end -- its back edge IS a queued glue entry naming the pending top,
+ * and the back-edge arm re-aims it at the merged node (ft_glue_reaim_edge).
  *
  * So the run simply grows by the pending top's bytes -- @parent_cn ++
  * @surviving_byte ++ pending->key_bytes -- and takes the pending top's CHILD.
@@ -1587,6 +1589,12 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	struct cds_ft_compressed_node *pending_cn = NULL;
 	/* ...and the glue that BUILT it, which is the only owner that may free it. */
 	struct ft_glue *pending_glue = NULL;
+	/*
+	 * The absorbed run's CHILD is LIVE (not built by @pending_glue): its back
+	 * edge is the glue's queued entry, which names the run this fold frees.
+	 * See the back-edge arm.
+	 */
+	bool absorbed_child_live = false;
 
 	assert(surviving_child);
 	/* The substitution exists only on the fold; the caller gates both. */
@@ -2079,12 +2087,14 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	} else if (pending_cn) {
 		/*
 		 * ABSORBED: the merged run carries the pending top's bytes, so
-		 * the child it must hold is the pending top's OWN child -- the
-		 * fresh cluster node below it, which no reader can reach yet.
+		 * the child it must hold is the pending top's OWN child -- most
+		 * often the fresh cluster node below it, which no reader can
+		 * reach yet.
 		 *
-		 * Its child needs no special back edge: @pending_child non-NULL
-		 * already routes the wiring to the PLAIN ft_set_parent arm below,
-		 * which is the right one for a fresh, unpublished child.
+		 * A fresh child needs no special back edge: @pending_child
+		 * non-NULL already routes the wiring to the PLAIN ft_set_parent
+		 * arm below, which is the right one for a fresh, unpublished
+		 * child.
 		 *
 		 * ☠ AND THE ABSORBED RUN LEAVES THE GLUE'S BUILT SET WITH IT.
 		 * It was never published, so it is not retired and owes no grace
@@ -2099,6 +2109,17 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * sees the node in a half-owned state.
 		 */
 		new_cn->child = pending_cn->child;
+		/*
+		 * ☠ ...EXCEPT WHEN IT IS NOT FRESH.  A duplicate-chain merge at
+		 * the run's end (a moved key equal to a dst key) hands back the
+		 * dst's own APP-OWNED HEAD as the run's child: ft_merge_build_run
+		 * queues its back edge in the glue, aimed at the run, because it
+		 * is live.  Read here, before the run is freed.
+		 */
+#ifndef FT_DEBUG_ABSORB_LIVE_CHILD_UNAIMED
+		absorbed_child_live = !ft_glue_is_fresh(ft, pending_glue,
+			new_cn->child);
+#endif
 		/*
 		 * ☠ @built IS NOT THE ONLY NAME THE GLUE KEPT.  ft_glue_set_publish
 		 * stored the same flag in @top, and the txn in @pending_pub_val;
@@ -2481,7 +2502,28 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			(deep_fold && child_cn &&
 				new_cn->child == child_cn->child);
 
-		if ((pending_child || deep_fold) && !pending_top_live) {
+		if (absorbed_child_live && ft_glue_reaim_edge(pending_glue,
+				new_cn->child, new_cn_flag, &new_cn->child)) {
+			/*
+			 * ABSORBED RUN, LIVE CHILD: ONE OWNER, THE GLUE.  The run
+			 * this fold freed is still the PARENT of its child's
+			 * queued glue entry, and ft_glue_txn_commit_edges records
+			 * that entry into this same txn after the fold -- so left
+			 * alone it overwrote this arm's plain store and aimed a
+			 * live head's parent word at freed memory: cds_ft_verify
+			 * "skip-encoded slot slen 2 != cn->len 1" (the length read
+			 * off the freed run) and both copies of the key lost to
+			 * lookup, on the default build, single-threaded -- {cacb,
+			 * baca, ccb} + rekey_merge(dst "cc", src "cac").  The
+			 * plain store was wrong on its own too: the head is
+			 * reader-reachable until the commit, which no abort would
+			 * have rolled back.  Re-aimed at @new_cn, the entry
+			 * records the edge atomically with this publish, like
+			 * every other live dst-origin child.  (Live with no
+			 * queued entry takes the RECORD arm below.)
+			 */
+		} else if ((pending_child || deep_fold) && !pending_top_live &&
+				!absorbed_child_live) {
 			/*
 			 * FOLD substitution: the child is the FRESH, UNPUBLISHED
 			 * cluster top -- build-invisible until the caller's one
