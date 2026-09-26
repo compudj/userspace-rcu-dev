@@ -34454,24 +34454,27 @@ static int test_moved_keys_overflow_exact(void)
 
 		/*
 		 * merge_at of prefix "a" (real: "q", the long key itself), the
-		 * long key present in the source throughout.
+		 * long key present in the source throughout.  Compiled out with
+		 * -DNO_FEATURE_FT_MERGE (NOT_SUPPORTED), so only this case is.
 		 */
-		if (cds_ft_create(group, NULL, &src) < 0)
-			abort();
-		mko_insert(src, lk, sizeof(lk));
-		mko_insert(src, (const uint8_t *) "abc", 3);
-		mko_insert(dst, (const uint8_t *) "zz", 2);
-		rcu_read_lock();
-		cds_ft_make_exclusive(src);
-		st = cds_ft_merge_at(dst, dk, sizeof(dk), src,
-			(const uint8_t *) (real ? "q" : "a"), 1);
-		rcu_read_unlock();
-		if (mko_check(real ? "merge_at, real" : "merge_at, subset",
-				st, want, dst, src))
-			ret = -1;
-		if (drain_trie(dst) || drain_trie(src))
-			ret = -1;
-		cds_ft_destroy(src);
+		if (cds_ft_merge_enabled()) {
+			if (cds_ft_create(group, NULL, &src) < 0)
+				abort();
+			mko_insert(src, lk, sizeof(lk));
+			mko_insert(src, (const uint8_t *) "abc", 3);
+			mko_insert(dst, (const uint8_t *) "zz", 2);
+			rcu_read_lock();
+			cds_ft_make_exclusive(src);
+			st = cds_ft_merge_at(dst, dk, sizeof(dk), src,
+				(const uint8_t *) (real ? "q" : "a"), 1);
+			rcu_read_unlock();
+			if (mko_check(real ? "merge_at, real" :
+					"merge_at, subset", st, want, dst, src))
+				ret = -1;
+			if (drain_trie(dst) || drain_trie(src))
+				ret = -1;
+			cds_ft_destroy(src);
+		}
 
 		/* same-trie rekey of prefix "a" (real: "q") under dk. */
 		mko_insert(dst, lk, sizeof(lk));
