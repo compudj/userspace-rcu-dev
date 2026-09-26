@@ -6997,6 +6997,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			ft_lock_ctx_init(&octx, &d_src, txn, optxn);
 			octx.held.extra = marks;
 			octx.held.nr_extra = nr_marks;
+			/*
+			 * AND THE GLUE's named fences: the climb-rest / survivor
+			 * fences above are filed into @glue before this prepare
+			 * runs, and at root-only (or exponential, when they
+			 * share an anchor) the store's recompaction maps onto
+			 * the SAME word.  A frame naming only @marks refused
+			 * the op's own fence on every attempt -- a
+			 * single-threaded livelock at the -EIO retry below.
+			 */
+#ifndef FT_DEBUG_GRAFT_OCTX_NO_GLUE
+			octx.held.glue = &glue;
+#endif
 			gst = ft_store_at_graft_point_prepare(ft, dst_ord,
 				dst_len, &d_dst, s_top_prime, cnt, &glue,
 				&octx.held, &gst_st);
