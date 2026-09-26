@@ -8267,24 +8267,46 @@ bool ft_lock_ctx_depth_of_climb(const struct cds_ft *ft,
  * member's anchor.  (Remove's stale-holder recovery arm uses the same walk to
  * re-derive a tombstoned holder from the authoritative forward path.)
  * @ik_ret receives the key cursor the walk consumed.
+ *
+ * ☠ A WALK THAT RAISED @skip_conflict IS WALKED AGAIN.  A reanchoring step that
+ * lands shallower (a peer chain-merge moved the encoded position up) leaves
+ * @d->nf and @d->depth at different levels: the step still advances the depth,
+ * so every node from there on is dated too deep and entered into the anchor
+ * table at the wrong level.  Under exponential spacing that picks a DIFFERENT
+ * anchor than every correctly dated op picks for the same node, and two ops
+ * that lock different words for one node exclude nothing.  LTTng-traced: a
+ * prefix-key remove descended across a peer's chain collapse above its holder,
+ * dated the holder one level deep, and coarsened it onto the new compressed
+ * node above it with a plain state guard; a peer's detach took the holder's
+ * OWN lock, rewrote a child slot and released it, the guard saw the same clean
+ * word, and the remove's collapse republished the child that detach had just
+ * unlinked -- a removed key found again.  The mutating descents re-descend on
+ * the flag (cds_ft_insert, cds_ft_insert_replace); this walk takes no lock and
+ * records nothing, so it simply starts over from the root.
  */
 static
 void ft_anchor_descend(struct cds_ft *ft, struct ft_descent *d,
 		const uint8_t *iter_key, size_t key_len, const uint8_t **ik_ret)
 {
-	const uint8_t *ik = iter_key;
+	const uint8_t *ik;
 
-	ft_descent_init(d, ft);
-	while (d->depth < key_len) {
-		if (!d->nf || ft_node_external(d->nf))
-			break;
-		if (ft_node_compressed(d->nf)) {
-			ft_descent_traverse_compressed(ft, d,
-				ft_compressed_node_ptr(d->nf), &ik);
-			continue;
+	do {
+		ik = iter_key;
+		ft_descent_init(d, ft);
+		while (d->depth < key_len) {
+			if (!d->nf || ft_node_external(d->nf))
+				break;
+			if (ft_node_compressed(d->nf)) {
+				ft_descent_traverse_compressed(ft, d,
+					ft_compressed_node_ptr(d->nf), &ik);
+				continue;
+			}
+			ft_descent_step(ft, d, *(ik++));
 		}
-		ft_descent_step(ft, d, *(ik++));
-	}
+#ifdef FT_DEBUG_ANCHOR_DESCEND_IGNORE_CONFLICT
+		break;
+#endif
+	} while (caa_unlikely(d->skip_conflict));
 	*ik_ret = ik;
 }
 
