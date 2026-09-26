@@ -1328,6 +1328,24 @@ struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
 }
 
 /*
+ * A parent word, proxy-resolved, as a NODE -- NULL at a root.
+ *
+ * RESOLVE FIRST, THEN LAUNDER.  ft_parent_node() maps a root's trie stamp to
+ * NULL but passes a parked flip proxy through untouched, so the reverse order
+ * hands back whatever the record holds -- a trie stamp when the record moves
+ * a node into or out of a root position -- and a stamp passes
+ * ft_node_external() (its tag bits are 0), so the caller walks a struct
+ * cds_ft as a node.  A stamp is never a proxy, so resolving first is the
+ * identity for it.  (No test reaches a proxied stamp today; this is the
+ * order that stays right when one does.)
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_parent_node_resolved(struct cds_ft_inode_flag *raw)
+{
+	return ft_parent_node(ft_resolve_flip_proxy(raw));
+}
+
+/*
  * Explicit acquire-load for child pointer dereference.
  *
  * Count-based readers (lookup_nth, skip, count_keys) need acquire
@@ -2508,9 +2526,9 @@ struct cds_ft_inode_flag *ft_skip_reanchor_impl(struct cds_ft *ft,
 			if (at_pos)
 				*at_pos = parent;
 			/* Same flip-proxy resolve as the up-walk read above. */
-			holder = ft_resolve_flip_proxy(ft_parent_node(
+			holder = ft_parent_node_resolved(
 				rcu_dereference(cds_ft_item_to_metadata(
-				(struct cds_ft_inode *) pitem)->parent_word)));
+				(struct cds_ft_inode *) pitem)->parent_word));
 			/*
 			 * The holder is NULL only if @parent is the root -- the
 			 * encoded position is the root itself, i.e. a root-level
@@ -3205,8 +3223,8 @@ void ft_trace_pub_check(struct cds_ft *ft,
 	meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	state = (uintptr_t) urcu_txn_read((void **) &meta->state,
 			FT_STATE_PROXY);
-	rt_parent = ft_resolve_flip_proxy(ft_parent_node(
-			rcu_dereference(meta->parent_word)));
+	rt_parent = ft_parent_node_resolved(
+			rcu_dereference(meta->parent_word));
 	rt_slotp = rt_parent ? ft_get_parent_slot(meta, ft) : NULL;
 	if (caa_likely(cn->len != 0 && !(state & FT_STATE_TOMBSTONE) &&
 			rt_slotp == slot))

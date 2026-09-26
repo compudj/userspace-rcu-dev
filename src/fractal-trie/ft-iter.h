@@ -275,7 +275,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 	 * stamp the metadata parent words already carry, rather than silently
 	 * dereferencing a struct cds_ft as a node.
 	 */
-	nf = ft_resolve_flip_proxy(ft_parent_node(rcu_dereference(cell->parent)));
+	nf = ft_parent_node_resolved(rcu_dereference(cell->parent));
 	/*
 	 * A PREFIX head's parent word says so on the word itself
 	 * (FT_PARENT_PREFIX_HEAD, set when the head was installed at the
@@ -449,8 +449,8 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		 */
 		{
 			struct cds_ft_inode_flag *parent =
-				ft_resolve_flip_proxy(ft_parent_node(
-					rcu_dereference(meta->parent_word)));
+				ft_parent_node_resolved(
+					rcu_dereference(meta->parent_word));
 
 			if (parent && !ft_node_compressed(
 					ft_resolve_skip_compressed(ft, parent))) {

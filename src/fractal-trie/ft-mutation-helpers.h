@@ -6285,8 +6285,8 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 			return;
 		}
 	} else if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
-		struct cds_ft_inode_flag *af = ft_resolve_flip_proxy(
-			ft_parent_node(hm->parent_word));
+		struct cds_ft_inode_flag *af = 
+			ft_parent_node_resolved(hm->parent_word);
 		unsigned int guard = 0;
 
 		/*
@@ -6313,8 +6313,7 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 				s->anchored++;
 				return;
 			}
-			af = ft_resolve_flip_proxy(
-				ft_parent_node(am->parent_word));
+			af = ft_parent_node_resolved(am->parent_word);
 		}
 	}
 	s->unheld++;
@@ -6334,8 +6333,8 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 		 * proxy and stop at an external, both of which SEGV'd this walk
 		 * before they were added.  ASK before prescribing a lock.
 		 */
-		struct cds_ft_inode_flag *af = ft_resolve_flip_proxy(
-			ft_parent_node(hm->parent_word));
+		struct cds_ft_inode_flag *af = 
+			ft_parent_node_resolved(hm->parent_word);
 		unsigned int guard = 0;
 
 		while (af && guard++ < FT_MAX_DEPTH && !ft_node_external(af)) {
@@ -6352,8 +6351,7 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 				s->un_anc_held++;
 				break;
 			}
-			af = ft_resolve_flip_proxy(
-				ft_parent_node(am->parent_word));
+			af = ft_parent_node_resolved(am->parent_word);
 		}
 	}
 	if (!ft_hold_trace_count())
@@ -6501,8 +6499,8 @@ void ft_ch_audit_body_at(const char *fn, int line, const struct cds_ft *ft,
 		 * before).
 		 */
 		if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
-			struct cds_ft_inode_flag *af = ft_resolve_flip_proxy(
-				ft_parent_node(owner->parent_word));
+			struct cds_ft_inode_flag *af = 
+				ft_parent_node_resolved(owner->parent_word);
 			unsigned int guard = 0;
 
 			while (af && guard++ < FT_MAX_DEPTH &&
@@ -6519,8 +6517,7 @@ void ft_ch_audit_body_at(const char *fn, int line, const struct cds_ft *ft,
 					s->anchored++;
 					return;
 				}
-				af = ft_resolve_flip_proxy(
-					ft_parent_node(am->parent_word));
+				af = ft_parent_node_resolved(am->parent_word);
 			}
 		}
 		s->hw_locked_viol++;
@@ -13777,8 +13774,8 @@ bool ft_trace_miswire_observe(struct cds_ft *ft,
 
 	state = (uintptr_t) urcu_txn_read((void **) &meta->state,
 			FT_STATE_PROXY);
-	rt_parent = ft_resolve_flip_proxy(ft_parent_node(
-			rcu_dereference(meta->parent_word)));
+	rt_parent = ft_parent_node_resolved(
+			rcu_dereference(meta->parent_word));
 	rt_slotp = rt_parent ? ft_get_parent_slot(meta, ft) : NULL;
 	if (rt_slotp)
 		rt_val = ft_resolve_flip_proxy(rcu_dereference(*rt_slotp));

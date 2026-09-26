@@ -3406,9 +3406,8 @@ int ft_detach_node(struct cds_ft *ft,
 		 * when no re-home is in flight -- single-writer unchanged),
 		 * exactly as the reader up-walk ft_skip_reanchor does.
 		 */
-		resolved_parent = ft_resolve_flip_proxy(
-			(struct cds_ft_inode_flag *) ft_parent_node(
-				rcu_dereference(metadata->parent_word)));
+		resolved_parent = ft_parent_node_resolved(
+				rcu_dereference(metadata->parent_word));
 		is_root = (resolved_parent == NULL);
 		boundary_parent_nf = resolved_parent;	/* always names @cur */
 		/*
