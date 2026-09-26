@@ -83,7 +83,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(139 + NR_TESTS_REKEY_DLM)	/* +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+#define NR_TESTS	(141 + NR_TESTS_REKEY_DLM)	/* +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -14775,21 +14775,31 @@ static int inv_prefix_shape_zoo(void)
  * that peer had just removed.  FT_INV_OWNED_MS sets the duration,
  * FT_INV_OWNED_LIST=1 runs it with the ordered list on.
  */
-#define OWNED_WRITERS	2
+#define OWNED_WRITERS_MAX	4
 #define OWNED_STABLE	200
 #define OWNED_CHURN	200
-#define OWNED_MAXLEN	10
+#define OWNED_KEY_MAX	16
 
 struct owned_key {
-	uint8_t b[OWNED_MAXLEN];
+	uint8_t b[OWNED_KEY_MAX];
 	unsigned int len;
 	struct ft_test_node *cur;	/* the owner's node while present */
+	struct ft_test_node *prev;	/* the node this key last dropped */
+	const char *prev_op;		/* ... and the op that dropped it */
+	unsigned long prev_at;		/* ... at this writer op count */
 };
 
+/* The failure print names whose node a wrong lookup returned. */
+static struct owned_key *owned_dbg_stable, *owned_dbg_churn;
+
 struct owned_arg {
+	const char *name;
 	struct cds_ft *ft;
 	struct owned_key *keys;
 	unsigned int nr_keys;
+	bool replace;		/* insert_replace + remove, key by key */
+	uint64_t seed;
+	int cur_key;		/* the key this writer is operating on, or -1 */
 	unsigned long ops;
 	int *stop_all;
 	int failed;
@@ -14808,9 +14818,10 @@ static bool owned_key_eq(const struct owned_key *x, const struct owned_key *y)
 	return x->len == y->len && !memcmp(x->b, y->b, x->len);
 }
 
-/* @n distinct keys, none equal to one of @avoid[0..@navoid). */
+/* @n distinct keys of 1..@maxlen bytes, none equal to one of @avoid[]. */
 static void owned_mkkeys(struct owned_key *dst, unsigned int n,
-		const struct owned_key *avoid, unsigned int navoid, uint64_t *s)
+		const struct owned_key *avoid, unsigned int navoid,
+		unsigned int maxlen, uint64_t *s)
 {
 	unsigned int i = 0, j;
 
@@ -14819,7 +14830,7 @@ static void owned_mkkeys(struct owned_key *dst, unsigned int n,
 		bool dup = false;
 
 		memset(&k, 0, sizeof(k));
-		k.len = 1 + (unsigned int) (owned_rnd(s) % OWNED_MAXLEN);
+		k.len = 1 + (unsigned int) (owned_rnd(s) % maxlen);
 		for (j = 0; j < k.len; j++)
 			k.b[j] = (uint8_t) ('a' + (owned_rnd(s) & 1));
 		for (j = 0; j < i && !dup; j++)
@@ -14845,11 +14856,273 @@ static struct cds_ft_node *owned_find(struct cds_ft *ft,
 static void owned_fail(struct owned_arg *a, const char *what,
 		const struct owned_key *k, const void *node)
 {
-	fprintf(stderr, "inv_owned_prefix_dense: %s key=%.*s node=%p\n",
+	unsigned int i;
+
+	fprintf(stderr, "%s: %s key=%.*s node=%p\n", a->name,
 		what, (int) k->len, (const char *) k->b, node);
+	if (node && k->prev && node == &k->prev->node)
+		fprintf(stderr, "%s:   node is THIS key's previous node, dropped by %s %lu ops ago (model now %s)\n",
+			a->name, k->prev_op, a->ops - k->prev_at,
+			k->cur ? "present" : "absent");
+	for (i = 0; node && owned_dbg_stable && i < OWNED_STABLE; i++)
+		if (owned_dbg_stable[i].cur &&
+				node == &owned_dbg_stable[i].cur->node)
+			fprintf(stderr, "%s:   node is STABLE key %.*s\n",
+				a->name, (int) owned_dbg_stable[i].len,
+				(const char *) owned_dbg_stable[i].b);
+	for (i = 0; node && owned_dbg_churn && i < OWNED_CHURN; i++) {
+		struct owned_key *c = &owned_dbg_churn[i];
+
+		if (c->cur && node == &c->cur->node)
+			fprintf(stderr, "%s:   node is CHURN key %.*s (current)\n",
+				a->name, (int) c->len, (const char *) c->b);
+		if (c->prev && node == &c->prev->node)
+			fprintf(stderr, "%s:   node is CHURN key %.*s (previous)\n",
+				a->name, (int) c->len, (const char *) c->b);
+	}
 	a->failed = 1;
 	*a->stop_all = 1;
+	if (getenv("FT_TRACE_SESSION")) {
+		char cmd[256];
+
+		/* The peer that did it ran within the last lap: keep it. */
+		snprintf(cmd, sizeof(cmd), "lttng stop %s 1>&2",
+			getenv("FT_TRACE_SESSION"));
+		(void) system(cmd);
+		snprintf(cmd, sizeof(cmd), "lttng snapshot record -s %s 1>&2",
+			getenv("FT_TRACE_SESSION"));
+		(void) system(cmd);
+		abort();
+	}
 	mw_violation_snapshot();
+}
+
+/*
+ * One key, one op, checked on both sides: the key must resolve to exactly the
+ * owner's node (or to nothing) before and after.  A coin picks insert_replace
+ * or remove; insert_replace must answer OK exactly when the key was absent,
+ * and DUPLICATE_FOUND with the owner's own node otherwise.
+ */
+static int owned_plain_insert;
+
+static int owned_replace_one(struct owned_arg *a, struct cds_ft_iter *iter,
+		struct owned_key *k)
+{
+	struct cds_ft_node *want = k->cur ? &k->cur->node : NULL;
+	struct cds_ft_node *o = owned_find(a->ft, k), *res = NULL;
+	struct ft_test_node *n;
+	enum cds_ft_status st = CDS_FT_STATUS_OK;
+	const char *op = "none";
+
+	if (o != want) {
+		owned_fail(a, "before the op, the key is not exactly its owner's node",
+			k, o);
+		return -1;
+	}
+	bool coin = owned_rnd(&a->seed) & 1;
+
+	if (owned_plain_insert && coin) {
+		/* FT_INV_OWNED_PLAIN_INSERT=1: cds_ft_insert where absent. */
+		if (!want) {
+			n = node_alloc(0);
+			op = "insert";
+			st = cds_ft_insert(a->ft, k->b, k->len, &n->node);
+			if (st == CDS_FT_STATUS_OK)
+				k->cur = n;
+			else
+				node_free(n);
+		}
+	} else if (!owned_plain_insert && coin) {
+		n = node_alloc(0);
+		op = "insert_replace";
+		st = cds_ft_insert_replace(a->ft, k->b, k->len, &n->node, &res);
+		if (st == CDS_FT_STATUS_BUSY_ERROR) {
+			node_free(n);		/* nothing published */
+		} else if (st == CDS_FT_STATUS_OK) {
+			if (want) {
+				owned_fail(a, "insert_replace found no prior node while the owner's is present",
+					k, want);
+				return -1;
+			}
+			k->cur = n;
+		} else if (st == CDS_FT_STATUS_DUPLICATE_FOUND) {
+			if (!want || res != want || cds_ft_node_next_rcu(res)) {
+				owned_fail(a, "insert_replace displaced a chain that is not the owner's node",
+					k, res);
+				return -1;
+			}
+			k->prev = k->cur;
+			k->prev_op = "insert_replace";
+			k->prev_at = a->ops;
+			node_free_rcu(k->cur);
+			k->cur = n;
+		} else {
+			owned_fail(a, "insert_replace failed", k, NULL);
+			return -1;
+		}
+	} else if (want) {
+		op = "remove";
+		cds_ft_iter_set_key(iter, k->b, k->len);
+		if (cds_ft_lookup(a->ft, iter) != CDS_FT_STATUS_OK ||
+				cds_ft_iter_node(iter) != want ||
+				cds_ft_remove(a->ft, iter, want) !=
+					CDS_FT_STATUS_OK) {
+			owned_fail(a, "the owner's remove failed", k, want);
+			return -1;
+		}
+		k->prev = k->cur;
+		k->prev_op = "remove";
+		k->prev_at = a->ops;
+		node_free_rcu(k->cur);
+		k->cur = NULL;
+	}
+	want = k->cur ? &k->cur->node : NULL;
+	o = owned_find(a->ft, k);
+	if (o != want) {
+		fprintf(stderr, "%s: the op was %s, status %d, want %p, res %p\n",
+			a->name, op, (int) st, (void *) want, (void *) res);
+		owned_fail(a, "after the op, the key is not exactly its owner's node",
+			k, o);
+		return -1;
+	}
+	return 0;
+}
+
+/* FT_INV_OWNED_WIN_MS: writers park here while the main thread checks. */
+static int owned_pause, owned_paused;
+
+static void owned_park(void)
+{
+	if (!uatomic_read(&owned_pause))
+		return;
+	uatomic_inc(&owned_paused);
+	rcu_thread_offline();
+	while (uatomic_read(&owned_pause) && !test_stop)
+		caa_cpu_relax();
+	rcu_thread_online();
+	uatomic_dec(&owned_paused);
+}
+
+struct owned_expect {
+	const struct cds_ft_node *node;
+	const struct owned_key *key;
+};
+
+static int owned_expect_cmp(const void *x, const void *y)
+{
+	uintptr_t p = (uintptr_t) ((const struct owned_expect *) x)->node;
+	uintptr_t q = (uintptr_t) ((const struct owned_expect *) y)->node;
+
+	return p < q ? -1 : p > q;
+}
+
+static void owned_window_fail(const char *name, unsigned long nwin,
+		const char *what, const struct owned_key *k, const void *node,
+		const uint8_t *got, size_t got_len)
+{
+	const char *sess = getenv("FT_TRACE_SESSION");
+	char cmd[256];
+
+	fprintf(stderr, "%s: window %lu: %s key=%.*s node=%p walked-as=%.*s\n",
+		name, nwin, what, k ? (int) k->len : 0,
+		k ? (const char *) k->b : "", node,
+		(int) got_len, got ? (const char *) got : "");
+	if (sess) {
+		/* Every writer is parked: the rings are quiescent already. */
+		snprintf(cmd, sizeof(cmd), "lttng stop %s 1>&2", sess);
+		(void) system(cmd);
+		snprintf(cmd, sizeof(cmd), "lttng snapshot record -s %s 1>&2",
+			sess);
+		(void) system(cmd);
+	}
+	if (sess || getenv("FT_INV_OWNED_ABORT"))
+		abort();
+}
+
+/*
+ * With every writer parked: each stable and each owned key resolves to
+ * exactly the node the models say, and an ordered walk of the whole trie
+ * visits exactly those nodes, each under its OWN key -- a node filed at the
+ * wrong position shows up here as a key mismatch or an extra entry, at the
+ * window it happened in rather than at its owner's next op.
+ */
+static int owned_window_check(const char *name, unsigned long nwin,
+		struct cds_ft *ft, const struct owned_key *stable,
+		const struct owned_key *churn)
+{
+	struct owned_expect ex[OWNED_STABLE + OWNED_CHURN];
+	struct cds_ft_iter *iter;
+	unsigned int i, nex = 0, seen = 0;
+	int ret = 0;
+
+	/* The structure itself first: back-pointers, counts, canonical form. */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		owned_window_fail(name, nwin, "cds_ft_verify fails", NULL,
+			NULL, NULL, 0);
+		return -1;
+	}
+	for (i = 0; i < OWNED_STABLE; i++) {
+		if (owned_find(ft, &stable[i]) != &stable[i].cur->node) {
+			owned_window_fail(name, nwin, "a stable key does not resolve to its node",
+				&stable[i], owned_find(ft, &stable[i]), NULL, 0);
+			return -1;
+		}
+		ex[nex].node = &stable[i].cur->node;
+		ex[nex++].key = &stable[i];
+	}
+	for (i = 0; i < OWNED_CHURN; i++) {
+		const struct cds_ft_node *want = churn[i].cur ?
+			&churn[i].cur->node : NULL;
+
+		if (owned_find(ft, &churn[i]) != want) {
+			owned_window_fail(name, nwin, "an owned key does not resolve to its model",
+				&churn[i], owned_find(ft, &churn[i]), NULL, 0);
+			return -1;
+		}
+		if (want) {
+			ex[nex].node = want;
+			ex[nex++].key = &churn[i];
+		}
+	}
+	qsort(ex, nex, sizeof(ex[0]), owned_expect_cmp);
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	if (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		do {
+			struct owned_expect q = { .node = cds_ft_iter_node(iter) };
+			const struct owned_expect *e;
+			uint8_t rk[OWNED_KEY_MAX + 8];
+			size_t rk_len = 0;
+
+			cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+			e = (const struct owned_expect *) bsearch(&q, ex, nex,
+				sizeof(ex[0]), owned_expect_cmp);
+			if (!e) {
+				owned_window_fail(name, nwin, "the walk visits a node no model holds",
+					NULL, q.node, rk, rk_len);
+				ret = -1;
+				break;
+			}
+			if (rk_len != e->key->len ||
+					memcmp(rk, e->key->b, rk_len)) {
+				owned_window_fail(name, nwin, "a node is walked under another key",
+					e->key, q.node, rk, rk_len);
+				ret = -1;
+				break;
+			}
+			if (++seen > nex)
+				break;
+		} while (cds_ft_next(ft, iter) == CDS_FT_STATUS_OK);
+	}
+	if (!ret && seen != nex) {
+		fprintf(stderr, "%s: window %lu: walked %u entries, models hold %u\n",
+			name, nwin, seen, nex);
+		owned_window_fail(name, nwin, "entry count differs", NULL, NULL,
+			NULL, 0);
+		ret = -1;
+	}
+	cds_ft_iter_destroy(iter);
+	return ret;
 }
 
 static void *owned_writer(void *arg)
@@ -14864,12 +15137,29 @@ static void *owned_writer(void *arg)
 	while (!test_go)
 		rcu_quiescent_state();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	while (!test_stop && !*a->stop_all) {
+	while (a->replace && !test_stop && !*a->stop_all) {
+		for (i = 0; i < a->nr_keys && !test_stop && !*a->stop_all; i++) {
+			int r;
+
+			owned_park();
+			uatomic_set(&a->cur_key, (int) i);
+			rcu_read_lock();
+			r = owned_replace_one(a, iter, &a->keys[i]);
+			rcu_read_unlock();
+			uatomic_set(&a->cur_key, -1);
+			if (r)
+				break;
+			rcu_quiescent_state();
+			a->ops++;
+		}
+	}
+	while (!a->replace && !test_stop && !*a->stop_all) {
 		for (i = 0; i < a->nr_keys && !test_stop && !*a->stop_all; i++) {
 			struct owned_key *k = &a->keys[i];
 			struct ft_test_node *n;
 			struct cds_ft_node *o;
 
+			owned_park();
 			rcu_read_lock();
 			o = owned_find(a->ft, k);
 			if (o && !k->cur) {
@@ -14896,6 +15186,7 @@ static void *owned_writer(void *arg)
 
 			if (!k->cur)
 				continue;
+			owned_park();
 			rcu_read_lock();
 			cds_ft_iter_set_key(iter, k->b, k->len);
 			if (cds_ft_lookup(a->ft, iter) != CDS_FT_STATUS_OK ||
@@ -14931,22 +15222,32 @@ static void *owned_writer(void *arg)
 	return NULL;
 }
 
-static int inv_owned_prefix_dense(void)
+static int owned_body(const char *name, unsigned int nwriters,
+		unsigned int maxlen, bool replace)
 {
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	struct owned_key *stable, *churn;
-	struct owned_arg a[OWNED_WRITERS];
-	pthread_t th[OWNED_WRITERS];
+	struct owned_arg a[OWNED_WRITERS_MAX];
+	pthread_t th[OWNED_WRITERS_MAX];
 	const char *ms_env = getenv("FT_INV_OWNED_MS");
 	const char *list_env = getenv("FT_INV_OWNED_LIST");
+	const char *win_env = getenv("FT_INV_OWNED_WIN_MS");
 	unsigned long long ms = ms_env ? strtoull(ms_env, NULL, 10) :
 		PREFIX_PAIR_MS;
+	unsigned long long win;
 	uint64_t s = 0x5eedf00dULL;
 	struct timespec t0;
-	unsigned int i, per = OWNED_CHURN / OWNED_WRITERS;
+	unsigned int i, per = OWNED_CHURN / nwriters;
 	int ret = 0, stop_all = 0;
+
+	owned_plain_insert = getenv("FT_INV_OWNED_PLAIN_INSERT") != NULL;
+	/* Under a per-process capture, let the launcher start the session. */
+	if (getenv("FT_TRACE_SESSION"))
+		sleep(3);
+	/* Default: park and verify every 5 ms; FT_INV_OWNED_WIN_MS=0 turns it off. */
+	win = win_env ? strtoull(win_env, NULL, 10) : 5;
 
 	/*
 	 * The DEFAULT group, as an application gets it -- no creator knobs:
@@ -14968,59 +15269,324 @@ static int inv_owned_prefix_dense(void)
 	churn = (struct owned_key *) calloc(OWNED_CHURN, sizeof(*churn));
 	if (!stable || !churn)
 		abort();
-	owned_mkkeys(stable, OWNED_STABLE, NULL, 0, &s);
-	owned_mkkeys(churn, OWNED_CHURN, stable, OWNED_STABLE, &s);
+	owned_mkkeys(stable, OWNED_STABLE, NULL, 0, maxlen, &s);
+	owned_mkkeys(churn, OWNED_CHURN, stable, OWNED_STABLE, maxlen, &s);
+	owned_dbg_stable = stable;
+	owned_dbg_churn = churn;
 	rcu_read_lock();
-	for (i = 0; i < OWNED_STABLE; i++)
+	for (i = 0; i < OWNED_STABLE; i++) {
+		stable[i].cur = node_alloc(0);
 		if (cds_ft_insert(ft, stable[i].b, stable[i].len,
-				&node_alloc(0)->node) != CDS_FT_STATUS_OK)
+				&stable[i].cur->node) != CDS_FT_STATUS_OK)
 			abort();
+	}
 	rcu_read_unlock();
 
 	test_go = 0;
 	test_stop = 0;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	for (i = 0; i < OWNED_WRITERS; i++) {
+	for (i = 0; i < nwriters; i++) {
 		memset(&a[i], 0, sizeof(a[i]));
+		a[i].name = name;
 		a[i].ft = ft;
 		a[i].keys = churn + i * per;
 		a[i].nr_keys = per;
+		a[i].replace = replace;
+		a[i].seed = 0x5eed + 7919ULL * (i + 1);
+		a[i].cur_key = -1;
 		a[i].stop_all = &stop_all;
 		pthread_create(&th[i], NULL, owned_writer, &a[i]);
 	}
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	test_go = 1;
-	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
+	if (win) {
+		unsigned long nwin = 0;
+
+		while (elapsed_ms(&t0) < ms && !stop_all) {
+			struct timespec tw;
+
+			clock_gettime(CLOCK_MONOTONIC, &tw);
+			while (elapsed_ms(&tw) < win && !stop_all)
+				rcu_quiescent_state();
+			uatomic_set(&owned_pause, 1);
+			clock_gettime(CLOCK_MONOTONIC, &tw);
+			while (uatomic_read(&owned_paused) != (int) nwriters &&
+					!stop_all) {
+				rcu_quiescent_state();
+				if (elapsed_ms(&tw) < 2000)
+					continue;
+				/*
+				 * A writer that has not reached its park point in
+				 * 2 s is stuck INSIDE an op: name it, and check the
+				 * structure it is stuck on -- every other writer
+				 * is parked.
+				 */
+				for (i = 0; i < nwriters; i++) {
+					int ck = uatomic_read(&a[i].cur_key);
+
+					if (ck >= 0)
+						fprintf(stderr, "%s: writer %u STUCK on key=%.*s (model %s)\n",
+							name, i,
+							(int) a[i].keys[ck].len,
+							(const char *) a[i].keys[ck].b,
+							a[i].keys[ck].cur ?
+							"present" : "absent");
+				}
+				/* The key set the stuck op runs against. */
+				for (i = 0; i < OWNED_STABLE; i++)
+					fprintf(stderr, "PRESENT %.*s\n",
+						(int) stable[i].len,
+						(const char *) stable[i].b);
+				for (i = 0; i < OWNED_CHURN; i++)
+					if (churn[i].cur)
+						fprintf(stderr, "PRESENT %.*s\n",
+							(int) churn[i].len,
+							(const char *) churn[i].b);
+				rcu_read_lock();
+				fprintf(stderr, "SHAPE-BEGIN\n");
+				cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
+				fprintf(stderr, "SHAPE-END\n");
+				if (!owned_window_check(name, nwin + 1, ft,
+						stable, churn))
+					fprintf(stderr, "%s: the structure CHECKS CLEAN around the stuck op\n",
+						name);
+				rcu_read_unlock();
+				owned_window_fail(name, nwin + 1,
+					"a writer is stuck in an op", NULL, NULL,
+					NULL, 0);
+				stop_all = 1, ret = -1;
+			}
+			if (!stop_all) {
+				nwin++;
+				rcu_read_lock();
+				if (owned_window_check(name, nwin, ft, stable,
+						churn))
+					stop_all = 1, ret = -1;
+				rcu_read_unlock();
+			}
+			uatomic_set(&owned_pause, 0);
+			while (uatomic_read(&owned_paused) != 0)
+				rcu_quiescent_state();
+		}
+		fprintf(stderr, "# %s: %lu windows checked\n", name, nwin);
+	}
+	rcu_thread_offline();
 	while (elapsed_ms(&t0) < ms && !stop_all)
 		usleep(1000);
 	test_stop = 1;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	for (i = 0; i < OWNED_WRITERS; i++)
+	for (i = 0; i < nwriters; i++)
 		pthread_join(th[i], NULL);
 	rcu_thread_online();
 
-	for (i = 0; i < OWNED_WRITERS; i++) {
+	fprintf(stderr, "# %s: ops", name);
+	for (i = 0; i < nwriters; i++) {
+		fprintf(stderr, " %lu", a[i].ops);
 		if (a[i].failed)
 			ret = -1;
 		if (!a[i].ops) {
-			fprintf(stderr, "inv_owned_prefix_dense: writer %u made no progress\n",
-				i);
+			fprintf(stderr, "\n%s: writer %u made no progress", name, i);
 			ret = -1;
 		}
 	}
-	fprintf(stderr, "# inv_owned_prefix_dense: %lu + %lu ops\n",
-		a[0].ops, a[1].ops);
+	fprintf(stderr, "\n");
 	rcu_read_lock();
-	if (verify_or_dump(ft, "inv_owned_prefix_dense"))
+	if (verify_or_dump(ft, name))
 		ret = -1;
 	rcu_read_unlock();
 	/* The drain frees every node still reachable, the churn heads included. */
 	drain_trie_keep_group(ft);
 	rcu_barrier();
 	cds_ft_group_destroy(group);
+	owned_dbg_stable = owned_dbg_churn = NULL;
 	free(stable);
 	free(churn);
+	return ret;
+}
+
+static int inv_owned_prefix_dense(void)
+{
+	return owned_body("inv_owned_prefix_dense", 2, 10, false);
+}
+
+/*
+ * The same owners, insert_replace + remove, four writers, keys of 1..16 bytes.
+ * Two defects only this mix reached, both at exponential spacing, both a plan
+ * dated from two snapshots: insert_replace ignored the descent's skip conflict
+ * and parked a leaf key as the prefix key of the node one byte above it (OK
+ * with the owner's node present), and the detach orphan walk anchored at a
+ * depth its descent never reached (an assert, or a SEGV in release).
+ */
+static int inv_owned_prefix_dense_replace(void)
+{
+	return owned_body("inv_owned_prefix_dense_replace", 4, 16, true);
+}
+
+/*
+ * insert_replace on a body leaf K inherits K's prefix answer for the new head,
+ * read from K's parent word before the op holds anything.  A peer that inserts
+ * K+'b' turns K into the prefix head of a fresh node, and removing K+'b'
+ * promotes it back -- the SAME head in the SAME slot.  An op whose plan read
+ * the answer in between and checks only the slot under its lock publishes a
+ * body leaf saying prefix-head=1.  The next split/promote rewrites that word,
+ * so the state is transient: park every writer and verify each window.
+ * Measured without the under-lock re-check, 10 s: 4/8 runs fail at per-node,
+ * 2/8 at exponential.  FT_INV_IRPR_MS sets the duration.
+ */
+#define IRPR_PAIRS	8
+#define IRPR_KLEN	7
+
+struct irpr_arg {
+	struct cds_ft *ft;
+	int pair;
+	bool extender;		/* inserts and removes K+'b'; else replaces K */
+	int *stop_all;
+};
+
+static void irpr_key(uint8_t *k, int pair, uint8_t last)
+{
+	memset(k, 'a', IRPR_KLEN + 1);
+	k[0] = (uint8_t) ('a' + pair);
+	k[IRPR_KLEN - 1] = last;
+}
+
+static void *irpr_writer(void *arg)
+{
+	struct irpr_arg *a = (struct irpr_arg *) arg;
+	struct cds_ft_iter *iter;
+	uint8_t k[IRPR_KLEN + 1];
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(a->ft, &iter) < 0)
+		abort();
+	irpr_key(k, a->pair, 'a');
+	k[IRPR_KLEN] = 'b';
+	while (!test_go)
+		rcu_quiescent_state();
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop && !*a->stop_all) {
+		struct ft_test_node *n = node_alloc(0);
+		struct cds_ft_node *res = NULL;
+		enum cds_ft_status st;
+
+		owned_park();
+		rcu_read_lock();
+		if (!a->extender) {
+			st = cds_ft_insert_replace(a->ft, k, IRPR_KLEN,
+				&n->node, &res);
+			if (st == CDS_FT_STATUS_DUPLICATE_FOUND)
+				node_free_rcu(to_test_node(res));
+			else if (st != CDS_FT_STATUS_OK)
+				node_free(n);
+		} else if (cds_ft_insert(a->ft, k, IRPR_KLEN + 1, &n->node) !=
+				CDS_FT_STATUS_OK) {
+			node_free(n);
+		} else {
+			cds_ft_iter_set_key(iter, k, IRPR_KLEN + 1);
+			if (cds_ft_lookup(a->ft, iter) != CDS_FT_STATUS_OK ||
+					cds_ft_iter_node(iter) != &n->node ||
+					cds_ft_remove(a->ft, iter, &n->node) !=
+						CDS_FT_STATUS_OK) {
+				fprintf(stderr, "inv_ir_prefix_roundtrip: the extension's remove failed\n");
+				*a->stop_all = 1;
+			} else {
+				node_free_rcu(n);
+			}
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_ir_prefix_roundtrip(void)
+{
+	const char *name = "inv_ir_prefix_roundtrip";
+	const char *ms_env = getenv("FT_INV_IRPR_MS");
+	unsigned long long ms = ms_env ? strtoull(ms_env, NULL, 10) : 2000;
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct irpr_arg a[2 * IRPR_PAIRS];
+	pthread_t th[2 * IRPR_PAIRS];
+	unsigned int i, nthreads = 2 * IRPR_PAIRS;
+	unsigned long nwin = 0;
+	struct timespec t0;
+	int ret = 0, stop_all = 0;
+
+	/* The default group, ordered list off, as the owned-key row. */
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	/* The sibling that keeps each K a BODY leaf of a 2-child node. */
+	rcu_read_lock();
+	for (i = 0; i < IRPR_PAIRS; i++) {
+		uint8_t s[IRPR_KLEN + 1];
+
+		irpr_key(s, (int) i, 'b');
+		if (cds_ft_insert(ft, s, IRPR_KLEN, &node_alloc(0)->node) !=
+				CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < nthreads; i++) {
+		a[i] = (struct irpr_arg) { .ft = ft, .pair = (int) (i / 2),
+			.extender = i & 1, .stop_all = &stop_all };
+		pthread_create(&th[i], NULL, irpr_writer, &a[i]);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < ms && !stop_all) {
+		struct timespec tw;
+
+		clock_gettime(CLOCK_MONOTONIC, &tw);
+		while (elapsed_ms(&tw) < 1)
+			rcu_quiescent_state();
+		uatomic_set(&owned_pause, 1);
+		while (uatomic_read(&owned_paused) != (int) nthreads &&
+				!stop_all)
+			rcu_quiescent_state();
+		if (!stop_all) {
+			nwin++;
+			rcu_read_lock();
+			if (verify_or_dump(ft, name))
+				stop_all = 1, ret = -1;
+			rcu_read_unlock();
+		}
+		uatomic_set(&owned_pause, 0);
+		while (uatomic_read(&owned_paused) != 0)
+			rcu_quiescent_state();
+	}
+	if (stop_all)
+		ret = -1;
+	fprintf(stderr, "# %s: %lu windows checked\n", name, nwin);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	rcu_thread_offline();
+	for (i = 0; i < nthreads; i++)
+		pthread_join(th[i], NULL);
+	rcu_thread_online();
+	rcu_read_lock();
+	if (verify_or_dump(ft, name))
+		ret = -1;
+	rcu_read_unlock();
+	drain_trie_keep_group(ft);
+	rcu_barrier();
+	cds_ft_group_destroy(group);
 	return ret;
 }
 
@@ -28374,6 +28940,8 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_prefix_dup_promote_vs_extension);
 	RUN_TEST(inv_prefix_shape_zoo);
 	RUN_TEST(inv_owned_prefix_dense);
+	RUN_TEST(inv_owned_prefix_dense_replace);
+	RUN_TEST(inv_ir_prefix_roundtrip);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);
