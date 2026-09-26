@@ -3012,6 +3012,11 @@ int ft_detach_node(struct cds_ft *ft,
 	/* This level's pair-checked load of the slot holding @cur. */
 	struct cds_ft_inode_flag *pair_held = NULL;
 	/*
+	 * The shape-D collapse predicate as the PLAN evaluated it (unlocked):
+	 * see the residue re-check after ft_node_replace_ptr.
+	 */
+	bool shape_d_plan = false;
+	/*
 	 * The detach TARGET as the entry read it (@plan_old_child before the
 	 * climb re-anchors it): the node the orphan walk must arrive at once it
 	 * has walked the @nr_elevated links the climb counted.
@@ -5002,11 +5007,12 @@ int ft_detach_node(struct cds_ft *ft,
 			 * every other child the node really had.  No assert stands
 			 * between that and a published trie.
 			 */
-			if (ft_group_skip_compressed(ft->group) &&
+			shape_d_plan = ft_group_skip_compressed(ft->group) &&
 			    !topmost_external_nodes &&
 			    ft_meta_nr_child_load(bmeta) == 2 &&
 			    !bmeta->external_nodes &&
-			    ft_parent_node(bmeta->parent_word) != NULL) {
+			    ft_parent_node(bmeta->parent_word) != NULL;
+			if (shape_d_plan) {
 				struct cds_ft_inode_flag *s_child = NULL;
 				struct cds_ft_inode_flag **s_slot = NULL;
 				struct cds_ft_inode_flag *fold_pending = NULL;
@@ -5558,6 +5564,40 @@ int ft_detach_node(struct cds_ft *ft,
 				cur_depth, pub, commit_txn, replace_hint,
 				&lctx);
 		}
+#if defined(FEATURE_FT_SKIP_COMPRESSED) && !defined(FT_DEBUG_RECOMPACT_RESIDUE)
+		/*
+		 * A COPY THAT SHOULD HAVE BEEN A COLLAPSE.  The shape-D test above
+		 * is a PLAN read: it saw @iter_node_flag keep its prefix key (or a
+		 * third child), so removing one child left a legal keyed node and
+		 * no collapse was owed.  A peer removing that prefix key between the
+		 * plan and the recompaction's lock changes the answer: the copy the
+		 * recompaction just built from the LOCKED state has one child and no
+		 * key -- the 1-child keyless internal cds_ft_verify refuses in skip
+		 * mode, and which a later remove below it cannot date its plan on
+		 * (it livelocks at exponential spacing).  Measured: 143 such copies
+		 * in 24 owned-key runs, every one planned with nr_child 2 and a key.
+		 * Nothing is committed yet -- the copy is unpublished and its
+		 * re-parent sweep and retire ride @commit_txn -- so re-plan; the
+		 * next attempt sees the node without its key and collapses it.
+		 * Only where this plan did NOT choose the collapse, so a shape-D that
+		 * refuses as out of bound cannot send it round forever; not for a
+		 * bulk fold (@record_only), which no peer can race.
+		 */
+		if (!ret && !boundary_fused && !shape_d_plan && !record_only &&
+		    old_recompacted_node && !topmost_external_nodes &&
+		    ft_group_skip_compressed(ft->group) &&
+		    !ft_node_external(iter_node_flag) &&
+		    !ft_node_compressed(iter_node_flag) &&
+		    !ft_node_skip_compressed(iter_node_flag)) {
+			struct cds_ft_metadata *nm = cds_ft_item_to_metadata(
+				ft_node_ptr(iter_node_flag));
+
+			if (ft_meta_nr_child_load(nm) == 1 &&
+			    !nm->external_nodes &&
+			    ft_parent_node(nm->parent_word) != NULL)
+				ret = -EAGAIN;
+		}
+#endif
 		if (!ret) {
 			/*
 			 * Freeze the collected orphan chain (+ trailing skip-target)
