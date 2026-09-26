@@ -2099,9 +2099,19 @@ struct cds_ft_key_map {
  * reserved (the bulk ops move existing cells, they do not allocate new ones).
  * Per-bucket capacity is small because each bulk op's exact node need is O(1)
  * per (kind, order); reserve fills assert against it.
+ *
+ * ONE exception, without FEATURE_FT_COMPRESS: ft_build_branch cannot fold a
+ * branch into one compressed node, so it builds a chain of single-child nodes,
+ * one per key byte -- up to FT_MAX_KEY_LEN of the smallest node type, not O(1).
+ * That bucket's excess lives in @branch (cds_ft_alloc_reserve_add_branch): the
+ * draw path takes from it once the ordinary bucket is empty, and a refund spills
+ * into it once the ordinary bucket is full.
  */
 #define CDS_FT_ALLOC_RESERVE_NR_KIND	2
 #define CDS_FT_ALLOC_RESERVE_CAP	8
+#ifndef FEATURE_FT_COMPRESS
+#define CDS_FT_ALLOC_RESERVE_BRANCH_CAP	FT_MAX_KEY_LEN
+#endif
 
 enum cds_ft_alloc_kind {
 	CDS_FT_ALLOC_KIND_NODE = 0,
@@ -2113,6 +2123,12 @@ struct cds_ft_alloc_reserve {
 	struct cds_ft_metadata *items[CDS_FT_ALLOC_RESERVE_NR_KIND]
 			[FT_ALLOC_ORDER_MAX + 1][CDS_FT_ALLOC_RESERVE_CAP];
 	unsigned int count[CDS_FT_ALLOC_RESERVE_NR_KIND][FT_ALLOC_ORDER_MAX + 1];
+#ifndef FEATURE_FT_COMPRESS
+	/* Excess of the (NODE, @branch_order) bucket; 0 until add_branch. */
+	struct cds_ft_metadata *branch[CDS_FT_ALLOC_RESERVE_BRANCH_CAP];
+	unsigned int branch_count;
+	size_t branch_order;
+#endif
 };
 
 struct cds_ft_group {
@@ -5436,6 +5452,19 @@ __attribute__((visibility("hidden")))
 int cds_ft_alloc_reserve_add(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
 		enum cds_ft_alloc_kind kind, size_t item_len_order, bool bitmap,
 		unsigned int n);
+
+#ifndef FEATURE_FT_COMPRESS
+/*
+ * Add @n single-child branch nodes (CDS_FT_ALLOC_KIND_NODE, @item_len_order) to
+ * @r's branch excess (see struct cds_ft_alloc_reserve).  One order per reserve;
+ * same contract as cds_ft_alloc_reserve_add, asserted against
+ * CDS_FT_ALLOC_RESERVE_BRANCH_CAP.
+ */
+__attribute__((visibility("hidden")))
+int cds_ft_alloc_reserve_add_branch(struct cds_ft *ft,
+		struct cds_ft_alloc_reserve *r, size_t item_len_order, bool bitmap,
+		unsigned int n);
+#endif
 
 /*
  * Make @r the active reserve for @ft in THIS THREAD's reserve set.  A bulk op

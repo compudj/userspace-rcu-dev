@@ -1518,6 +1518,11 @@ struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 
 			if (*cnt)
 				return r->items[kind][item_len_order][--(*cnt)];
+#ifndef FEATURE_FT_COMPRESS
+			if (kind == CDS_FT_ALLOC_KIND_NODE && r->branch_count
+					&& item_len_order == r->branch_order)
+				return r->branch[--r->branch_count];
+#endif
 			/*
 			 * Reserve active but exhausted for this (kind, order):
 			 * the op's manifest under-counted what it allocates.
@@ -1781,6 +1786,30 @@ int cds_ft_alloc_reserve_add(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
 	return 0;
 }
 
+#ifndef FEATURE_FT_COMPRESS
+int cds_ft_alloc_reserve_add_branch(struct cds_ft *ft,
+		struct cds_ft_alloc_reserve *r, size_t item_len_order, bool bitmap,
+		unsigned int n)
+{
+	unsigned int i;
+
+	assert(item_len_order <= FT_ALLOC_ORDER_MAX);
+	assert(!ft_tls_reserve_for(ft));
+	assert(!r->branch_count || r->branch_order == item_len_order);
+	assert(r->branch_count + n <= CDS_FT_ALLOC_RESERVE_BRANCH_CAP);
+	r->branch_order = item_len_order;
+	for (i = 0; i < n; i++) {
+		struct cds_ft_metadata *m;
+
+		m = cds_ft_alloc_item(ft, item_len_order, bitmap);
+		if (!m)
+			return -ENOMEM;
+		r->branch[r->branch_count++] = m;
+	}
+	return 0;
+}
+#endif
+
 void cds_ft_alloc_reserve_activate(struct cds_ft *ft,
 		struct cds_ft_alloc_reserve *r)
 {
@@ -1840,6 +1869,11 @@ void cds_ft_alloc_reserve_drain(struct cds_ft *ft,
 			r->count[k][o] = 0;
 		}
 	}
+#ifndef FEATURE_FT_COMPRESS
+	for (i = 0; i < r->branch_count; i++)
+		cds_ft_do_free_item(r->branch[i]);
+	r->branch_count = 0;
+#endif
 }
 
 #ifdef FT_DEBUG_TOMBSTONE_AUDIT
@@ -1967,6 +2001,7 @@ bool ft_alloc_reserve_refund(struct cds_ft *ft, struct cds_ft_metadata *metadata
 	enum cds_ft_alloc_kind kind;
 	size_t order, alloc_index;
 	unsigned int *cnt;
+	bool full;
 	void *p;
 
 	if (!ft_tls_reserve_nr)
@@ -1986,13 +2021,27 @@ bool ft_alloc_reserve_refund(struct cds_ft *ft, struct cds_ft_metadata *metadata
 	else
 		return false;		/* a cell, or not this group's node arena */
 	cnt = &r->count[kind][order];
-	if (*cnt >= CDS_FT_ALLOC_RESERVE_CAP)
+	full = *cnt >= CDS_FT_ALLOC_RESERVE_CAP;
+#ifndef FEATURE_FT_COMPRESS
+	/* A long branch drew past the bucket: its excess goes back to @branch. */
+	if (full && (kind != CDS_FT_ALLOC_KIND_NODE || order != r->branch_order
+			|| r->branch_count >= CDS_FT_ALLOC_RESERVE_BRANCH_CAP))
+		return false;
+#else
+	if (full)
 		return false;		/* bucket full: the arena takes it back */
+#endif
 	item = caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
 	p = cds_ft_metadata_to_item(metadata);
 	alloc_index = metadata->alloc_index;
 	memset(p, 0, 1UL << order);
 	ft_clear_recycled_slot(arena, item, alloc_index);
+#ifndef FEATURE_FT_COMPRESS
+	if (full) {
+		r->branch[r->branch_count++] = metadata;
+		return true;
+	}
+#endif
 	r->items[kind][order][(*cnt)++] = metadata;
 	return true;
 }

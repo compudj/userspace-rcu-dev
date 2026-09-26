@@ -21581,7 +21581,9 @@ unsigned long ft_node_key_count(struct cds_ft *ft, struct cds_ft_inode_flag *c)
  * Fill @r with a generous SUPERSET of the nodes ONE ATTEMPT at a bulk op's
  * commit can allocate -- CDS_FT_ALLOC_RESERVE_CAP of every internal node type
  * (its own order + bitmap), the minimal order, and (speculative groups) the
- * compressed-node orders.  Drawn before the op's last fallible step, this lets
+ * compressed-node orders -- or, without FEATURE_FT_COMPRESS, FT_MAX_KEY_LEN
+ * more single-child nodes, since a branch is then one node per key byte, the
+ * one need a constant per bucket does not bound.  Drawn before the op's last fallible step, this lets
  * the commit draw and never fail on an arena allocation, so nothing after that
  * step needs a reader-observable rollback.  Used by the same-trie rekey (before
  * its detach) and by ft_graft_keylen's NOSPLIT attach (before it publishes the
@@ -21627,6 +21629,15 @@ int ft_bulk_node_reserve_fill(struct cds_ft *ft, struct cds_ft_alloc_reserve *r)
 				CDS_FT_ALLOC_KIND_COMPRESSED, order,
 				FT_NO_BITMAP, CDS_FT_ALLOC_RESERVE_CAP);
 	}
+#ifndef FEATURE_FT_COMPRESS
+	/*
+	 * No compressed node to fold a branch into: ft_build_branch spells it
+	 * as single-child ft_types[0] nodes, one per key byte.
+	 */
+	if (!ret)
+		ret = cds_ft_alloc_reserve_add_branch(ft, r, ft_types[0].order,
+			ft_types[0].bitmap, CDS_FT_ALLOC_RESERVE_BRANCH_CAP);
+#endif
 	return ret;
 }
 
