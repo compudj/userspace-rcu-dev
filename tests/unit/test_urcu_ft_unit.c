@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 354 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 356 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (405 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (407 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (354 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (356 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -34625,6 +34625,400 @@ static int test_rekey_merge_collide_absorbed_run(void)
 	return ret;
 }
 
+/*
+ * THE SHAPE CORPUS: generated key sets, one move each, checked exhaustively.
+ *
+ * The suites build the shapes their authors thought of.  A generated corpus of
+ * small key sets over a small alphabet reaches the ones nobody did: the
+ * colliding rekey_merge that lost both chain entries (test_rekey_merge_collide_
+ * absorbed_run) was found this way, at 4 in 80000 seeds, after every suite was
+ * green.  Each case: 2..MAXK distinct keys of 1..KLEN bytes over ALPHA letters,
+ * a src that is a prefix of one of them, a dst disjoint from src; expected
+ * names src||S -> dst||S, with a COLLISION (a moved key landing on a present
+ * one) expected as a chain of two.  Four (KLEN, ALPHA, MAXK) variants, because
+ * each found cases the others did not.
+ *
+ * Oracle per case: OK -> every expected name present with its multiplicity,
+ * no src-prefixed name left, entries conserved, verify clean; a refusal
+ * (NOT_SUPPORTED) -> every original key intact, verify clean; anything else
+ * fails.  Refusals are counted, not failed: a refusal is a coverage gap, not a
+ * defect.
+ *
+ * FT_UNIT_CORPUS_SEEDS overrides the per-(variant, mode) seed count; the
+ * default keeps the leg to seconds.  Deterministic: seeds 1..N.
+ */
+#define FT_CORPUS_SEEDS_DEFAULT	250
+#define FT_CORPUS_KMAX		16
+#define FT_CORPUS_LMAX		12
+
+struct ft_corpus_variant {
+	unsigned int klen, alpha, maxk;
+};
+
+static const struct ft_corpus_variant ft_corpus_variants[] = {
+	{ 6, 3, 8 }, { 10, 2, 8 }, { 8, 4, 12 }, { 12, 2, 16 },
+};
+
+struct ft_corpus_case {
+	unsigned int nk;
+	char keys[FT_CORPUS_KMAX][FT_CORPUS_LMAX + 1];
+	char want[FT_CORPUS_KMAX][2 * FT_CORPUS_LMAX + 1];
+	char src[FT_CORPUS_LMAX + 1], dst[FT_CORPUS_LMAX + 1];
+};
+
+static uint64_t ft_corpus_rs;
+
+static unsigned int ft_corpus_rnd(unsigned int m)
+{
+	ft_corpus_rs = ft_corpus_rs * 6364136223846793005ULL +
+		1442695040888963407ULL;
+	return (unsigned int) ((ft_corpus_rs >> 33) % m);
+}
+
+static void ft_corpus_str(char *b, unsigned int len, unsigned int alpha)
+{
+	unsigned int i;
+
+	for (i = 0; i < len; i++)
+		b[i] = (char) ('a' + ft_corpus_rnd(alpha));
+	b[len] = 0;
+}
+
+static int ft_corpus_is_prefix(const char *p, const char *s)
+{
+	size_t lp = strlen(p);
+
+	return strlen(s) >= lp && !memcmp(p, s, lp);
+}
+
+/* 0 when the seed yields no case (no disjoint dst, or nothing moves). */
+static int ft_corpus_gen(const struct ft_corpus_variant *v, unsigned long seed,
+		struct ft_corpus_case *c)
+{
+	unsigned int i, j, tries = 0, wk, len;
+	int moved = 0;
+
+	ft_corpus_rs = seed * 2654435761UL + 12345;
+	c->nk = 2 + ft_corpus_rnd(v->maxk - 1);
+	for (i = 0; i < c->nk; i++) {
+		int dup;
+
+		do {
+			ft_corpus_str(c->keys[i], 1 + ft_corpus_rnd(v->klen),
+				v->alpha);
+			dup = 0;
+			for (j = 0; j < i; j++)
+				if (!strcmp(c->keys[i], c->keys[j]))
+					dup = 1;
+		} while (dup);
+	}
+	wk = ft_corpus_rnd(c->nk);
+	len = 1 + ft_corpus_rnd((unsigned int) strlen(c->keys[wk]));
+	memcpy(c->src, c->keys[wk], len);
+	c->src[len] = 0;
+	do {
+		ft_corpus_str(c->dst, 1 + ft_corpus_rnd(v->klen), v->alpha);
+	} while ((ft_corpus_is_prefix(c->dst, c->src) ||
+			ft_corpus_is_prefix(c->src, c->dst)) && ++tries < 64);
+	if (ft_corpus_is_prefix(c->dst, c->src) ||
+			ft_corpus_is_prefix(c->src, c->dst))
+		return 0;
+	for (i = 0; i < c->nk; i++) {
+		if (ft_corpus_is_prefix(c->src, c->keys[i])) {
+			snprintf(c->want[i], sizeof(c->want[i]), "%s%s", c->dst,
+				c->keys[i] + strlen(c->src));
+			moved = 1;
+		} else {
+			snprintf(c->want[i], sizeof(c->want[i]), "%s",
+				c->keys[i]);
+		}
+	}
+	return moved;
+}
+
+static unsigned int ft_corpus_ndup(struct cds_ft *ft, const char *k)
+{
+	struct cds_ft_node *h = NULL;
+	unsigned int n = 0;
+
+	if (cds_ft_eager_lookup_key(ft, (const uint8_t *) k, strlen(k), 0,
+			&h) != CDS_FT_STATUS_OK)
+		return 0;
+	cds_ft_for_each_duplicate_rcu(h)
+		n++;
+	return n;
+}
+
+static void ft_corpus_insert(struct cds_ft *ft, const char *k)
+{
+	struct ft_test_node *n = node_alloc(0);
+
+	if (cds_ft_insert(ft, (const uint8_t *) k, strlen(k), &n->node) !=
+			CDS_FT_STATUS_OK)
+		abort();
+}
+
+/*
+ * The OK-side oracle, shared by both corpora: every expected name at its
+ * multiplicity in @ft, and no src-prefixed name left in @ft.  Caller holds the
+ * read side.
+ */
+static int ft_corpus_check_moved(struct cds_ft *ft,
+		const struct ft_corpus_case *c)
+{
+	unsigned int i, j, want_n;
+
+	for (i = 0; i < c->nk; i++) {
+		want_n = 0;
+		for (j = 0; j < c->nk; j++)
+			if (!strcmp(c->want[i], c->want[j]))
+				want_n++;
+		if (ft_corpus_ndup(ft, c->want[i]) != want_n)
+			return -1;
+		if (ft_corpus_is_prefix(c->src, c->keys[i]) &&
+				ft_corpus_ndup(ft, c->keys[i]))
+			return -1;
+	}
+	return 0;
+}
+
+static unsigned long ft_corpus_seeds(void)
+{
+	const char *e = getenv("FT_UNIT_CORPUS_SEEDS");
+
+	return e ? strtoul(e, NULL, 0) : FT_CORPUS_SEEDS_DEFAULT;
+}
+
+static void ft_corpus_diag_case(const char *what, const struct ft_corpus_case *c,
+		unsigned int vi, unsigned long seed, int list, int rank,
+		enum cds_ft_status s, const char *why)
+{
+	char buf[512];
+	size_t o = 0;
+	unsigned int i;
+
+	for (i = 0; i < c->nk && o < sizeof(buf) - 16; i++)
+		o += (size_t) snprintf(buf + o, sizeof(buf) - o, " %s",
+			c->keys[i]);
+	diag("%s: variant %u seed %lu list %d rank %d: dst=%s src=%s -> %s: %s;"
+		" keys:%s", what, vi, seed, list, rank, c->dst, c->src,
+		cds_ft_status_to_string(s), why, buf);
+}
+
+/*
+ * FT_UNIT_CORPUS_TRACE=1: name each case on stderr BEFORE it runs, flushed, so
+ * a case that hangs or runs away with memory is identified by the last line.
+ */
+static void ft_corpus_trace(const char *what, const struct ft_corpus_case *c,
+		unsigned int vi, unsigned long seed, int list, int rank)
+{
+	unsigned int i;
+
+	if (!getenv("FT_UNIT_CORPUS_TRACE"))
+		return;
+	fprintf(stderr, "CORPUS %s variant %u seed %lu list %d rank %d dst=%s src=%s keys:",
+		what, vi, seed, list, rank, c->dst, c->src);
+	for (i = 0; i < c->nk; i++)
+		fprintf(stderr, " %s", c->keys[i]);
+	fputc('\n', stderr);
+	fflush(stderr);
+}
+
+static struct cds_ft_group *ft_corpus_group(int list, int rank, int rekey)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *g;
+
+	if (cds_ft_group_attr_create(&attr) < 0 ||
+	    (rekey && cds_ft_group_attr_set_rekey(attr, true) < 0) ||
+	    cds_ft_group_attr_set_ordered_list(attr, list) < 0 ||
+	    cds_ft_group_attr_set_rank_stats(attr, rank) < 0 ||
+	    cds_ft_group_create(attr, &g) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	return g;
+}
+
+static int test_rekey_shape_corpus(void)
+{
+	unsigned long nseeds = ft_corpus_seeds(), seed;
+	unsigned long served = 0, refused = 0;
+	int mode, ret = 0;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_shape_corpus: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	for (mode = 0; mode < 4 && !ret; mode++) {
+		int list = mode & 1, rank = !!(mode & 2);
+		struct cds_ft_group *g = ft_corpus_group(list, rank, 1);
+		struct cds_ft *ft;
+		unsigned int vi;
+
+		if (cds_ft_create(g, NULL, &ft) < 0)
+			abort();
+		for (vi = 0; vi < CAA_ARRAY_SIZE(ft_corpus_variants) && !ret;
+				vi++) {
+			for (seed = 1; seed <= nseeds && !ret; seed++) {
+				struct ft_corpus_case c;
+				enum cds_ft_status s;
+				unsigned long before;
+				const char *why = NULL;
+				unsigned int i;
+
+				if (!ft_corpus_gen(&ft_corpus_variants[vi], seed,
+						&c))
+					continue;
+				ft_corpus_trace("rekey", &c, vi, seed, list, rank);
+				rcu_read_lock();
+				for (i = 0; i < c.nk; i++)
+					ft_corpus_insert(ft, c.keys[i]);
+				before = cds_ft_count_entries(ft);
+				rcu_read_unlock();
+				s = cds_ft_rekey_merge(ft,
+					(const uint8_t *) c.dst, strlen(c.dst),
+					(const uint8_t *) c.src, strlen(c.src));
+				rcu_read_lock();
+				if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+					why = "verify RED";
+				else if (cds_ft_count_entries(ft) != before)
+					why = "entries not conserved";
+				else if (s == CDS_FT_STATUS_OK) {
+					served++;
+					if (ft_corpus_check_moved(ft, &c))
+						why = "a moved or kept key is "
+							"wrong";
+				} else if (s == CDS_FT_STATUS_NOT_SUPPORTED) {
+					refused++;
+					for (i = 0; i < c.nk && !why; i++)
+						if (ft_corpus_ndup(ft,
+								c.keys[i]) != 1)
+							why = "a refusal MUTATED "
+								"the trie";
+				} else {
+					why = "unexpected status";
+				}
+				rcu_read_unlock();
+				if (why) {
+					ft_corpus_diag_case("rekey_shape_corpus",
+						&c, vi, seed, list, rank, s, why);
+					ret = -1;	/* leak: a red trie may not drain */
+					break;
+				}
+				if (drain_trie(ft) || cds_ft_count_entries(ft)) {
+					diag("rekey_shape_corpus: drain left keys");
+					ret = -1;
+					break;
+				}
+				rcu_quiescent_state();
+			}
+		}
+		if (!ret && drain_and_destroy(ft, g) < 0)
+			ret = -1;
+	}
+	diag("rekey_shape_corpus: %lu seeds x %zu variants x 4 modes: %lu served, "
+		"%lu refused", nseeds, CAA_ARRAY_SIZE(ft_corpus_variants), served,
+		refused);
+	return ret;
+}
+
+/*
+ * The same corpus CROSS-TRIE: cds_ft_merge_at moves the src-prefixed keys from
+ * an exclusive source into the destination at dst; cds_ft_merge unions a source
+ * already holding the renamed keys.  Collisions concatenate chains in both.
+ */
+static int test_merge_shape_corpus(void)
+{
+	unsigned long nseeds = ft_corpus_seeds(), seed;
+	int mode, ret = 0;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_shape_corpus: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	for (mode = 0; mode < 8 && !ret; mode++) {
+		int list = mode & 1, rank = !!(mode & 2), whole = !!(mode & 4);
+		struct cds_ft_group *g = ft_corpus_group(list, rank, 0);
+		struct cds_ft *dst, *src;
+		unsigned int vi;
+
+		if (cds_ft_create(g, NULL, &dst) < 0 ||
+				cds_ft_create(g, NULL, &src) < 0)
+			abort();
+		cds_ft_make_exclusive(src);
+		for (vi = 0; vi < CAA_ARRAY_SIZE(ft_corpus_variants) && !ret;
+				vi++) {
+			for (seed = 1; seed <= nseeds && !ret; seed++) {
+				struct ft_corpus_case c;
+				enum cds_ft_status s;
+				const char *why = NULL;
+				unsigned int i;
+
+				if (!ft_corpus_gen(&ft_corpus_variants[vi], seed,
+						&c))
+					continue;
+				ft_corpus_trace(whole ? "merge" : "merge_at", &c, vi,
+					seed, list, rank);
+				rcu_read_lock();
+				for (i = 0; i < c.nk; i++) {
+					int moves = ft_corpus_is_prefix(c.src,
+						c.keys[i]);
+
+					if (!moves)
+						ft_corpus_insert(dst, c.keys[i]);
+					else
+						ft_corpus_insert(src, whole ?
+							c.want[i] : c.keys[i]);
+				}
+				s = whole ? cds_ft_merge(dst, NULL, 0, src) :
+					cds_ft_merge_at(dst,
+						(const uint8_t *) c.dst,
+						strlen(c.dst), src,
+						(const uint8_t *) c.src,
+						strlen(c.src));
+				if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK
+						|| cds_ft_verify(src, stderr) !=
+							CDS_FT_STATUS_OK)
+					why = "verify RED";
+				else if (s != CDS_FT_STATUS_OK)
+					why = "not served";
+				else if (cds_ft_count_entries(src))
+					why = "source not emptied";
+				else if (ft_corpus_check_moved(dst, &c))
+					why = "a moved or kept key is wrong";
+				rcu_read_unlock();
+				if (why) {
+					ft_corpus_diag_case(whole ?
+						"merge_shape_corpus(whole)" :
+						"merge_shape_corpus(at)", &c, vi,
+						seed, list, rank, s, why);
+					ret = -1;	/* leak: see the rekey corpus */
+					break;
+				}
+				if (drain_trie(dst) || cds_ft_count_entries(dst)) {
+					diag("merge_shape_corpus: drain left keys");
+					ret = -1;
+					break;
+				}
+				rcu_quiescent_state();
+			}
+		}
+		if (!ret) {
+			/* @src first: drain_and_destroy takes the group down. */
+			if (drain_trie(src) < 0)
+				ret = -1;
+			cds_ft_destroy(src);
+			if (drain_and_destroy(dst, g) < 0)
+				ret = -1;
+		}
+	}
+	diag("merge_shape_corpus: %lu seeds x %zu variants x 8 modes", nseeds,
+		CAA_ARRAY_SIZE(ft_corpus_variants));
+	return ret;
+}
+
 static int test_walk_past_empty_internal(void)
 {
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -41042,6 +41436,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_overlong_bulk_fuse);
 	RUN_TEST(test_moved_keys_overflow_exact);
 	RUN_TEST(test_rekey_merge_collide_absorbed_run);
+	RUN_TEST(test_rekey_shape_corpus);
+	RUN_TEST(test_merge_shape_corpus);
 	RUN_TEST(test_walk_past_deep_empty_internal);
 	RUN_TEST(test_verify_disjoint_cross_trie);
 
