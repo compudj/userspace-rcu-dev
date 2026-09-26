@@ -263,12 +263,27 @@ void static_array_size_check(void)
  * soon as either tier could.  With both tiers compiled out (the default) every
  * predicate answers no and every caller recompacts.
  */
+/*
+ * THE SAME-TRIE REKEY RUNS WITHOUT THE IN-PLACE TIERS, on the thread running it
+ * (ft_rekey_dispatch holds this non-zero).  Its folds are built on the premise
+ * that every edit is a RECORD in the descriptor or a build-invisible copy, and
+ * its gates refuse a shape outright wherever an in-place tier could edit a node
+ * where it stands (ft_in_place_excl_ok, an exclusive trie's bulk tier) -- so
+ * with a tier compiled in, an EXCLUSIVE trie's rekey refused moves the same
+ * build without the tier serves (measured: test_rekey_exclusive_drain_after_
+ * loss on nocompress, either tier).  A bulk op already pays grace periods;
+ * the in-place stores buy it nothing.  Thread-local because an exclusive trie
+ * has one writer and a shared one never reaches the exclusive tier, so no
+ * other op can observe the difference.
+ */
+static __thread unsigned int ft_tls_in_place_off;
+
 static inline
 bool ft_in_place_insert_ok(const struct cds_ft *ft)
 {
 	(void) ft;
 #ifdef FEATURE_FT_INSERT_IN_PLACE
-	return true;
+	return !ft_tls_in_place_off;
 #else
 	return false;
 #endif
@@ -279,7 +294,7 @@ bool ft_in_place_delete_ok(const struct cds_ft *ft)
 {
 	(void) ft;
 #ifdef FEATURE_FT_DELETE_IN_PLACE
-	return true;
+	return !ft_tls_in_place_off;
 #else
 	return false;
 #endif
