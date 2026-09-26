@@ -5550,6 +5550,39 @@ int ft_detach_node(struct cds_ft *ft,
 					ret = -EAGAIN;
 					goto end;
 				}
+#if defined(FEATURE_FT_SKIP_COMPRESSED) && !defined(FT_DEBUG_INPLACE_DELETE_RESIDUE)
+				/*
+				 * THE IN-PLACE TWIN OF THE RECOMPACTION RE-PLAN below.
+				 * This hoist only runs for a pure delete, and an
+				 * in-place delete drops the boundary's child count at
+				 * its commit with no copy for that check to inspect.
+				 * The shape-D test above is a PLAN read: a peer that
+				 * removed the boundary's prefix key (or a third child)
+				 * since leaves, under the lock we now hold, a keyless
+				 * 2-child node this delete turns into the 1-child
+				 * keyless internal skip mode refuses.  Measured on the
+				 * in-place build's owned-key row: 5 of 96 runs left
+				 * one at root-only and exponential spacing, 0 of 96
+				 * with this re-plan.  Nothing is
+				 * recorded yet and the lock rides @commit_txn: re-plan;
+				 * the next plan reads the node keyless and collapses
+				 * it.  Only where this plan did NOT choose the
+				 * collapse, as below, so an out-of-bound shape-D
+				 * cannot send it round forever.
+				 */
+				if (!shape_d_plan &&
+				    ft_group_skip_compressed(ft->group)) {
+					struct cds_ft_metadata *bm =
+						metadata_stack[nr_branch - 1];
+
+					if (ft_meta_nr_child_load(bm) == 2 &&
+					    !bm->external_nodes &&
+					    ft_parent_node(bm->parent_word) != NULL) {
+						ret = -EAGAIN;
+						goto end;
+					}
+				}
+#endif
 				FT_INTERLEAVE(FT_IL_LEAF_HOIST_POST);
 			}
 			ret = ft_node_replace_ptr(ft,
