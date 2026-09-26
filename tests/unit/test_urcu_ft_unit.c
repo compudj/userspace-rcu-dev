@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 339 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 340 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (402 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (403 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (351 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (352 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -34219,6 +34219,131 @@ static int test_overlong_collapse(void)
 	return ret;
 }
 
+/*
+ * The BULK fuses cap a fused run at what one compressed node can spell, not at
+ * a skip pointer's run: cds_ft_graft's cluster build (a single-child node's
+ * canonicalization, a chain's fuse into its compressed child) and
+ * cds_ft_graft_swap's fuse of the swapped-in run into the one above it.
+ * Capped at FT_SKIP_LEN_MAX they left one-child internals and adjacent
+ * compresseds whenever a fused run passed 127 bytes.  Random tries of keys of
+ * up to 250 bytes over a two-letter alphabet, some sharing a long prefix, one
+ * bulk op per seed; every trie the op touches must verify.  With the old cap
+ * (-DFT_DEBUG_OVERLONG_BULK_CAP) this fails graft on 10 and graft_swap on 27
+ * of their 200 seeds; merge and detach end in the remove path's collapse and
+ * are covered here as well.
+ */
+static uint64_t ovb_rs;
+
+static uint64_t ovb_rnd(void)
+{
+	ovb_rs ^= ovb_rs << 13;
+	ovb_rs ^= ovb_rs >> 7;
+	ovb_rs ^= ovb_rs << 17;
+	return ovb_rs;
+}
+
+static void ovb_fill(struct cds_ft *ft, const uint8_t *pfx, unsigned int plen,
+		int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		uint8_t k[FT_TEST_OVL_MAX];
+		unsigned int base = (ovb_rnd() & 1) ? plen :
+			(unsigned int) (ovb_rnd() % (plen + 1));
+		unsigned int len = base + 1 +
+			(unsigned int) (ovb_rnd() % (250 - base));
+		struct ft_test_node *node = node_alloc(i);
+		unsigned int j;
+
+		memcpy(k, pfx, base);
+		for (j = base; j < len; j++)
+			k[j] = (uint8_t) ('a' + (ovb_rnd() & 1));
+		rcu_read_lock();
+		if (cds_ft_insert(ft, k, len, &node->node) != CDS_FT_STATUS_OK)
+			node_free(node);	/* a duplicate key: never published */
+		rcu_read_unlock();
+	}
+}
+
+static int ovb_verify(struct cds_ft *ft)
+{
+	int bad;
+
+	rcu_read_lock();
+	bad = cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK;
+	rcu_read_unlock();
+	return bad;
+}
+
+static int test_overlong_bulk_fuse(void)
+{
+	static const char *const opn[] = { "merge_root", "merge_at_key",
+		"graft", "graft_swap", "detach" };
+	unsigned long seed, fails[5] = { 0 };
+	int ret = 0, op;
+
+	for (seed = 1; seed <= 1000; seed++) {
+		uint8_t pfx[FT_TEST_OVL_MAX], key[FT_TEST_OVL_MAX];
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group), *src, *res = NULL;
+		unsigned int plen, klen, j;
+
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		ovb_rs = seed * 0x9e3779b97f4a7c15ULL | 1;
+		plen = (unsigned int) (ovb_rnd() % 160);
+		for (j = 0; j < plen; j++)
+			pfx[j] = (uint8_t) ('a' + (ovb_rnd() & 1));
+		ovb_fill(dst, pfx, plen, 1 + (int) (ovb_rnd() % 6));
+		ovb_fill(src, pfx, plen, 1 + (int) (ovb_rnd() % 6));
+		op = (int) (seed % 5);
+		klen = plen ? (unsigned int) (ovb_rnd() % plen) : 0;
+		memcpy(key, pfx, klen);
+		rcu_read_lock();
+		cds_ft_make_exclusive(src);
+		switch (op) {
+		case 0: (void) cds_ft_merge(dst, NULL, 0, src); break;
+		case 1: (void) cds_ft_merge(dst, key, klen, src); break;
+		case 2:
+			key[klen] = 'z';
+			(void) cds_ft_graft(dst, key, klen + 1, src);
+			break;
+		case 3: (void) cds_ft_graft_swap(dst, key, klen, src); break;
+		default: (void) cds_ft_detach(dst, key, klen, &res); break;
+		}
+		rcu_read_unlock();
+		if (ovb_verify(dst) || ovb_verify(src) ||
+				(res && ovb_verify(res))) {
+			if (!fails[op]++)
+				diag("overlong_bulk_fuse: %s leaves a trie cds_ft_verify refuses (seed %lu)",
+					opn[op], seed);
+			ret = -1;
+			/*
+			 * LEAK the refused tries: draining one is a remove_all
+			 * over the illegal shape, which spins (measured with the
+			 * old cap: the test never returned).  A failed run must
+			 * report, not hang.
+			 */
+			continue;
+		}
+		if (drain_trie(dst) || drain_trie(src) ||
+				(res && drain_trie(res)))
+			ret = -1;
+		if (res)
+			cds_ft_destroy(res);
+		cds_ft_destroy(src);
+		cds_ft_destroy(dst);
+		rcu_barrier();	/* node_free_rcu callbacks before the group goes */
+		cds_ft_group_destroy(group);
+	}
+	for (op = 0; op < 5; op++)
+		if (fails[op])
+			diag("overlong_bulk_fuse: %s failed %lu of 200 seeds",
+				opn[op], fails[op]);
+	return ret;
+}
+
 static int test_walk_past_empty_internal(void)
 {
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -40633,6 +40758,7 @@ int main(int argc, char **argv)
 
 	RUN_TEST(test_walk_past_empty_internal);
 	RUN_TEST(test_overlong_collapse);
+	RUN_TEST(test_overlong_bulk_fuse);
 	RUN_TEST(test_walk_past_deep_empty_internal);
 	RUN_TEST(test_verify_disjoint_cross_trie);
 
