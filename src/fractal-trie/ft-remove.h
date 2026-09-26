@@ -4112,7 +4112,26 @@ int ft_detach_node(struct cds_ft *ft,
 					 * op's descent already ENTERED the node the walk
 					 * starts under; a cursor still ON it would leave
 					 * its levels uncrossed (skeptic, 2026-09-17).
+					 *
+					 * ☠ THAT IS A PLAN, NOT AN INVARIANT.  @walk_depth
+					 * comes from the climb (key_len minus the spans it
+					 * reads LIVE), the anchors from the descent, and a
+					 * peer split or merge between the two lets the climb
+					 * date the walk deeper than the descent ever went.
+					 * ft_anchor_meta then answers from the wrong path:
+					 * the assert fired under rcu-debug, and a release
+					 * build anchored a garbage item and faulted in
+					 * ft_lock_set_order_by_anchor (two-writer owned-key
+					 * harness, exponential spacing).  Re-descend, as the
+					 * acquire's own refusal below does.
 					 */
+#ifndef FT_DEBUG_ORPHAN_WALK_UNDATED
+					if (caa_unlikely(wd_valid &&
+							fwd.depth < walk_depth)) {
+						ret = -EAGAIN;
+						goto end;
+					}
+#endif
 					assert(!wd_valid || fwd.depth >= walk_depth);
 					if (ft_detach_orphan_acquire(ft, &flctx,
 								walk_nf, walk_depth,
@@ -4303,6 +4322,14 @@ int ft_detach_node(struct cds_ft *ft,
 						(unsigned int) nr_orphan_locked;
 					flctx.held.txn = lctx.held.txn;
 					flctx.held.nr_extra = lctx.held.nr_extra;
+#ifndef FT_DEBUG_ORPHAN_WALK_UNDATED
+					/* A walk the descent never dated: see above. */
+					if (caa_unlikely(wd_valid &&
+							fwd.depth < walk_depth)) {
+						ret = -EAGAIN;
+						goto end;
+					}
+#endif
 					assert(!wd_valid || fwd.depth >= walk_depth);
 					if (ft_detach_orphan_acquire(ft, &flctx,
 							ft_compressed_node_flag(
