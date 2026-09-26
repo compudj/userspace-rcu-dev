@@ -4893,6 +4893,37 @@ int ft_detach_node(struct cds_ft *ft,
 					goto end;
 				}
 #endif
+#ifndef FT_DEBUG_NO_ARRIVAL_EXTERNAL
+				/*
+				 * ☠ AND AN EXTERNAL ARRIVAL IS NOT EXEMPT: it has to
+				 * be the target too.  The exemption above assumed a
+				 * walk that reaches an external has reached THE chain
+				 * head, because every link it took was a single
+				 * child.  The in-place delete tier breaks that: a
+				 * peer's in-place delete leaves a link LIVE with one
+				 * child fewer, so a link this climb counted as
+				 * "single child = our path" is single again with a
+				 * DIFFERENT child -- a sibling key's -- and phase 1,
+				 * taking the first child under the lock, walks into
+				 * it.  MEASURED (delete tier, skip-compress off,
+				 * inv_concurrent_remove_all_nolist, LTTng): lane A
+				 * deleted key 62 in place from a two-child holder;
+				 * lane B, planned with key 62 there, climbed through
+				 * the holder, walked to key 63's head, retired it
+				 * (LOST) and handed key 62's chain back a second time
+				 * (DOUBLE-OWNED).  With skip-compression on, the
+				 * in-place delete that would leave such a holder is
+				 * re-planned instead (the shape-D hoist below), which
+				 * is why only a skip-off build saw it.  Identity by
+				 * address: a parked proxy retries too.
+				 */
+				if (walk_nf && ft_node_external(walk_nf) &&
+						ft_node_ptr_raw(walk_nf) !=
+						ft_node_ptr_raw(entry_target)) {
+					ret = -EAGAIN;
+					goto end;
+				}
+#endif
 
 				while (walk_nf &&
 				       !ft_node_external(walk_nf) &&
