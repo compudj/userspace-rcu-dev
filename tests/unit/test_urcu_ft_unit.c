@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 341 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 354 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (404 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (405 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (353 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (354 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -34490,6 +34490,138 @@ static int test_moved_keys_overflow_exact(void)
 	return ret;
 }
 
+/*
+ * A COLLIDING rekey_merge whose src junction COLLAPSES INTO THE DST RUN.  The
+ * moved key lands on a key already at dst, so ft_merge_build_run builds a fresh
+ * run whose child is the dst's LIVE head (chain appended), and queues that head's
+ * back edge in the glue, aimed at the run.  The src junction is left with one
+ * child -- the dst slot -- so the detach fold absorbs the fresh run into the
+ * merged run and frees it.  The queued edge must follow the head to the merged
+ * run: left aimed at the freed one, the head's parent word decoded a length off
+ * freed memory (verify "skip-encoded slot slen N != cn->len N-1") and the key --
+ * both chain entries -- vanished from lookup, OK returned.  Found by the rekey
+ * shape fuzzer, 4 in 80000 seeds, every list/rank mode, default build.
+ * test_rekey_merge_collide_dst never collapses its junction, so it never saw it.
+ */
+struct rmc_case {
+	const char *keys[9];
+	const char *dst, *src;
+	const char *collided;	/* dst || (moved key minus src) */
+};
+
+static const struct rmc_case rmc_cases[] = {
+	{ { "cacb", "baca", "ccb", NULL }, "cc", "cac", "ccb" },
+	{ { "bbabab", "babaaa", "bbbbab", NULL }, "bba", "bbb", "bbabab" },
+	{ { "aabbab", "a", "aabaaab", "abaab", "abbabab", NULL },
+		"aba", "abbab", "abaab" },
+	{ { "c", "abbbca", "caa", "caccc", "baa", "aacaab", "abbca", "bcca",
+		NULL }, "ba", "bcc", "baa" },
+};
+
+static int rmc_run(const struct rmc_case *c, bool list, bool rank)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_node *head = NULL;
+	unsigned long before, after, n = 0;
+	size_t sl = strlen(c->src);
+	enum cds_ft_status s;
+	int i, rc = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0 ||
+	    cds_ft_group_attr_set_rekey(attr, true) < 0 ||
+	    cds_ft_group_attr_set_ordered_list(attr, list) < 0 ||
+	    cds_ft_group_attr_set_rank_stats(attr, rank) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	rcu_read_lock();
+	for (i = 0; c->keys[i]; i++) {
+		struct ft_test_node *tn = node_alloc(0);
+
+		if (cds_ft_insert(ft, (const uint8_t *) c->keys[i],
+				strlen(c->keys[i]), &tn->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	before = cds_ft_count_entries(ft);
+	s = cds_ft_rekey_merge(ft, (const uint8_t *) c->dst, strlen(c->dst),
+		(const uint8_t *) c->src, sl);
+	if (s != CDS_FT_STATUS_OK) {
+		diag("rekey_merge_collide_absorbed: dst %s src %s list %d rank %d: %s",
+			c->dst, c->src, list, rank, cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		diag("rekey_merge_collide_absorbed: dst %s src %s list %d rank %d: "
+			"verify RED", c->dst, c->src, list, rank);
+		goto out;
+	}
+	after = cds_ft_count_entries(ft);
+	if (after != before) {
+		diag("rekey_merge_collide_absorbed: dst %s src %s list %d rank %d: "
+			"%lu entries, expected %lu", c->dst, c->src, list, rank,
+			after, before);
+		goto out;
+	}
+	/* Every key at its (possibly new) name; the collided one twice. */
+	for (i = 0; c->keys[i]; i++) {
+		char name[32];
+		const char *k = c->keys[i];
+
+		if (!strncmp(k, c->src, sl))
+			snprintf(name, sizeof(name), "%s%s", c->dst, k + sl);
+		else
+			snprintf(name, sizeof(name), "%s", k);
+		head = NULL;
+		if (cds_ft_eager_lookup_key(ft, (const uint8_t *) name,
+				strlen(name), 0, &head) != CDS_FT_STATUS_OK) {
+			diag("rekey_merge_collide_absorbed: dst %s src %s list %d "
+				"rank %d: %s absent", c->dst, c->src, list, rank,
+				name);
+			goto out;
+		}
+	}
+	head = NULL;
+	if (cds_ft_eager_lookup_key(ft, (const uint8_t *) c->collided,
+			strlen(c->collided), 0, &head) != CDS_FT_STATUS_OK)
+		goto out;
+	cds_ft_for_each_duplicate_rcu(head)
+		n++;
+	if (n != 2) {
+		diag("rekey_merge_collide_absorbed: dst %s src %s list %d rank %d: "
+			"%s has %lu entries, expected a chain of 2", c->dst, c->src,
+			list, rank, c->collided, n);
+		goto out;
+	}
+	rc = 0;
+out:
+	rcu_read_unlock();
+	/* A RED trie may not drain: leak it rather than spin in the drain. */
+	if (!rc && drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
+static int test_rekey_merge_collide_absorbed_run(void)
+{
+	unsigned int ci, mode;
+	int ret = 0;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_merge_collide_absorbed_run: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	for (ci = 0; ci < sizeof(rmc_cases) / sizeof(rmc_cases[0]); ci++)
+		for (mode = 0; mode < 4; mode++)
+			if (rmc_run(&rmc_cases[ci], mode & 1, mode & 2))
+				ret = -1;
+	return ret;
+}
+
 static int test_walk_past_empty_internal(void)
 {
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -40906,6 +41038,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_overlong_collapse);
 	RUN_TEST(test_overlong_bulk_fuse);
 	RUN_TEST(test_moved_keys_overflow_exact);
+	RUN_TEST(test_rekey_merge_collide_absorbed_run);
 	RUN_TEST(test_walk_past_deep_empty_internal);
 	RUN_TEST(test_verify_disjoint_cross_trie);
 
