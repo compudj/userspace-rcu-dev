@@ -260,8 +260,9 @@ void static_array_size_check(void)
  * ft_in_place_ok / ft_in_place_excl_ok answer "EITHER tier": they are for the
  * sites that refuse or re-route a shape because an in-place tier would edit a
  * node where it stands (the same-trie rekey's gates), which must refuse as
- * soon as either tier could.  With both tiers compiled out (the default) every
- * predicate answers no and every caller recompacts.
+ * soon as either tier could.  With both tiers compiled out
+ * (-DNO_FEATURE_FT_{INSERT,DELETE}_IN_PLACE) every predicate answers no and
+ * every caller recompacts.
  */
 /*
  * THE SAME-TRIE REKEY RUNS WITHOUT THE IN-PLACE TIERS, on the thread running it

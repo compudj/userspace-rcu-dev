@@ -42,15 +42,12 @@
  *   FEATURE_INLINE_LOOKUP       Force-inline the lookup hot path (no call
  *                               boundaries on descent).
  *                               Disable with -DNO_FEATURE_INLINE_LOOKUP.
- *
- * Functional features (OPT-IN):
- *
  *   FEATURE_FT_INSERT_IN_PLACE  Point inserts append into the live node under
  *                               the held lock instead of recompacting it.
- *                               Enable with -DFEATURE_FT_INSERT_IN_PLACE.
+ *                               Disable with -DNO_FEATURE_FT_INSERT_IN_PLACE.
  *   FEATURE_FT_DELETE_IN_PLACE  Point deletes soft-delete from the live node
  *                               under the held lock instead of recompacting.
- *                               Enable with -DFEATURE_FT_DELETE_IN_PLACE.
+ *                               Disable with -DNO_FEATURE_FT_DELETE_IN_PLACE.
  *
  * (The library-owned ordered-cell index is always compiled in; it is
  * gated per group at runtime via cds_ft_group_attr_set_ordered_list,
@@ -584,9 +581,11 @@ unsigned int ft_lock_level_index(unsigned int depth)
 /*
  * FEATURE_FT_INSERT_IN_PLACE: in-place occupancy-bitmap safe-append (the O(1)
  * insert tier).  FEATURE_FT_DELETE_IN_PLACE: in-place soft-delete (the delete
- * tier).  Both OPT-IN and independent (split 2026-09-26 -- the one macro used
- * to enable both -- so root-cause work can switch either tier alone); without
- * them the build recompacts on insert and on delete.
+ * tier).  BOTH ON BY DEFAULT since 2026-09-26, and independent (split the same
+ * day -- the one macro used to enable both -- so root-cause work can switch
+ * either tier alone): -DNO_FEATURE_FT_INSERT_IN_PLACE /
+ * -DNO_FEATURE_FT_DELETE_IN_PLACE turn one back into recompact-on-insert /
+ * recompact-on-delete.
  *
  * With the insert tier, a POINT insert that lands at a node's tail rank with
  * spare tier capacity is applied IN PLACE: the child slot is published and the
@@ -633,10 +632,23 @@ unsigned int ft_lock_level_index(unsigned int depth)
  * keep pigeon's O(1) insert/delete.  See doc/design/mcas-multiwriter-
  * readiness.md S4.
  *
- * Default: recompact-on-insert and -on-delete.  Opt into the tiers with
- * -DFEATURE_FT_INSERT_IN_PLACE and -DFEATURE_FT_DELETE_IN_PLACE (the gate's
- * `in-place` config sets both).
+ * Default: both tiers on.  Lock-before-write is what makes them safe against
+ * concurrent writers, and the sticky bitmap bit against readers (above).  The
+ * gate keeps the recompact paths covered with its no-in-place,
+ * no-in-place-insert and no-in-place-delete configs.
  */
+#if defined(NO_FEATURE_FT_INSERT_IN_PLACE) && defined(FEATURE_FT_INSERT_IN_PLACE)
+# error "FEATURE_FT_INSERT_IN_PLACE and NO_FEATURE_FT_INSERT_IN_PLACE both defined"
+#endif
+#if defined(NO_FEATURE_FT_DELETE_IN_PLACE) && defined(FEATURE_FT_DELETE_IN_PLACE)
+# error "FEATURE_FT_DELETE_IN_PLACE and NO_FEATURE_FT_DELETE_IN_PLACE both defined"
+#endif
+#if !defined(NO_FEATURE_FT_INSERT_IN_PLACE) && !defined(FEATURE_FT_INSERT_IN_PLACE)
+# define FEATURE_FT_INSERT_IN_PLACE
+#endif
+#if !defined(NO_FEATURE_FT_DELETE_IN_PLACE) && !defined(FEATURE_FT_DELETE_IN_PLACE)
+# define FEATURE_FT_DELETE_IN_PLACE
+#endif
 
 /*
  * Skip-compressed pointers encode the compressed path length in the

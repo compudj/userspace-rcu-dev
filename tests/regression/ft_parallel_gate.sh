@@ -6,7 +6,7 @@
 #
 # Why a separate tree per config:
 #   The feature flags (verify-at-mutation, skip-compress off, compress
-#   off, fault-inject + tombstone-audit, insert-in-place) are compile
+#   off, fault-inject + tombstone-audit, in-place off) are compile
 #   time -D defines.  A single in-tree build can only hold one set at a
 #   time (and an out-of-tree build is refused while the source is
 #   configured), so a sequential "clean; rebuild; test" per config
@@ -24,7 +24,7 @@
 #   tests/regression/ft_parallel_gate.sh [config ...]
 #     no args   -- run the full matrix
 #     config... -- run only the named configs (default fault-audit vam
-#                  noskip nocompress in-place)
+#                  noskip nocompress no-in-place)
 #
 # Env:
 #   FT_GATE_DIR  per-config tree copies live here   (default:
@@ -322,23 +322,17 @@ ALL_CONFIGS=(
 	# the check a green run cannot absorb.
 	"rekeyoptin|-DFT_DEBUG_REKEY_OPTIN_STRICT|u ion ioff imw"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
-	# Concurrent legs are SAFE here since the in-place tier became runtime
-	# gated on ft->exclusive: on a shared trie every one of these builds
-	# takes the recompact path, so this config now checks that the opt-in
-	# flag changes nothing a concurrent trie can observe.  Before that gate
-	# it failed 303 of 480 saturated runs of inv_sibling_split_compress
-	# ("ft_attach_node: Assertion `slot_ptr'"), because the flag alone
-	# decided and an in-place store on a LIVE node races a peer's rebuild.
-	#
-	# What these legs do NOT cover is the in-place path itself: with the
-	# gate, ft_unit takes it 2255 times against 204M refusals, because most
-	# tries in the suite are not exclusive.  Exercising the fast path
-	# meaningfully needs exclusive-trie mutation coverage, which is its own
-	# piece of work.
-	#
-	# The two in-place tiers are separate switches since 2026-09-26 (the
-	# one macro used to enable both); this config keeps enabling both.
-	"in-place|-DFEATURE_FT_INSERT_IN_PLACE -DFEATURE_FT_DELETE_IN_PLACE|u ion ioff"
+	# In-place point insert AND delete are the DEFAULT since 2026-09-26, so
+	# every other config runs both tiers.  These three keep the recompact
+	# paths covered -- the pre-flip default, and still what the bulk ops fall
+	# back to on a shared trie -- in every mode the old default ran, MW
+	# included.  The two tiers are independent switches, so each mix a build
+	# can select has its own config: delete-on / insert-off is supported by
+	# design (a hole refill is an insert-tier store; with that tier off the
+	# refill recompacts and drops the hole) and is otherwise never run.
+	"no-in-place|-DNO_FEATURE_FT_INSERT_IN_PLACE -DNO_FEATURE_FT_DELETE_IN_PLACE|u ion ioff imw"
+	"no-in-place-insert|-DNO_FEATURE_FT_INSERT_IN_PLACE|u ion ioff imw"
+	"no-in-place-delete|-DNO_FEATURE_FT_DELETE_IN_PLACE|u ion ioff imw"
 	# The byte-key-only build (~25 KiB less .text): compiles out the
 	# non-identity key-map lookup specializations, after which
 	# cds_ft_group_attr_set_key_map returns NOT_SUPPORTED.  It had no gate

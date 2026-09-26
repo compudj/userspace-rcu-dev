@@ -17018,8 +17018,8 @@ static int test_rekey_known_nonterminating(void)
 	/*
 	 * THE THIRD TRIGGER, and the only one on an ordinary shape: an
 	 * EXCLUSIVE trie hangs on a CROSS-parent move (src under 'a', dst under
-	 * 'b') on the DEFAULT build -- FEATURE_FT_INSERT_IN_PLACE is not
-	 * involved and is compiled out here.  Measured: the same-parent move
+	 * 'b') on the then-DEFAULT build -- FEATURE_FT_INSERT_IN_PLACE is not
+	 * involved (it was compiled out there).  Measured: the same-parent move
 	 * completes, an occupied dst is refused, and only cross-parent + empty
 	 * dst spins.  Pre-existing at the pushed base.  cds_ft_make_exclusive
 	 * is a documented public entry point, and this is the third defect
@@ -18280,7 +18280,7 @@ static int test_graft_inplace_exclusive(void)
 
 	if (!_cds_ft_debug_in_place_enabled()) {
 		diag("test_graft_inplace_exclusive: skipped, in-place tier not "
-			"compiled in (needs -DFEATURE_FT_INSERT_IN_PLACE)");
+			"compiled out (-DNO_FEATURE_FT_INSERT_IN_PLACE)");
 		return 0;
 	}
 	/* NULL group attr == VARIABLE key length, which cds_ft_graft requires. */

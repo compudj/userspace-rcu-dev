@@ -483,12 +483,16 @@ see the commit message for the leg table.
   `FEATURE_FT_DELETE_IN_PLACE` (delete); each edit site asks its own tier
   (`ft_in_place_insert_ok` / `ft_in_place_delete_ok` and their `_excl_`
   forms), and the same-trie rekey's refusal gates keep `ft_in_place_excl_ok`,
-  which answers "either tier".  Turning them on by default is blocked on
-  three defects the default-on gate found (2026-09-26): a DOUBLE-OWNED node
-  under concurrent remove_all with skip-compression off (delete tier), a lock
-  released by a non-owner in the prefix-shape zoo at exponential spacing
-  (insert tier), and an exclusive-trie rekey refused under either tier with
-  compression off.
+  which answers "either tier".  ☑ ON BY DEFAULT since 2026-09-26
+  (-DNO_FEATURE_FT_{INSERT,DELETE}_IN_PLACE opt out; the gate's no-in-place,
+  no-in-place-insert and no-in-place-delete configs keep the recompact paths
+  covered), after fixing the three defects the first default-on gate found:
+  a sibling key LOST and a chain DOUBLE-OWNED under concurrent remove_all with
+  skip-compression off (delete tier: the orphan walk now must arrive at its
+  own target), a peer's lock bit erased by an SW count park at exponential
+  spacing (insert tier: SW needs the exact state word), and an exclusive-trie
+  rekey refused under either tier (the same-trie rekey now runs with both
+  tiers off).
 
 ### 6.6 Operational: the stall that was not a livelock
 
