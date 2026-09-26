@@ -22371,6 +22371,18 @@ struct ft_glue {
 		bool live;
 	} old_dir_replace;
 	/*
+	 * THE SAME-TRIE MOVER'S SOURCE KEY, NULL for every other caller.  A split
+	 * of a run the source key CROSSES builds a fresh old-direction node above
+	 * a live child whose count the source detach lowers -- but the detach's
+	 * walk climbs the pre-op chain and is redirected onto the published top
+	 * (@pending_pub_slot), never through that fresh node, so the builder
+	 * must give it the post-move count itself (ft_split_compressed_graft_
+	 * build).  Only the one-decide rekey fold sets it: elsewhere the source
+	 * is another trie, or already detached when the build reads its counts.
+	 */
+	const uint8_t *src_key;
+	size_t src_len;
+	/*
 	 * ☠ WHAT THIS BUILD REPLACED, so a LATER step of the same op can see it.
 	 *
 	 * A split RETIRES @cn and re-homes @cn's one live child under the fresh
@@ -22604,6 +22616,8 @@ static
 void ft_glue_init(struct ft_glue *g)
 {
 	g->op = NULL;			/* the op sets it beside g->txn */
+	g->src_key = NULL;		/* the rekey fold sets it: see @src_key */
+	g->src_len = 0;
 	g->deferred = g->deferred_floor;
 	g->nr_deferred = 0;
 	g->cap_deferred = FT_GLUE_FLOOR_DEFERRED;

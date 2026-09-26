@@ -4270,6 +4270,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	glue.op = optxn;
 	glue.txn = txn;
 	glue.record_only = true;
+	glue.src_key = src_key;		/* see @src_key: the split's old direction */
+	glue.src_len = src_len;
 	/*
 	 * ☠ FUSE THE RETIRES INTO THAT ONE COMMIT, EVERY ARM.  @record_only says
 	 * this glue does not commit: the CALLER's single commit is still ahead of

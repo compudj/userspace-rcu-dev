@@ -224,6 +224,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	struct cds_ft_inode_flag **slot;
 	struct cds_ft_inode *old_branch = NULL;
 	unsigned long old_child_nr_keys;
+	unsigned long old_sfx_nr_keys = 0;	/* the fresh suffix's: see below */
+	bool src_under = false;		/* below the split (old_dir_built jumps past its set) */
 	int ret;
 	/*
 	 * THE ONE @cn->child LOAD, SETTLED.  This build derives its whole plan
@@ -525,6 +527,41 @@ no_old_dir_replace:
 	} else {
 		old_child_nr_keys = 0;
 	}
+	/*
+	 * THE FRESH NODES BELOW THE TOP, when the source lives BELOW the split.
+	 * @old_child_nr_keys is @cn_child's PRE-move total.  The source detach's
+	 * -@src_count walk climbs the pre-op chain, reaches @cn's slot and is
+	 * redirected onto the published TOP (@pending_pub_slot), which it
+	 * charges -- and ONLY the top.  So the top is built pre-move (the walk
+	 * settles it), while every fresh node strictly below it on the old
+	 * direction's path is on neither chain and must be born post-move: the
+	 * suffix run (@old_child_nr_keys - @src_count) and, when a prefix sits
+	 * above it (@diverge_pos > 0), the junction itself (@old_child_nr_keys).
+	 * MEASURED, rank stats on, every build, pre-existing (the rekey shape
+	 * corpus): {aaaaa, baababbbabba, a, baabbbbbaaab, aaba, abbbbaaaaba,
+	 * abbaabab, baaaaabbbbb, aaabbbba} + rekey_merge(dst "bbaaa", src
+	 * "baabb") -> `depth 2: compressed node nr_keys mismatch: stored 3,
+	 * computed 2` (the suffix); {aabbbbbbb, a, bbabbaaab, bbaaabbaba, abba,
+	 * bbabab, aabbb} + rekey_merge(dst "bbb", src "bbabb") -> `depth 2:
+	 * internal node ... stored 4, computed 3` (the junction under a prefix).
+	 * The substituted-child arms above already read a post-move count, hence
+	 * !@old_dir_replace.done.
+	 */
+	{
+		size_t cn_end = (size_t) d->depth + cn->len;
+
+		src_under = glue->src_key && !glue->old_dir_replace.done &&
+			glue->src_len >= cn_end &&
+			!memcmp(glue->src_key, key, d->depth) &&
+			!memcmp(glue->src_key + d->depth, cn->key_bytes,
+				cn->len) &&
+			old_child_nr_keys >= src_count;
+#ifdef FT_DEBUG_SPLIT_PRECOUNT
+		src_under = false;
+#endif
+		old_sfx_nr_keys = old_child_nr_keys -
+			(src_under ? src_count : 0);
+	}
 
 	/*
 	 * 1. Build the OLD-direction suffix -> old child (mirrors the legacy
@@ -546,7 +583,7 @@ no_old_dir_replace:
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1],
 			suffix_len);
 		ft_meta_nr_child_set(sfx_meta, 1);
-		ft_nr_keys_store(ft, sfx_meta, old_child_nr_keys, CMM_RELAXED);
+		ft_nr_keys_store(ft, sfx_meta, old_sfx_nr_keys, CMM_RELAXED);
 		old_suffix_flag = ft_compressed_node_flag(sfx);
 		sfx_skip_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
 		ft_glue_track(glue, old_suffix_flag);
@@ -579,7 +616,7 @@ no_old_dir_replace:
 		if (ret)
 			return -ENOMEM;
 		ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(dest)),
-			old_child_nr_keys, CMM_RELAXED);
+			old_sfx_nr_keys, CMM_RELAXED);
 		old_suffix_flag = dest;
 		ft_glue_track(glue, dest);
 		ft_node_get_nth_skip(dest, &slot,
@@ -697,7 +734,9 @@ old_dir_built:
 	 * the @diverge_pos == 0 arm below re-deriving it from @cn_meta.
 	 */
 	ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
-		old_child_nr_keys + src_count, CMM_RELAXED);
+		old_child_nr_keys + src_count -
+			(src_under && diverge_pos > 0 ? src_count : 0),
+		CMM_RELAXED);
 
 	/* Wire the OLD direction (re-encode compressed slot to skip form). */
 	ft_node_get_nth_skip(branch_flag, &slot, old_ordinal, FT_PF_NONE);
