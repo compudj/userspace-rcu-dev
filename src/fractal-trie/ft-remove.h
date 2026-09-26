@@ -7332,7 +7332,45 @@ enum ft_unchain_kind {
 	FT_UNCHAIN_INTERIOR,
 	FT_UNCHAIN_PROMOTE,
 	FT_UNCHAIN_CLEAR,
+	/*
+	 * A CLEAR after the fused collapse DECLINED (a run too long to spell):
+	 * the 1-child internal it leaves is the designed product, so the
+	 * residue re-route must not send the op round forever.
+	 */
+	FT_UNCHAIN_CLEAR_KEEP,
 };
+
+/*
+ * THE COLLAPSE THE PLAN DID NOT SEE, list-off arm.  The caller picked this plain
+ * clear over the fused collapse from UNHELD reads of the holder (its nr_child,
+ * its parent); a peer that removed the holder's second child -- or was
+ * re-parenting it while the plan read -- makes clearing its last external leave
+ * a 1-child keyless internal, which cds_ft_verify refuses in skip mode and a
+ * later remove beneath it livelocks on (exponential spacing, owned-key row;
+ * LTTng: five fused attempts refused on a peer's lock, the sixth took this arm).
+ * Under the holder's lock nr_child is exact: re-route, and the retry's plan
+ * takes the fused collapse.
+ */
+static inline
+bool ft_unchain_clear_leaves_residue(struct cds_ft *ft,
+		enum ft_unchain_kind kind, struct cds_ft_inode_flag *holder)
+{
+#if defined(FEATURE_FT_SKIP_COMPRESSED) && !defined(FT_DEBUG_PREFIX_CLEAR_RESIDUE)
+	struct cds_ft_metadata *hm;
+
+	if (kind != FT_UNCHAIN_CLEAR || !holder ||
+	    !ft_group_skip_compressed(ft->group) ||
+	    ft_node_external(holder) || ft_node_compressed(holder) ||
+	    ft_node_skip_compressed(holder))
+		return false;
+	hm = ft_flag_to_metadata(ft, holder);
+	return ft_meta_nr_child_load(hm) == 1 &&
+		ft_parent_node(hm->parent_word) != NULL;
+#else
+	(void) ft; (void) kind; (void) holder;
+	return false;
+#endif
+}
 
 static
 int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
@@ -7510,7 +7548,10 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				}
 				if ((kind == FT_UNCHAIN_INTERIOR) != member ||
 				    (kind == FT_UNCHAIN_PROMOTE && !succ) ||
-				    (kind == FT_UNCHAIN_CLEAR && succ)) {
+				    ((kind == FT_UNCHAIN_CLEAR ||
+				      kind == FT_UNCHAIN_CLEAR_KEEP) && succ) ||
+				    ft_unchain_clear_leaves_residue(ft, kind,
+						parent_nf)) {
 #ifdef FT_ENABLE_TRACING
 					uatomic_inc(&ft_dbg_unchain_rerouted);
 #endif
@@ -8999,7 +9040,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * key disappears (the holder KEEPS its longer-key children
 			 * -- prefix-with-siblings).
 			 */
-			bool last_fused = false;
+			bool last_fused = false, fused_declined = false;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
 			 * Fuse the chain-compress prune INTO the key-removal
@@ -9070,6 +9111,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					last_fused = true;
 				}
 				/* cret > 0: merge out of bound -- fall back to plain clear. */
+				if (cret > 0)
+					fused_declined = true;
 			}
 #endif
 			if (!last_fused) {
@@ -9135,6 +9178,31 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 							ft_flip_txn_commit(ft, txn));
 					} else
 #endif
+#if defined(FEATURE_FT_SKIP_COMPRESSED) && !defined(FT_DEBUG_PREFIX_CLEAR_RESIDUE)
+					/*
+					 * THE COLLAPSE THE PLAN DID NOT SEE.  The fused arm
+					 * above is chosen from an UNHELD nr_child: this plan
+					 * saw a second child, so a plain clear would leave a
+					 * legal keyless node with two.  A peer that removed that
+					 * second child before our take changes the answer:
+					 * clearing the last external of a 1-child node leaves
+					 * the 1-child keyless internal cds_ft_verify refuses in
+					 * skip mode, and the post-prune below is a separate
+					 * flip that loses under contention -- the
+					 * residue a later remove beneath it livelocks on
+					 * (exponential spacing, owned-key row).  Under the
+					 * holder's lock nr_child is exact: re-plan, and the
+					 * next attempt takes the fused collapse.
+					 */
+					if (!fused_declined &&
+					    ft_group_skip_compressed(ft->group) &&
+					    ft_meta_nr_child_load(holder_meta) == 1 &&
+					    ft_parent_node(holder_meta->parent_word) !=
+							NULL) {
+						ft_flip_txn_destroy(txn);
+						ret = -EAGAIN;
+					} else
+#endif
 					{
 						ft_flip_txn_record_count_parent(ft, txn,
 							holder_flag, -1);
@@ -9151,7 +9219,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					ret = ft_unchain_node(ft, &lctx, holder_flag,
 						holder_depth,
 						(struct cds_ft_node **) &holder_meta->external_nodes,
-						node, FT_UNCHAIN_CLEAR);
+						node, fused_declined ?
+							FT_UNCHAIN_CLEAR_KEEP :
+							FT_UNCHAIN_CLEAR);
 				}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				/*
