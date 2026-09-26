@@ -23703,7 +23703,27 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		ft_hold_trace_drop(meta);
 		ft_flip_txn_record_state(txn, meta,
 			(void *) live_state, (void *) live_state);
-	} else if (check_child) {
+	} else if (check_child
+#ifndef FT_DEBUG_REPARENT_GUARD_WHEN_HELD
+			/*
+			 * ☞ A HOLD CANCELS THE GUARD.  The {live -> live} validate is
+			 * the MW-CAS era's arbitration; under lock-before-write the
+			 * op's lock on @meta IS the exclusion -- here held through its
+			 * ANCHOR (a member or covered entry in @txn's registry), since
+			 * the node's own word is taken only where it is itself an
+			 * anchor.  Planted anyway, the guard expects @meta's word
+			 * clean at commit, and a LATER take of that word by the same
+			 * op (ft_glue_acquire_reparent_marks, where @meta anchors a
+			 * deeper member) makes the op's own commit fail every
+			 * attempt.  MEASURED (exponential spacing, single-threaded):
+			 * {a, abbbbaabaa, babbbaaaba, abba, aabbb, abbabab} +
+			 * rekey_merge(dst "baabaaba", src "ab") never returned -- the
+			 * one MW record, this guard {0x8 -> 0x8}, lost to its own
+			 * 0x80008, and the retry loop allocated until killed.
+			 */
+			&& !ft_flip_txn_holds(txn, meta)
+#endif
+			) {
 #ifdef FT_DEBUG_LIVE_VALIDATE
 		int lv_self = -1, lv_held = -1;
 # ifdef FT_DEBUG_STRUCT_ANCHOR
