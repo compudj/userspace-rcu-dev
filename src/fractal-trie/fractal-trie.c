@@ -690,8 +690,9 @@ int _cds_ft_debug_skip_compressed_enabled(void)
  * ☠ THE FLAG IS ONLY HALF THE CONDITION FOR THE BULK ARMS.  A graft's reserve
  * vouches ft_in_place_excl_ok(), which also requires an EXCLUSIVE trie, so a
  * test that wants ft_store_at_graft_point_commit's in-place arm must ALSO
- * create one -- which is why the gate's `in-place` config alone never reached
- * it.  The point ops' tier (ft_in_place_ok) is the flag alone.
+ * create one -- which is why an in-place build alone never reached it.
+ * Answers for the INSERT tier (the graft reserve's); the delete tier has its
+ * own switch, FEATURE_FT_DELETE_IN_PLACE.  The point ops' tier (ft_in_place_ok) is the flag alone.
  */
 int _cds_ft_debug_in_place_enabled(void)
 {

@@ -3918,7 +3918,7 @@ int ft_node_set_nth(struct cds_ft *ft,
 	 */
 	return ft_node_set_nth_rec(ft, node_flag, n, child_node_flag,
 			old_node_ret, metadata, node_depth, cluster_leaf, NULL,
-			NULL, NULL, NULL, ft_in_place_excl_ok(ft), NULL);
+			NULL, NULL, NULL, ft_in_place_insert_excl_ok(ft), NULL);
 }
 
 /*

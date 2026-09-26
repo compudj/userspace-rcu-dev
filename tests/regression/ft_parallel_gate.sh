@@ -335,7 +335,10 @@ ALL_CONFIGS=(
 	# tries in the suite are not exclusive.  Exercising the fast path
 	# meaningfully needs exclusive-trie mutation coverage, which is its own
 	# piece of work.
-	"in-place|-DFEATURE_FT_INSERT_IN_PLACE|u ion ioff"
+	#
+	# The two in-place tiers are separate switches since 2026-09-26 (the
+	# one macro used to enable both); this config keeps enabling both.
+	"in-place|-DFEATURE_FT_INSERT_IN_PLACE -DFEATURE_FT_DELETE_IN_PLACE|u ion ioff"
 	# The byte-key-only build (~25 KiB less .text): compiles out the
 	# non-identity key-map lookup specializations, after which
 	# cds_ft_group_attr_set_key_map returns NOT_SUPPORTED.  It had no gate

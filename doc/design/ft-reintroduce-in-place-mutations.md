@@ -478,8 +478,17 @@ see the commit message for the leg table.
   liveness assertion, also 0 lost).
 - The bulk reserves and the build-path wrapper stay exclusive-only; each needs
   its own lock-before-write before `ft_in_place_excl_ok` can retire.
-- The default build still compiles the tier out. Flipping
-  `FEATURE_FT_INSERT_IN_PLACE` on by default is a gate-wide decision.
+- The default build still compiles the tiers out.  Since 2026-09-26 they are
+  two switches, `FEATURE_FT_INSERT_IN_PLACE` (insert) and
+  `FEATURE_FT_DELETE_IN_PLACE` (delete); each edit site asks its own tier
+  (`ft_in_place_insert_ok` / `ft_in_place_delete_ok` and their `_excl_`
+  forms), and the same-trie rekey's refusal gates keep `ft_in_place_excl_ok`,
+  which answers "either tier".  Turning them on by default is blocked on
+  three defects the default-on gate found (2026-09-26): a DOUBLE-OWNED node
+  under concurrent remove_all with skip-compression off (delete tier), a lock
+  released by a non-owner in the prefix-shape zoo at exponential spacing
+  (insert tier), and an exclusive-trie rekey refused under either tier with
+  compression off.
 
 ### 6.6 Operational: the stall that was not a livelock
 

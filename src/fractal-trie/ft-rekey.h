@@ -6854,7 +6854,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					ft_flag_to_metadata(ft, climb_rest),
 					rn, NULL /*delete*/,
 					/* bulk: the exclusive-only in-place tier */
-					ft_in_place_excl_ok(ft),
+					ft_in_place_delete_excl_ok(ft),
 					false /*is_root: a child of @graft_c*/,
 					fold_rest_depth, &rpub, txn,
 					NULL /*held_hint: no publish to guard*/,
@@ -7095,7 +7095,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		urcu_assert_debug(gst_st.old_recompacted_node != NULL ||
 			(gst_st.displaced_shape &&
 				ft_glue_is_fresh(ft, &glue, gst_st.attached)) ||
-			ft_in_place_excl_ok(ft));
+			ft_in_place_insert_excl_ok(ft));
 	}
 
 	/*
@@ -7241,7 +7241,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					.parent_guard = true },
 				&detach_rc /*old + fresh BP copies, reclaimed post-commit*/,
 				/* bulk: exclusive-only tier */
-				ft_in_place_excl_ok(ft));
+				ft_in_place_delete_excl_ok(ft));
 	} else if (bp_folds_into_graft_c) {
 		/*
 		 * THE FOLD'S OWN HALF OF THE DETACH.  The slot drop already rode

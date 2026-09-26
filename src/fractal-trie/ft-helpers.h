@@ -254,11 +254,17 @@ void static_array_size_check(void)
  * MW model needed -- a whole-node replacement so one CAS could arbitrate every
  * word -- the DLM locks now provide by exclusion instead.
  *
- * Without FEATURE_FT_INSERT_IN_PLACE both answer no and every caller behaves
- * exactly as before (recompact-on-insert / recompact-on-delete).
+ * PER TIER.  The insert tier (FEATURE_FT_INSERT_IN_PLACE) and the delete tier
+ * (FEATURE_FT_DELETE_IN_PLACE) are separate build switches, each with its own
+ * predicate: a site that EDITS in place asks the tier of the edit it makes.
+ * ft_in_place_ok / ft_in_place_excl_ok answer "EITHER tier": they are for the
+ * sites that refuse or re-route a shape because an in-place tier would edit a
+ * node where it stands (the same-trie rekey's gates), which must refuse as
+ * soon as either tier could.  With both tiers compiled out (the default) every
+ * predicate answers no and every caller recompacts.
  */
 static inline
-bool ft_in_place_ok(const struct cds_ft *ft)
+bool ft_in_place_insert_ok(const struct cds_ft *ft)
 {
 	(void) ft;
 #ifdef FEATURE_FT_INSERT_IN_PLACE
@@ -266,6 +272,35 @@ bool ft_in_place_ok(const struct cds_ft *ft)
 #else
 	return false;
 #endif
+}
+
+static inline
+bool ft_in_place_delete_ok(const struct cds_ft *ft)
+{
+	(void) ft;
+#ifdef FEATURE_FT_DELETE_IN_PLACE
+	return true;
+#else
+	return false;
+#endif
+}
+
+static inline
+bool ft_in_place_ok(const struct cds_ft *ft)
+{
+	return ft_in_place_insert_ok(ft) || ft_in_place_delete_ok(ft);
+}
+
+static inline
+bool ft_in_place_insert_excl_ok(const struct cds_ft *ft)
+{
+	return ft_in_place_insert_ok(ft) && ft->exclusive;
+}
+
+static inline
+bool ft_in_place_delete_excl_ok(const struct cds_ft *ft)
+{
+	return ft_in_place_delete_ok(ft) && ft->exclusive;
 }
 
 static inline

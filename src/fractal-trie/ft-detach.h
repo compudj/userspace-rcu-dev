@@ -442,7 +442,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 						-(long) detached_count, NULL, false,
 						NULL, NULL,
 						/* bulk: exclusive-only tier */
-						ft_in_place_excl_ok(ft));
+						ft_in_place_delete_excl_ok(ft));
 				urcu_txn_end(&optxn);
 				assert(ret != -ENOENT);
 				if (ret < 0) {

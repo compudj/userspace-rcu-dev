@@ -43,6 +43,15 @@
  *                               boundaries on descent).
  *                               Disable with -DNO_FEATURE_INLINE_LOOKUP.
  *
+ * Functional features (OPT-IN):
+ *
+ *   FEATURE_FT_INSERT_IN_PLACE  Point inserts append into the live node under
+ *                               the held lock instead of recompacting it.
+ *                               Enable with -DFEATURE_FT_INSERT_IN_PLACE.
+ *   FEATURE_FT_DELETE_IN_PLACE  Point deletes soft-delete from the live node
+ *                               under the held lock instead of recompacting.
+ *                               Enable with -DFEATURE_FT_DELETE_IN_PLACE.
+ *
  * (The library-owned ordered-cell index is always compiled in; it is
  * gated per group at runtime via cds_ft_group_attr_set_ordered_list,
  * not at build time.)
@@ -574,18 +583,22 @@ unsigned int ft_lock_level_index(unsigned int depth)
 
 /*
  * FEATURE_FT_INSERT_IN_PLACE: in-place occupancy-bitmap safe-append (the O(1)
- * insert tier) and in-place soft-delete.  OPT-IN; RECOMPACT-ON-INSERT is the
- * DEFAULT.
+ * insert tier).  FEATURE_FT_DELETE_IN_PLACE: in-place soft-delete (the delete
+ * tier).  Both OPT-IN and independent (split 2026-09-26 -- the one macro used
+ * to enable both -- so root-cause work can switch either tier alone); without
+ * them the build recompacts on insert and on delete.
  *
- * When enabled (-DFEATURE_FT_INSERT_IN_PLACE), a POINT insert that lands at a
- * node's tail rank with spare tier capacity is applied IN PLACE: the child slot
- * is published and the node's occupancy-bitmap bit is set with a relaxed store
- * on the LIVE node's body (ft_popcount_node_set_nth Cases 2A/2B,
- * ft_pigeon_node_set_nth); a point delete that leaves the holder above
- * min_child NULLs the slot and decrements nr_child through the commit instead
- * of rebuilding the node (☐ still exclusive-only for the point removes: the
- * delete tier's own validation step is next).  On EVERY trie type: what makes
- * the insert store safe
+ * With the insert tier, a POINT insert that lands at a node's tail rank with
+ * spare tier capacity is applied IN PLACE: the child slot is published and the
+ * node's occupancy-bitmap bit is set with a relaxed store on the LIVE node's
+ * body (ft_popcount_node_set_nth Cases 2A/2B, ft_pigeon_node_set_nth).  With
+ * the delete tier, a point delete that leaves the holder above min_child NULLs
+ * the slot and decrements nr_child through the commit instead of rebuilding
+ * the node, on shared tries too (the three point-remove ft_detach_node calls,
+ * since 2026-09-16).  Delete-on / insert-off is a supported mix: refilling a
+ * soft-deleted hole is itself an insert-tier store, so with the insert tier
+ * off the refill reports -ERANGE and the recompact drops the hole.  On EVERY
+ * trie type: what makes the insert store safe
  * against concurrent WRITERS is that the op HOLDS the node before it writes --
  * the node's DLM lock, or its anchor at a coarser spacing, or the FT-wide lock
  * under the coarse strategy (ft_attach_node's acquire hoist; ft_in_place_ok's
@@ -596,7 +609,7 @@ unsigned int ft_lock_level_index(unsigned int depth)
  * converted to lock-before-write; a same-trie move's dst attach parent must
  * relocate on a shared trie anyway, for the reader-coherence witness.
  *
- * By DEFAULT (the macro undefined) every new-occupancy insert (i.e. not an
+ * Without the insert tier every new-occupancy insert (i.e. not an
  * in-place pointer replace at an already-occupied slot) instead reports -ERANGE,
  * so the setter wrapper (ft_node_set_nth_rec) routes it through
  * ft_node_recompact(ADD_SAME) -- a fresh node carrying the new entry AND its
@@ -605,8 +618,8 @@ unsigned int ft_lock_level_index(unsigned int depth)
  * needed (the Invariant-2 disjoint-word hazard, see
  * doc/design/mcas-multiwriter-readiness.md S4): every node change a whole-node
  * replacement via the parent flip-txn edge, so one CAS could arbitrate every
- * word.  The DLM locks now provide that exclusion, at the cost the default
- * still pays: the O(1) in-place insert turned into an O(node) alloc-and-copy
+ * word.  The DLM locks now provide that exclusion, and that build still pays
+ * the cost: the O(1) in-place insert turned into an O(node) alloc-and-copy
  * recompact.  See doc/design/ft-reintroduce-in-place-mutations.md.
  *
  * Both popcount and pigeon nodes recompact uniformly here.  FUTURE (noted,
@@ -620,8 +633,9 @@ unsigned int ft_lock_level_index(unsigned int depth)
  * keep pigeon's O(1) insert/delete.  See doc/design/mcas-multiwriter-
  * readiness.md S4.
  *
- * Default: recompact-on-insert (multi-writer-safe).  Opt into the in-place
- * fast path with -DFEATURE_FT_INSERT_IN_PLACE (the gate's `in-place` config).
+ * Default: recompact-on-insert and -on-delete.  Opt into the tiers with
+ * -DFEATURE_FT_INSERT_IN_PLACE and -DFEATURE_FT_DELETE_IN_PLACE (the gate's
+ * `in-place` config sets both).
  */
 
 /*

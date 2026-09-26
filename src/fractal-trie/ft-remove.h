@@ -9144,7 +9144,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				-1 /* leaf key removed: detach owns the -1 */,
 				NULL, false, NULL, NULL,
 				/* EXPERIMENT: delete tier open, for the trace. */
-				ft_in_place_ok(ft));
+				ft_in_place_delete_ok(ft));
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/*
@@ -9438,7 +9438,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				-1 /* leaf key removed: detach owns the -1 */,
 				NULL, false, NULL, NULL,
 				/* EXPERIMENT: delete tier open, for the trace. */
-				ft_in_place_ok(ft));
+				ft_in_place_delete_ok(ft));
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
@@ -10690,7 +10690,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			-1 /* leaf key removed: detach owns the -1 */,
 			NULL, false, NULL, NULL,
 			/* EXPERIMENT: delete tier open, for the trace. */
-			ft_in_place_ok(ft));
+			ft_in_place_delete_ok(ft));
 		ft_removeall_fault_scope_exit();
 	}
 

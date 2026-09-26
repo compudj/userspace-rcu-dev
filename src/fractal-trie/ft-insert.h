@@ -2581,7 +2581,7 @@ int ft_attach_node(struct cds_ft *ft,
 			 * already carries every frame and @rctx would only add
 			 * this txn a second time.
 			 */
-			if (!old_node_flag && ft_in_place_ok(ft)) {
+			if (!old_node_flag && ft_in_place_insert_ok(ft)) {
 				/*
 				 * THE ACQUIRE SEAM (-DFT_DELAY_INJECT,
 				 * FT_DELAY_MODE=acquire).  @old_node_flag and the

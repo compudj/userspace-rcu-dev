@@ -185,7 +185,7 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 				 */
 				-(long) detached_count, NULL, false, NULL, NULL,
 				/* bulk: exclusive-only tier */
-				ft_in_place_excl_ok(src_ft));
+				ft_in_place_delete_excl_ok(src_ft));
 	}
 	if (ret < 0) {
 		/*
