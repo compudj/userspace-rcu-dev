@@ -1988,8 +1988,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * So the absorption refuses TERMINALLY instead, which is what a
 		 * run that cannot be spelled deserves: it is a property of the
 		 * trie, not of this writer.  Only the absorbing shape takes this
-		 * exit; an ordinary over-long merge still falls back, because for
-		 * it the fallback IS a legal product.
+		 * exit.
 		 *
 		 * ☠ AND THE DEEP FOLD TAKES THE SAME EXIT, for the same reason.  It
 		 * was left on the fallback because its live-top case was
@@ -2003,10 +2002,33 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		if (pending_cn || deep_fold)
 			return -EDOM;
+#ifndef FT_DEBUG_OVERLONG_COLLAPSE_FALLBACK
+		/*
+		 * ☑ AN ORDINARY OVER-LONG MERGE IS SPELLED, NOT REFUSED.  Its
+		 * fallback was never a legal product: ft_node_replace_ptr leaves
+		 * the boundary a one-child keyless internal, which cds_ft_verify
+		 * refuses in skip mode -- single-threaded, on the default build:
+		 * {ab, a+128*'c'}, remove "ab" (127 bytes clean).  But a run
+		 * longer than a skip pointer can encode is not unspellable:
+		 * cds_ft_insert builds exactly that shape for a long unique
+		 * suffix -- ONE compressed node, published through a PLAIN
+		 * compressed flag (ft_publish_compressed picks the encoding by
+		 * length), and verify accepts it.  So build the same node here
+		 * and let the publish below take the plain flag.  The only bound
+		 * left is the node's own 8-bit length, which a key of
+		 * FT_MAX_KEY_LEN bytes below a non-root boundary cannot reach.
+		 */
+		if (merged_len > UINT8_MAX) {
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
+			return 1;
+		}
+#else
 		/* Merge does not apply: caller falls back (fences cleared). */
 		if (!record_only)
 			ft_flip_txn_destroy(txn);
 		return 1;
+#endif
 	}
 	new_cn = alloc_compressed_node(ft, merged_len, &new_cn_meta);
 	if (!new_cn) {
