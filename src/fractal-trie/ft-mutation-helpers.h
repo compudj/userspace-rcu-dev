@@ -7590,6 +7590,29 @@ bool ft_flip_txn_owns(const struct ft_flip_txn *t,
 }
 
 /*
+ * Is EVERY writer of EVERY word in @ft -- the trie holding the word a validate
+ * would name -- excluded until @t's commit lands?  Door 1's answer (a coarse
+ * trie, or an exclusive one by the caller's contract: @t's latched
+ * @trie_wide_sw for its own trie, ft_txn_content_sw_ok for another one a
+ * cross-trie op touches) or the FT-wide writer lock this thread holds on @ft
+ * (a bulk window on a fine trie, point writers flipped onto it).  Then no
+ * validate {v -> v} on @ft can fail on anyone else's account: it is the MW-CAS
+ * era's arbitration with nothing left to arbitrate, and dropping it changes no
+ * commit's outcome.  A validate that must catch THIS txn's own retire is not
+ * governed by this (each caller keeps its own carve-out).
+ */
+static inline
+bool ft_flip_txn_excludes_all(const struct ft_flip_txn *t,
+		const struct cds_ft *ft)
+{
+	if (!ft)
+		return false;
+	if (ft == t->ft ? t->trie_wide_sw : ft_txn_content_sw_ok(ft))
+		return true;
+	return ft_wlock_held == ft;
+}
+
+/*
  * May a record on @meta's STATE WORD be parked SW -- i.e. does this commit hold
  * THAT WORD, not merely @meta's lock?
  *
@@ -16981,6 +17004,8 @@ void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 # include <dlfcn.h>
 static unsigned long ft_guard_total, ft_guard_unheld, ft_guard_unheld_fine;
 static unsigned long ft_guard_ctx_covered, ft_guard_truly_unheld;
+/* ...and the ones that actually reach urcu_txn_validate (past every skip). */
+static unsigned long ft_guard_installed, ft_guard_installed_fine;
 /* ...and the plants with NO ctx to ask: unknown, never "unheld". */
 static unsigned long ft_guard_no_ctx;
 /* lock_or_guard exits that still planted a guard, by exit code. */
@@ -17032,6 +17057,10 @@ static __attribute__((destructor)) void ft_guard_audit_report(void)
 		uatomic_read(&ft_guard_ctx_covered),
 		uatomic_read(&ft_guard_truly_unheld),
 		uatomic_read(&ft_guard_no_ctx));
+	fprintf(stderr, "FT GUARD AUDIT: INSTALLED (reached urcu_txn_validate) "
+		"%lu, of them on a FINE non-exclusive trie %lu (callers below)\n",
+		uatomic_read(&ft_guard_installed),
+		uatomic_read(&ft_guard_installed_fine));
 	for (i = 0; i < FT_GUARD_SITES; i++) {
 		const void *pc = uatomic_read(&ft_guard_site[i].pc);
 		Dl_info info;
@@ -17064,6 +17093,18 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 
 	if (!t || !parent_nf)
 		return;
+#ifndef FT_DEBUG_GUARD_ON_MISS
+	/*
+	 * A DISCARDED TXN INSTALLS NOTHING.  @acquire_miss is set-only for the
+	 * txn's life (cleared at construction alone), and ft_flip_txn_commit
+	 * discards a missed txn before the engine ever sees it -- so a validate
+	 * planted here can neither pass nor fail: it is work.  MEASURED (ft_inv
+	 * FT_INV_MW=1, -DFT_DEBUG_GUARD_AUDIT): 18.6M of 19.7M plants at
+	 * per-node, 23.4M of 27.9M at root-only, all of them on this path.
+	 */
+	if (t->acquire_miss)
+		return;
+#endif
 	/*
 	 * A word this txn already covers with a LIVE lock-protocol record
 	 * needs no guard: the held per-node lock IS the exclusion the guard
@@ -17120,14 +17161,27 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 					uatomic_inc(&ft_guard_ctx_covered);
 				} else {
 					uatomic_inc(&ft_guard_truly_unheld);
-					/* Tally ONLY the class that matters. */
-					ft_guard_note_site(
-						__builtin_return_address(0));
 				}
 			}
 		}
 #endif
-		if (ft_flip_txn_owns(t, pm)) {
+		/*
+		 * ...and a trie whose writers are ALL excluded by one lock: door
+		 * 1's latched answer (@trie_wide_sw: coarse, or exclusive by the
+		 * caller's contract) or the FT-wide writer lock this thread holds
+		 * (a bulk window, point writers flipped onto it).  No peer writes
+		 * @pm's word before this commit, so the validate cannot fail on
+		 * anyone else's account -- it is the MW-CAS era's arbitration
+		 * with nothing left to arbitrate.  MEASURED 0.9-1.0M such plants
+		 * per ft_inv MW run.  The carve-out below still applies: a parent
+		 * this txn itself tombstones keeps failing loudly.
+		 */
+		bool excl_all = ft_flip_txn_excludes_all(t, ft);
+
+#ifdef FT_DEBUG_GUARD_WHEN_EXCLUSIVE
+		excl_all = false;
+#endif
+		if (excl_all || ft_flip_txn_owns(t, pm)) {
 			/*
 			 * The REGISTRY is the skip's predicate -- order-
 			 * independent, and it covers the mark-release shape
@@ -17179,6 +17233,14 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 	 * matches -> proceed (the copy was abandoned, the holder unchanged).
 	 */
 	live = v & ~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
+#ifdef FT_DEBUG_GUARD_AUDIT
+	uatomic_inc(&ft_guard_installed);
+	if (ft->lock_fine && !ft->exclusive) {
+		/* Tally ONLY the class that matters: what still validates. */
+		uatomic_inc(&ft_guard_installed_fine);
+		ft_guard_note_site(__builtin_return_address(0));
+	}
+#endif
 	FT_AB_ARM(FT_AB_VALIDATE, FT_AB_OWN_NA);
 	urcu_txn_validate(t->mtxn,
 			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,

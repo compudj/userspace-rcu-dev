@@ -6400,6 +6400,54 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 }
 
 /*
+ * Does the holder hold {L} (@hm) exclude every writer of @parent_nf's word, so
+ * that the §4.B guard on it is subsumed?  The guard is the MW-CAS era's
+ * arbitration; under lock-before-write it is owed only where the op's lock
+ * does NOT reach the word.
+ *
+ *  - the exact word (@hm IS @parent_nf's metadata): per-node, and any spacing
+ *    whose anchor for @parent_nf is itself.  Planting the guard there would
+ *    abort every commit (its clean-LIVE expectation masks the LOCK this op
+ *    set) -- the measured livelock this predicate first existed to stop.
+ *  - ROOT-ONLY, when {L} was taken FOR @parent_nf (@hh->member).  The
+ *    coarsened acquire sampled the member's OWN state word, refused a
+ *    TOMBSTONE / PROXY / LOCK there, and validated that sample inside the
+ *    acquire's own commit (ft_held_anchor_guard_node): the validation AT THE
+ *    LOCK INSTANT, so "already retired" cannot pass.  From that instant the
+ *    root's lock -- every word in the trie anchors on it -- excludes every
+ *    writer of @parent_nf's word, so "retired during the window" cannot
+ *    either.  {L} outlives this txn's commit (ft_replace_exit releases it
+ *    only after the flip returned).  A @parent_nf that is NOT the member was
+ *    never asked about, so it keeps the guard.  MEASURED: 328k validates
+ *    per ft_inv FT_INV_MW=1 run at root-only came from these two replace
+ *    arms and nowhere else.
+ *  - EXPONENTIAL keeps the guard.  There the anchor comes from the plan's
+ *    DATING, and a plan dated before a move can lock the old path's
+ *    ancestor while a peer locks the new one (the second-path note at
+ *    ft_flip_txn_record_retire_anchored_arms); the clean-LIVE validate is
+ *    that gap's only defence until a revalidation under the lock replaces it.
+ */
+static inline
+bool ft_replace_hold_covers(struct cds_ft *ft, const struct cds_ft_metadata *hm,
+		const struct ft_held_anchor *hh,
+		struct cds_ft_inode_flag *parent_nf)
+{
+	struct cds_ft_metadata *pm;
+
+	if (!hm)
+		return false;
+	pm = ft_flag_to_metadata(ft, parent_nf);
+	if (pm == hm)
+		return true;
+#ifdef FT_DEBUG_REPLACE_GUARD_ROOT_ONLY
+	return false;
+#else
+	return ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY &&
+		pm == hh->member;
+#endif
+}
+
+/*
  * cds_ft_replace's SINGLE EXIT for the holder hold {L}.
  *
  * The hold is taken ONCE, above the routing derivation, and every one of this
@@ -7040,11 +7088,10 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * neither the "retired during the window" nor the
 			 * "already retired" case the guard exists for can arise.
 			 * At a COARSER spacing the hold anchors on an ANCESTOR,
-			 * so @hm names a different word, the guard IS planted,
-			 * and its clean-LIVE expectation is satisfied because
-			 * this op set no LOCK on @parent_nf itself.
+			 * so @hm names a different word -- and whether it still
+			 * covers this one is ft_replace_hold_covers' question.
 			 */
-			if (!hm || ft_flag_to_metadata(ft, parent_nf) != hm)
+			if (!ft_replace_hold_covers(ft, hm, &hh, parent_nf))
 				ft_flip_txn_guard_parent_ctx(ft, txn, parent_nf,
 					&hctx);
 			/*
@@ -7173,11 +7220,10 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * neither the "retired during the window" nor the
 			 * "already retired" case the guard exists for can arise.
 			 * At a COARSER spacing the hold anchors on an ANCESTOR,
-			 * so @hm names a different word, the guard IS planted,
-			 * and its clean-LIVE expectation is satisfied because
-			 * this op set no LOCK on @parent_nf itself.
+			 * so @hm names a different word -- and whether it still
+			 * covers this one is ft_replace_hold_covers' question.
 			 */
-			if (!hm || ft_flag_to_metadata(ft, parent_nf) != hm)
+			if (!ft_replace_hold_covers(ft, hm, &hh, parent_nf))
 				ft_flip_txn_guard_parent_ctx(ft, txn, parent_nf,
 					&hctx);
 			/*
