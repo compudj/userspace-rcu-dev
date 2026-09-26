@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 340 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 341 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (403 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (404 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (352 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (353 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -34344,6 +34344,149 @@ static int test_overlong_bulk_fuse(void)
 	return ret;
 }
 
+/*
+ * OVERFLOW_ERROR means "a moved key would exceed the group maximum" -- for the
+ * keys that MOVE.  Two ways the max_used_key_len hint answered otherwise:
+ * a whole-trie source whose long key was removed (the hint never goes down),
+ * and a subtree move (same-trie rekey, keyed merge_at) whose trie holds a long
+ * key outside the moved prefix.  Each must now succeed; each true overflow must
+ * still be refused.  Keys: a 250-byte run of 'q', moved under 100 bytes of 'd'.
+ */
+static void mko_insert(struct cds_ft *ft, const uint8_t *k, size_t len)
+{
+	struct ft_test_node *n = node_alloc(len);
+
+	rcu_read_lock();
+	if (cds_ft_insert(ft, k, len, &n->node) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+}
+
+static void mko_remove(struct cds_ft *ft, const uint8_t *k, size_t len)
+{
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *head, *tmp;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_iter_set_key(iter, k, len);
+	if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK ||
+	    cds_ft_remove_all(ft, iter, &head) != CDS_FT_STATUS_OK)
+		abort();
+	cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+		node_free_rcu(to_test_node(head));
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+}
+
+static int mko_check(const char *what, enum cds_ft_status got,
+		enum cds_ft_status want, struct cds_ft *a, struct cds_ft *b)
+{
+	int ret = 0;
+
+	rcu_read_lock();
+	if (got != want) {
+		diag("moved_keys_overflow_exact: %s: %s, expected %s", what,
+			cds_ft_status_to_string(got),
+			cds_ft_status_to_string(want));
+		ret = -1;
+	}
+	if (cds_ft_verify(a, stderr) != CDS_FT_STATUS_OK ||
+	    (b && cds_ft_verify(b, stderr) != CDS_FT_STATUS_OK)) {
+		diag("moved_keys_overflow_exact: %s: a trie fails verify", what);
+		ret = -1;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+static int test_moved_keys_overflow_exact(void)
+{
+	uint8_t lk[250], dk[100];
+	int ret = 0, real;
+
+	memset(lk, 'q', sizeof(lk));
+	memset(dk, 'd', sizeof(dk));
+	for (real = 0; real < 2; real++) {
+		enum cds_ft_status want = real ? CDS_FT_STATUS_OVERFLOW_ERROR :
+			CDS_FT_STATUS_OK;
+		struct cds_ft_group *group;
+		struct cds_ft *dst = create_varlen_ft(&group), *src;
+		enum cds_ft_status st;
+
+		/* graft: the source's long key removed (stale) or kept (real). */
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		mko_insert(src, lk, sizeof(lk));
+		if (!real)
+			mko_remove(src, lk, sizeof(lk));
+		mko_insert(src, (const uint8_t *) "abc", 3);
+		rcu_read_lock();
+		cds_ft_make_exclusive(src);
+		st = cds_ft_graft(dst, dk, sizeof(dk), src);
+		rcu_read_unlock();
+		if (mko_check(real ? "graft, real" : "graft, stale", st, want,
+				dst, src))
+			ret = -1;
+		if (drain_trie(dst) || drain_trie(src))
+			ret = -1;
+		cds_ft_destroy(src);
+
+		/* graft_swap: the same source shapes. */
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		mko_insert(src, lk, sizeof(lk));
+		if (!real)
+			mko_remove(src, lk, sizeof(lk));
+		mko_insert(src, (const uint8_t *) "abc", 3);
+		mko_insert(dst, (const uint8_t *) "zz", 2);
+		rcu_read_lock();
+		cds_ft_make_exclusive(src);
+		st = cds_ft_graft_swap(dst, dk, sizeof(dk), src);
+		rcu_read_unlock();
+		if (mko_check(real ? "graft_swap, real" : "graft_swap, stale",
+				st, want, dst, src))
+			ret = -1;
+		if (drain_trie(dst) || drain_trie(src))
+			ret = -1;
+		cds_ft_destroy(src);
+
+		/*
+		 * merge_at of prefix "a" (real: "q", the long key itself), the
+		 * long key present in the source throughout.
+		 */
+		if (cds_ft_create(group, NULL, &src) < 0)
+			abort();
+		mko_insert(src, lk, sizeof(lk));
+		mko_insert(src, (const uint8_t *) "abc", 3);
+		mko_insert(dst, (const uint8_t *) "zz", 2);
+		rcu_read_lock();
+		cds_ft_make_exclusive(src);
+		st = cds_ft_merge_at(dst, dk, sizeof(dk), src,
+			(const uint8_t *) (real ? "q" : "a"), 1);
+		rcu_read_unlock();
+		if (mko_check(real ? "merge_at, real" : "merge_at, subset",
+				st, want, dst, src))
+			ret = -1;
+		if (drain_trie(dst) || drain_trie(src))
+			ret = -1;
+		cds_ft_destroy(src);
+
+		/* same-trie rekey of prefix "a" (real: "q") under dk. */
+		mko_insert(dst, lk, sizeof(lk));
+		mko_insert(dst, (const uint8_t *) "abc", 3);
+		st = cds_ft_rekey_graft(dst, dk, sizeof(dk),
+			(const uint8_t *) (real ? "q" : "a"), 1);
+		if (mko_check(real ? "rekey_graft, real" : "rekey_graft, subset",
+				st, want, dst, NULL))
+			ret = -1;
+		if (drain_and_destroy(dst, group) < 0)
+			ret = -1;
+	}
+	return ret;
+}
+
 static int test_walk_past_empty_internal(void)
 {
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -40759,6 +40902,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_walk_past_empty_internal);
 	RUN_TEST(test_overlong_collapse);
 	RUN_TEST(test_overlong_bulk_fuse);
+	RUN_TEST(test_moved_keys_overflow_exact);
 	RUN_TEST(test_walk_past_deep_empty_internal);
 	RUN_TEST(test_verify_disjoint_cross_trie);
 
