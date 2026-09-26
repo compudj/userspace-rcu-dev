@@ -7801,8 +7801,23 @@ bool ft_held_set_snap(const struct ft_held_set *h,
 			*snap = h->extra[i].lock_snap;
 			return true;
 		}
-	if (h->glue && ft_glue_held_snap(h->glue, meta, snap, ratified))
+	if (h->glue && ft_glue_held_snap(h->glue, meta, snap, ratified)) {
+		uintptr_t osnap;
+		bool oratified;
+
+		/*
+		 * A glue that names the word only through a SHARED fence (or
+		 * the caller's) holds it without its value: the frame whose
+		 * acquire took it may be further out, so let a RATIFIED answer
+		 * there supply the clean value.  Still held either way.
+		 */
+		if (!*ratified && ft_held_set_snap(h->outer, meta, &osnap,
+					&oratified) && oratified) {
+			*snap = osnap;
+			*ratified = true;
+		}
 		return true;
+	}
 	return ft_held_set_snap(h->outer, meta, snap, ratified);
 }
 
@@ -24387,12 +24402,33 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 		const struct cds_ft_metadata *meta, uintptr_t *snap,
 		bool *ratified)
 {
+	/*
+	 * ☠ A SHARED NAMED FENCE CARRIES NO SNAPSHOT.  Its acquire DEDUPED onto
+	 * a word the op already held, and a deduped member's lock_snap is 0 by
+	 * construction (ft_dlm_acquire_set: "a deduped member has no acquire of
+	 * its own to sample it") -- so answering with it hands every later
+	 * dedupe a clean value of ZERO.  An uncoarsened member takes that as its
+	 * node_snap, and the revalidation under the lock then reads nr_child 0:
+	 * MEASURED as a single-threaded exponential rekey livelock, the
+	 * publish-parent fence shared onto the split-CN fence of the SAME glue
+	 * (snap 0 vs 0x8), ft_chain_compress_fused's plan re-check refusing on
+	 * every attempt.  @extra and the freelist-holder arm below already skip
+	 * a shared entry for exactly this reason; the named fences now do too.
+	 * The acquire that first took the word owns its value, so keep looking
+	 * for it, and answer HELD-BUT-UNRATIFIED only when no owning arm names
+	 * the word (the caller-held reading: dedupe mandatory, no value).
+	 */
+	bool shared_hit = false;
 	int i;
 
 	*ratified = true;
 	if (g->publish_parent_holder == meta) {
 		if (caa_unlikely(g->publish_parent_scrubbed)) {
 			FT_GLUE_SAVED_COUNT(0, g->publish_parent_txn_owned);
+#ifndef FT_DEBUG_GLUE_SHARED_SNAP
+		} else if (g->publish_parent_shared) {
+			shared_hit = true;
+#endif
 		} else {
 			FT_GLUE_ARM("publish_parent");
 			ft_glue_stale_check(0, meta,
@@ -24404,6 +24440,10 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 	if (g->publish_gp_holder == meta) {
 		if (caa_unlikely(g->publish_gp_scrubbed)) {
 			FT_GLUE_SAVED_COUNT(1, g->publish_gp_txn_owned);
+#ifndef FT_DEBUG_GLUE_SHARED_SNAP
+		} else if (g->publish_gp_shared) {
+			shared_hit = true;
+#endif
 		} else {
 			FT_GLUE_ARM("publish_gp");
 			ft_glue_stale_check(1, meta,
@@ -24413,9 +24453,16 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 		}
 	}
 	if (g->split_cn_holder == meta) {
-		FT_GLUE_ARM("split_cn");
-		*snap = g->split_cn_snap;
-		return true;
+#ifndef FT_DEBUG_GLUE_SHARED_SNAP
+		if (g->split_cn_shared) {
+			shared_hit = true;
+		} else
+#endif
+		{
+			FT_GLUE_ARM("split_cn");
+			*snap = g->split_cn_snap;
+			return true;
+		}
 	}
 	if (g->caller_holder == meta) {
 		FT_GLUE_ARM("caller");
@@ -24530,6 +24577,11 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 			*snap = g->splices[i].holder_snap;
 			return true;
 		}
+	if (shared_hit) {
+		FT_GLUE_ARM("shared");
+		*ratified = false;
+		return true;
+	}
 	return false;
 }
 
@@ -24543,8 +24595,19 @@ bool ft_glue_held_snap(const struct ft_glue *g,
 		const struct cds_ft_metadata *meta, uintptr_t *snap,
 		bool *ratified)
 {
-	if (ft_glue_held_snap_one(g, meta, snap, ratified))
+	uintptr_t psnap;
+	bool pratified;
+
+	if (ft_glue_held_snap_one(g, meta, snap, ratified)) {
+		/* Unratified here: the peer may be the one that took it. */
+		if (!*ratified && g->peer &&
+				ft_glue_held_snap_one(g->peer, meta, &psnap,
+					&pratified) && pratified) {
+			*snap = psnap;
+			*ratified = true;
+		}
 		return true;
+	}
 	return g->peer &&
 		ft_glue_held_snap_one(g->peer, meta, snap, ratified);
 }
