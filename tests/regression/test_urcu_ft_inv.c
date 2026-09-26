@@ -27030,56 +27030,24 @@ static int inv_concurrent_same_key_replace_nolist(void)
 	 * the conversion.
 	 */
 	/*
-	 * ☐ STILL OPT-IN, AND THE REASON MOVED.  The three defects above are
-	 * fixed and this row is green under the DEFAULT feature set at all three
-	 * spacings (rcu-debug, ft_inv 143/143 -> 145/145).  It is gated because it
-	 * is RED ON ONE FEATURE CONFIG, found by the gate after being promoted too
-	 * early:
+	 * ☑ BACK IN THE DEFAULT SET.  It was gated for a SIGSEGV in the iterator's
+	 * up-walk (ft_rebuild_key_upwalk -> cds_ft_item_to_metadata(cell), from
+	 * _cds_ft_replace_locked's ft_iter_read_key) on the holdtrace config with
+	 * the list off, blamed on the up-walk reading its cell UNHELD.  It was the
+	 * TEST: ski_worker, this row's insert/remove peer, recycled its array
+	 * nodes with cds_ft_node_init() inside the grace period cds_ft_remove
+	 * reserves, so a reader's up-walk could follow a prev the test had just
+	 * rewritten.  Fixed on the test side two days later (18a05072); the
+	 * unheld read is RCU-legal once nodes are not reused early.
 	 *
-	 *   holdtrace (-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE
-	 *   -DFEATURE_FT_ANCHOR_VALIDATE), ft_inv off (FT_INV_NO_ORDERED_LIST=1):
-	 *     per-node     TIMEOUT/hang after 143 tests
-	 *     exponential  SIGSEGV after 138 tests  (test 139 IS this row)
-	 *     root-only    TIMEOUT/hang after 134 tests
-	 *
-	 * ☞ THE SEGV IS NOT IN REPLACE.  Backtraced from the kept core:
-	 *     _cds_ft_replace_locked  ft-insert.h:4481   iter_key = ft_iter_read_key(iter)
-	 *       ft_iter_read_key
-	 *         ft_rebuild_key_upwalk    ft-iter.h:350
-	 *           cds_ft_item_to_metadata(cell)  -> SIGSEGV
-	 * The up-walk reaches its cell through ft_ord_cell_cursor and reads that
-	 * word UNHELD, so a peer re-homing or retiring it leaves a stale pointer
-	 * typed as metadata -- the same class as the raw-prev SEGV fixed above, in
-	 * the ITERATOR rather than in replace.  That call site is untouched by the
-	 * conversion (last changed by the module split @c656c513), and it is an
-	 * ALREADY-OPEN defect: the list up-walk slot arm.
-	 *
-	 * ⇒ WHAT THE CONVERSION CHANGED IS REACHABILITY, and the control says so:
-	 * at @e6666a4e this row cannot get there at all -- 3/3 runs spin on
-	 * "FT REFUSED (not ours): ft_unchain_node:5619" and are SIGKILLed at 16G by
-	 * the unbounded retry.  Post-fix the row RUNS, does tens of thousands of
-	 * replaces, and only then trips the iterator.  A user's cds_ft_replace went
-	 * from livelock+OOM to completing, so this is a newly EXPOSED second defect,
-	 * not a regression -- but a row that is red on a gate config does not belong
-	 * in the default set, whoever owns the bug.
-	 *
-	 * ☠ AND THE PROCESS LESSON: this row was certified at THREE SPACINGS ON ONE
-	 * FEATURE CONFIG and promoted on that.  Three spacings is not the gate's
-	 * coverage; the feature axis is a separate dimension and it is what caught
-	 * this.  Certify on the axis you are about to claim.
-	 *
-	 * ☞ UN-GATE WHEN the up-walk's cell read is made safe (hold or re-validate).
-	 * The two hangs are NOT backtraced and are NOT assumed to be the same
-	 * mechanism as the SEGV.
+	 * Found by bisect under the 2-cpu amplifier (each run pinned to two cpus
+	 * with two spinning hogs on them -- in isolation even the gating commit
+	 * was green): 6d90eadb, the commit before 18a05072, SIGSEGVs 4/32 runs,
+	 * 18a05072 0/32; the gating commit 6/48 against HEAD 0/48.  The two
+	 * holdtrace list-off hangs reported beside the SEGV (never backtraced)
+	 * did not recur: the full feature gate ran this row in all 110 legs,
+	 * holdtrace list-off at all three spacings, 166/166 each.
 	 */
-	if (!getenv("FT_INV_SAME_KEY_REPLACE")) {
-		diag("inv_concurrent_same_key_replace_nolist: skipped "
-			"(set FT_INV_SAME_KEY_REPLACE=1; the conversion is green "
-			"on the default feature set, but holdtrace+list-off SEGVs "
-			"in ft_iter_read_key's UNHELD up-walk -- a pre-existing "
-			"iterator defect this row now reaches)");
-		return 0;
-	}
 	return inv_concurrent_same_key_replace_run(false,
 		"inv_concurrent_same_key_replace_nolist");
 }
