@@ -310,8 +310,23 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 	 */
 	switch (type->type_class) {
 	case FT_POPCOUNT:
-		ft_popcount_node_get_ith_pos(type, node, 0, &byte, &single_child);
+	{
+		/*
+		 * The first NON-NULL position, not position 0: a bitmap bit
+		 * stays set over a soft-deleted slot (the in-place delete tier
+		 * NULLs the slot and decrements nr_child, never clears the bit),
+		 * so position 0 can be a hole while the one child @nr_child
+		 * counts sits further on.  The pointer is the source of truth.
+		 */
+		unsigned int i, pc = ft_popcount_node_get_nr_child(type, node);
+
+		single_child = NULL;
+		byte = 0;
+		for (i = 0; i < pc && !single_child; i++)
+			ft_popcount_node_get_ith_pos(type, node, (uint8_t) i,
+				&byte, &single_child);
 		break;
+	}
 	case FT_PIGEON:
 	{
 		unsigned int i;
