@@ -18773,6 +18773,17 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	if (ft_flip_txn_holds(t, meta)) {
 		return;
 	}
+#ifndef FT_DEBUG_VALIDATE_WHEN_COVERED
+	/*
+	 * ...and when the op's lock covers the word without naming it: at
+	 * ROOT-ONLY a txn holding the root's word excludes every writer of
+	 * every word (ft_flip_txn_owns' root arm), and under trie-wide
+	 * exclusion there is no peer to retire the node at all.  Per-node keeps
+	 * the guard: there no lock in {C,P,(GP)} reaches the installed node.
+	 */
+	if (ft_flip_txn_owns(t, meta) || ft_flip_txn_excludes_all(t, ft))
+		return;
+#endif
 	/*
 	 * ☠ AND SKIP IT WHEN THIS COMMIT ALREADY WRITES THAT WORD, which the
 	 * hold test above cannot tell you.
@@ -23799,6 +23810,22 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 			 * 0x80008, and the retry loop allocated until killed.
 			 */
 			&& !ft_flip_txn_holds(txn, meta)
+#endif
+#ifndef FT_DEBUG_VALIDATE_WHEN_COVERED
+			/*
+			 * ...and a word the op's lock covers without naming it:
+			 * at ROOT-ONLY every word anchors on the root's, so a txn
+			 * holding that word excludes every writer of this child's
+			 * (ft_flip_txn_owns' root arm), and under trie-wide
+			 * exclusion there is no peer at all.  The per-node validate
+			 * stays: it is the defence against a child retired while
+			 * still linked (the forward-edge twin at
+			 * ft_flip_txn_guard_installed_child).  EXPONENTIAL stays
+			 * exact: its anchor comes from a dating a record helper
+			 * does not have.
+			 */
+			&& !ft_flip_txn_owns(txn, meta)
+			&& !ft_flip_txn_excludes_all(txn, ft)
 #endif
 			) {
 #ifdef FT_DEBUG_LIVE_VALIDATE
