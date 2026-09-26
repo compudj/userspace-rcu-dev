@@ -3856,16 +3856,25 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		if (cluster_leaf)
 			break;	/* child back-pointers set by mutator at publish */
 		/*
-		 * Fetch the parent's child slot for every non-external child
-		 * (internal, compressed, or skip): ft_set_parent records the
-		 * slot offset so the parent-pointer backtrack can recover it.
-		 * (Externals carry no metadata / offset.)  Test skip FIRST: a
-		 * SKIP_X flag carries its external child's low tag bits, so
-		 * ft_node_external() would misclassify it.
+		 * Fetch the parent's child slot for EVERY child: ft_set_parent
+		 * records a non-external child's slot offset so the
+		 * parent-pointer backtrack can recover it, and an EXTERNAL
+		 * head's parent word carries FT_PARENT_PREFIX_HEAD, which a
+		 * NULL slot answers "prefix" (ft_head_parent_word_slot).  A
+		 * head installed in a body slot is not a prefix head: skipping
+		 * the fetch for externals ("they carry no metadata / offset",
+		 * true before the bit) stamped every such head as one --
+		 * cds_ft_verify red on an EXCLUSIVE trie's split insert, the
+		 * only trie this in-place arm serves, and carried along by a
+		 * later merge_at of that trie (measured: {baaacc, bc}).
 		 */
+#ifndef FT_DEBUG_SETNTH_EXT_NOSLOT
+		ft_node_get_nth_skip(*node_flag, &slot_ptr, n, FT_PF_NONE);
+#else
 		if (ft_node_skip_compressed(child_node_flag) ||
 		    !ft_node_external(child_node_flag))
 			ft_node_get_nth_skip(*node_flag, &slot_ptr, n, FT_PF_NONE);
+#endif
 		ft_set_parent(ft, child_node_flag, *node_flag, slot_ptr);
 		break;
 	}
