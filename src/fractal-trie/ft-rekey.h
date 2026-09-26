@@ -7035,27 +7035,45 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * glue build, destroy the txn.  (prepare failure freed its own
 			 * invisible build + left glue clean.)
 			 */
-			/* NULL on the merge path: no COW */
-			ft_rekey_free_stop_prime(ft, s_top_prime);
-			/*
-			 * The graft ALWAYS relocates the attach node, and that copy
-			 * comes from ft_node_recompact -- NOT glue-tracked -- so the
-			 * ft_glue_abort below does not reach it.  Every other bail in
-			 * this function frees it; this one did not have to, because a
-			 * record-only NOSPLIT commit had NO failure path until the
-			 * re-parent acquire (ft-graft.h) gave it one.  An in-place
-			 * recompact leaves @dest == the LIVE node, which
-			 * @old_recompacted_node is exactly the flag for.
-			 */
-			if (gst_st.old_recompacted_node)
-				free_cds_ft_node_unpublished(ft,
-					ft_node_ptr(gst_st.dest));
 			ft_glue_abort(ft, &glue);
 	if (src_glue_live) {		/* merged cluster's src side */
 		ft_glue_abort(ft, &src_glue);
 		src_glue_live = false;
 	}
+			/*
+			 * ☠ S_top' IS FREED AFTER THE GLUE'S FENCES, NEVER BEFORE THEM.  The
+			 * build's ft_try_compress_chain can ABSORB the copy into the run it
+			 * lays and file it on @glue's free list FENCED -- a lock taken on
+			 * S_top' itself -- so ft_glue_abort's ft_glue_clear_fenced releases
+			 * that word.  Freeing first handed the chunk back to the arena and
+			 * the release then cleared a LOCK bit in freed memory: the rcu-debug
+			 * balance caught it as FT LOCK UNDERFLOW (take, arena reset, plain
+			 * release), and a recycled chunk would have lost a PEER's lock.  Any
+			 * bail after the absorb reaches it -- a peer refusing the store's
+			 * recompaction is enough.  The same rule the later bails state
+			 * for @gst_st.dest, below.
+			 */
+			/* NULL on the merge path: no COW */
+			ft_rekey_free_stop_prime(ft, s_top_prime);
 			ft_flip_txn_destroy(txn);
+			/*
+			 * The graft ALWAYS relocates the attach node, and that copy
+			 * comes from ft_node_recompact -- NOT glue-tracked -- so the
+			 * ft_glue_abort above does not reach it.  Every other bail in
+			 * this function frees it; this one did not have to, because a
+			 * record-only NOSPLIT commit had NO failure path until the
+			 * re-parent acquire (ft-graft.h) gave it one.  An in-place
+			 * recompact leaves @dest == the LIVE node, which
+			 * @old_recompacted_node is exactly the flag for.
+			 *
+			 * ☠ AND AFTER THE REGISTRY SWEEP, like every other bail: its
+			 * born-locked relocation fence is registered on @txn, and
+			 * ft_flip_txn_destroy releases it through the node's own
+			 * metadata -- freeing first released into a freed chunk.
+			 */
+			if (gst_st.old_recompacted_node)
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(gst_st.dest));
 			ret = -EIO;
 			goto sweep;
 		}
@@ -7529,13 +7547,14 @@ detach_bail:
 		 * already released every mark it took.
 		 */
 		pp_meta = NULL;		/* ft_glue_abort below is the single owner */
-		/* NULL on the merge path: no COW */
-		ft_rekey_free_stop_prime(ft, s_top_prime);
 		ft_glue_abort(ft, &glue);
 		if (src_glue_live) {	/* merged cluster's src side */
 			ft_glue_abort(ft, &src_glue);
 			src_glue_live = false;
 		}
+		/* NULL on the merge path: no COW.  AFTER the glue's fences:
+		 * see the store bail's ☠ S_top' note. */
+		ft_rekey_free_stop_prime(ft, s_top_prime);
 		ft_flip_txn_destroy(txn);
 		/*
 		 * ☠ FREE AFTER THE REGISTRY SWEEP, NEVER BEFORE IT.
@@ -7670,7 +7689,6 @@ detach_bail:
 			}
 			if (iret) {
 				pp_meta = NULL;	/* ft_glue_abort: single owner */
-				ft_rekey_free_stop_prime(ft, s_top_prime);
 				if (detach_rc.new_flag)
 					free_cds_ft_node_unpublished(ft,
 						ft_node_ptr(detach_rc.new_flag));
@@ -7681,6 +7699,9 @@ detach_bail:
 					ft_glue_abort(ft, &src_glue);
 					src_glue_live = false;
 				}
+				/* NULL on the merge path: no COW.  AFTER the glue's fences:
+				 * see the store bail's ☠ S_top' note. */
+				ft_rekey_free_stop_prime(ft, s_top_prime);
 				ft_flip_txn_destroy(txn);
 				/*
 				 * ☠ FREE AFTER THE REGISTRY SWEEP, NEVER BEFORE IT.
@@ -7720,8 +7741,6 @@ detach_bail:
 		if (src_pred == ft_ord_or_sentinel(ft, run_dpred) ||
 				src_succ == ft_ord_or_sentinel(ft, run_dsucc)) {
 			pp_meta = NULL;		/* ft_glue_abort: single owner */
-			/* NULL on the merge path: no COW */
-			ft_rekey_free_stop_prime(ft, s_top_prime);
 			if (detach_rc.new_flag)
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(detach_rc.new_flag));
@@ -7732,6 +7751,9 @@ detach_bail:
 				ft_glue_abort(ft, &src_glue);
 				src_glue_live = false;
 			}
+			/* NULL on the merge path: no COW.  AFTER the glue's fences:
+			 * see the store bail's ☠ S_top' note. */
+			ft_rekey_free_stop_prime(ft, s_top_prime);
 			ft_flip_txn_destroy(txn);
 			/*
 			 * ☠ FREE AFTER THE REGISTRY SWEEP, NEVER BEFORE IT.
@@ -7836,8 +7858,6 @@ cells_done:
 			 * bail_build's own clear cannot double up.
 			 */
 			pp_meta = NULL;
-			/* NULL on the merge path: no COW */
-			ft_rekey_free_stop_prime(ft, s_top_prime);
 			if (detach_rc.new_flag)
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(detach_rc.new_flag));
@@ -7848,6 +7868,9 @@ cells_done:
 				ft_glue_abort(ft, &src_glue);
 				src_glue_live = false;
 			}
+			/* NULL on the merge path: no COW.  AFTER the glue's fences:
+			 * see the store bail's ☠ S_top' note. */
+			ft_rekey_free_stop_prime(ft, s_top_prime);
 			ft_flip_txn_destroy(txn);
 			ret = -EAGAIN;
 			goto sweep;
@@ -8214,8 +8237,6 @@ cells_done:
 		 * tombstones rolled back), so they are NOT freed here.  Unreachable under
 		 * the single-writer contract, kept leak-free for future concurrent use.
 		 */
-		/* NULL on the merge path: no COW */
-		ft_rekey_free_stop_prime(ft, s_top_prime);
 		if (gst_st.old_recompacted_node)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 		if (detach_rc.new_flag)
@@ -8226,6 +8247,9 @@ cells_done:
 				ft_glue_abort(ft, &src_glue);
 				src_glue_live = false;
 			}
+		/* NULL on the merge path: no COW.  AFTER the glue's fences:
+		 * see the store bail's ☠ S_top' note. */
+		ft_rekey_free_stop_prime(ft, s_top_prime);
 		ret = -EAGAIN;
 	}
 	ft_glue_fini(&glue);
@@ -8246,8 +8270,6 @@ cells_bail:
 	 * registry sweep BEFORE @gst_st.dest is freed.
 	 */
 	pp_meta = NULL;		/* ft_glue_abort: single owner */
-	/* NULL on the merge path: no COW */
-	ft_rekey_free_stop_prime(ft, s_top_prime);
 	if (detach_rc.new_flag)
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(detach_rc.new_flag));
 	ft_rekey_collapse_free_unpublished(ft, &detach_rc.collapse);
@@ -8256,6 +8278,9 @@ cells_bail:
 		ft_glue_abort(ft, &src_glue);
 		src_glue_live = false;
 	}
+	/* NULL on the merge path: no COW.  AFTER the glue's fences:
+	 * see the store bail's ☠ S_top' note. */
+	ft_rekey_free_stop_prime(ft, s_top_prime);
 	ft_flip_txn_destroy(txn);
 	if (gst_st.old_recompacted_node)
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
@@ -8284,8 +8309,6 @@ bail_build:
 	 * Disown and let the choke point do it.
 	 */
 	pp_meta = NULL;
-	/* NULL on the merge path: no COW */
-	ft_rekey_free_stop_prime(ft, s_top_prime);
 	/*
 	 * REACHED AFTER THE DETACH TOO -- the mark-release reserve loop bails here
 	 * -- so this label owes the same unpublished copies the post-detach @sweep
@@ -8303,6 +8326,9 @@ bail_build:
 				ft_glue_abort(ft, &src_glue);
 				src_glue_live = false;
 			}
+	/* NULL on the merge path: no COW.  AFTER the glue's fences:
+	 * see the store bail's ☠ S_top' note. */
+	ft_rekey_free_stop_prime(ft, s_top_prime);
 	ft_flip_txn_destroy(txn);
 	/*
 	 * @gst_st.dest was LEAKED here: this bail is reachable with a relocated
