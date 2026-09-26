@@ -10312,7 +10312,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * skip builds.
 		 */
 		{
-			bool prefix_fused = false;
+			bool prefix_fused = false, fused_declined = false;
 			/*
 			 * The DERIVATION both arms below freeze against, taken
 			 * once: ft_hlist_freeze_chain_prepare treats it as a
@@ -10393,8 +10393,10 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				} else if (cret < 0) {
 					ret = cret;
 					prefix_fused = true;
+				} else {
+					/* Merge out of bound -- fall back to plain clear. */
+					fused_declined = true;
 				}
-				/* cret > 0: merge out of bound -- fall back to plain clear. */
 			}
 #endif
 			if (!prefix_fused) {
@@ -10455,6 +10457,37 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					*need_retry = true;
 					return CDS_FT_STATUS_OK;
 				}
+#if defined(FEATURE_FT_SKIP_COMPRESSED) && !defined(FT_DEBUG_RA_CLEAR_RESIDUE)
+				/*
+				 * THE PLAIN CLEAR MUST NOT STRAND ITS HOLDER -- the
+				 * remove twin of this check (_cds_ft_remove_locked).
+				 * This arm was chosen from an UNHELD read: the holder
+				 * had more than one child, so clearing its key left a
+				 * legal node.  A peer that removed a child before the
+				 * lock above changes the answer, and the clear would
+				 * leave a 1-child keyless internal skip mode refuses;
+				 * the post-prune below is a separate commit that can
+				 * lose to a peer and leave it.  The holder is held and
+				 * nothing is recorded yet: re-plan, and the retry
+				 * reads one child and takes the fused collapse.  Not
+				 * where the fused collapse itself declined (out of
+				 * bound): the retry would decline again.
+				 */
+				if (!fused_declined &&
+				    ft_group_skip_compressed(ft->group) &&
+				    ft_meta_nr_child_load(holder_meta) == 1 &&
+				    ft_parent_node(holder_meta->parent_word) != NULL) {
+					ft_flip_txn_destroy(txn);
+					if (unsplice_txn)
+						ft_flip_txn_destroy(unsplice_txn);
+					*result_node = NULL;
+					FT_DBG_RETRY_SITE();
+					*need_retry = true;
+					return CDS_FT_STATUS_OK;
+				}
+#else
+				(void) fused_declined;
+#endif
 				ft_flip_txn_record_count_parent(ft, txn,
 					holder_flag, -1);
 				/*
