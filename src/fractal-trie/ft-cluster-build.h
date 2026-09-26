@@ -348,7 +348,7 @@ struct cds_ft_inode_flag *ft_compress_single_child_if_needed(struct cds_ft *ft,
 		single_cn = ft_compressed_node_ptr(single_child);
 	if (single_cn) {
 		single_len = single_cn->len;
-		if (1U + single_len > FT_SKIP_LEN_MAX) {
+		if (1U + single_len > FT_CN_LEN_MAX) {
 			/* Overflow: leave un-canonicalized. */
 			return child;
 		}
@@ -461,9 +461,8 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	 * Absorb the child's path bytes into the outer cn so the
 	 * result is a single compressed spanning
 	 * (key[level..key_len-1] ++ child_cn->key_bytes) ->
-	 * child_cn->child.  Bounded by FT_SKIP_LEN_MAX; on overflow,
-	 * fall back to the un-merged form (rare; the residue may be
-	 * cleaned up by a subsequent mutation).
+	 * child_cn->child.  Bounded by FT_CN_LEN_MAX, which a key of
+	 * FT_MAX_KEY_LEN bytes cannot exceed below the root.
 	 */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	if (ft_node_skip_compressed(child))
@@ -475,19 +474,16 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	if (child_cn) {
 		child_len = child_cn->len;
 		/*
-		 * Cap the fused path at what one compressed node can hold.  Under
-		 * skip-compressed the merged node must also stay skip-encodable, so
-		 * the cap is FT_SKIP_LEN_MAX.  Without skip-compression (notably
-		 * 32-bit, where FT_SKIP_LEN_MAX is 0) the node is a plain compressed
-		 * and the only limit is its uint8_t len field -- cap at UINT8_MAX.
-		 * Using FT_SKIP_LEN_MAX unconditionally would never fuse there and
-		 * leave two adjacent compresseds, violating the invariant.
+		 * Cap the fused path at what one compressed node can hold: its
+		 * uint8_t len field (FT_CN_LEN_MAX), with or without
+		 * skip-compression.  The merged node need NOT stay skip-encodable
+		 * -- ft_publish_compressed publishes a longer run through a plain
+		 * compressed flag -- and capping at FT_SKIP_LEN_MAX left two
+		 * adjacent compresseds for every longer run (cds_ft_graft and
+		 * cds_ft_graft_swap on keys of up to 250 bytes), the invariant this
+		 * fuse exists to keep.
 		 */
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-		if ((unsigned int) path_len + child_len > FT_SKIP_LEN_MAX) {
-#else
-		if ((unsigned int) path_len + child_len > UINT8_MAX) {
-#endif
+		if ((unsigned int) path_len + child_len > FT_CN_LEN_MAX) {
 			/* Overflow: leave adjacency in place. */
 			child_cn = NULL;
 			child_len = 0;

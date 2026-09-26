@@ -295,6 +295,21 @@
 # define FT_SKIP_LEN_BITS	8
 #endif
 
+/*
+ * The longest run ONE compressed node can spell: its 8-bit len.  A run past
+ * FT_SKIP_LEN_MAX is not unspellable -- ft_publish_compressed publishes it
+ * through a PLAIN compressed flag, which is the shape cds_ft_insert builds for
+ * a long unique suffix and cds_ft_verify accepts.  A site that FUSES runs caps
+ * the fused length at this, never at FT_SKIP_LEN_MAX: declining there leaves
+ * the one-child internal or the adjacent compresseds the fuse exists to
+ * remove.  -DFT_DEBUG_OVERLONG_BULK_CAP restores the old cap (red control).
+ */
+#ifndef FT_DEBUG_OVERLONG_BULK_CAP
+# define FT_CN_LEN_MAX		UINT8_MAX
+#else
+# define FT_CN_LEN_MAX		FT_SKIP_LEN_MAX
+#endif
+
 #ifdef FT_SKIP_LEN_BITS
 # define FT_SKIP_LEN_MAX	((1U << FT_SKIP_LEN_BITS) - 1)
 # define FT_SKIP_LEN_MASK	(((unsigned long) FT_SKIP_LEN_MAX) << FT_SKIP_LEN_SHIFT)

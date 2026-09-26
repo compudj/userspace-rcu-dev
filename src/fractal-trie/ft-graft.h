@@ -3998,12 +3998,18 @@ retry_swap:
 				if (pcn) FT_GS_PROBE_INC(cds_ft_probe_gs_fuse_pcn);
 				if (ccn) FT_GS_PROBE_INC(cds_ft_probe_gs_fuse_ccn);
 				if (pcn && ccn && (unsigned int) pcn->len + ccn->len
-						<= FT_SKIP_LEN_MAX)
+						<= FT_CN_LEN_MAX)
 					FT_GS_PROBE_INC(cds_ft_probe_gs_fuse_len);
 			}
 #endif
+			/*
+			 * Fuse up to what one compressed node can spell, not up to
+			 * a skip pointer's run: the publish below takes a plain
+			 * compressed flag for a longer run, and NOT fusing leaves
+			 * @ccn hung directly under @pcn -- two adjacent compresseds.
+			 */
 			if (pcn && ccn &&
-			    (unsigned int) pcn->len + ccn->len <= FT_SKIP_LEN_MAX) {
+			    (unsigned int) pcn->len + ccn->len <= FT_CN_LEN_MAX) {
 				struct cds_ft_metadata *pcn_meta =
 					cds_ft_item_to_metadata((struct cds_ft_inode *) pcn);
 				unsigned int merged_len = pcn->len + ccn->len;
