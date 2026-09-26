@@ -343,8 +343,9 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 
 /*
  * The lock-set granularity a group takes when the caller chose none:
- * CDS_FT_LOCK_SPACING env override ("per-node" / "exponential" / "root-only"),
- * else per-node.  An explicit cds_ft_group_attr_set_lock_spacing always wins --
+ * CDS_FT_LOCK_SPACING env override ("per-node" / "exponential" / "root-only";
+ * the last two only in a build carrying their own feature macro, else the knob
+ * ABORTS), else per-node.  An explicit cds_ft_group_attr_set_lock_spacing always wins --
  * this moves the DEFAULT only, so a test run can sweep the granularity axis
  * across a whole suite without every group-create site growing a knob.
  *
@@ -368,8 +369,18 @@ enum cds_ft_lock_spacing ft_lock_spacing_default(void)
 	const char *env = getenv("CDS_FT_LOCK_SPACING");
 
 	if (env) {
-		if (!strcmp(env, "exponential"))
+		if (!strcmp(env, "exponential")) {
+#ifdef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
 			return CDS_FT_LOCK_SPACING_EXPONENTIAL;
+#else
+			/* LOUD, NOT SILENT: see root-only below. */
+			fprintf(stderr, "[Fatal] Fractal Trie: CDS_FT_LOCK_SPACING="
+				"exponential requested, but this build has no "
+				"-DFEATURE_FT_LOCK_SPACING_EXPONENTIAL (an "
+				"experimental axis)\n");
+			abort();
+#endif
+		}
 		if (!strcmp(env, "root-only")) {
 #ifdef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
 			return CDS_FT_LOCK_SPACING_ROOT_ONLY;
@@ -422,11 +433,13 @@ enum cds_ft_status cds_ft_group_attr_set_lock_spacing(
 		 * quietly, since a mostly single-writer suite still passes.
 		 * Refuse it rather than ship a selectable config that is wrong.
 		 *
-		 * FEATURE_FT_ANCHOR_VALIDATE keeps the setting reachable for the
-		 * development sweep: it is not a shippable configuration, and
-		 * without it the anchor table has no test config at all.
+		 * EXPERIMENTAL, gated on its OWN macro like root-only -- no longer
+		 * on FEATURE_FT_ANCHOR_VALIDATE, which used to make it settable as
+		 * a side effect.  It is not a shippable configuration; the gate's
+		 * spacing sweeps define the macro explicitly.  See the enumerator's
+		 * comment in the public header.
 		 */
-#ifndef FEATURE_FT_ANCHOR_VALIDATE
+#ifndef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 #else
 		break;

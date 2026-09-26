@@ -3509,7 +3509,9 @@ static int test_lifecycle_lock_spacing(void)
 		 * FEATURE_FT_ANCHOR_COMPLETE claims they WORK.
 		 */
 #ifdef FEATURE_FT_ANCHOR_COMPLETE
+# ifdef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
 		CDS_FT_LOCK_SPACING_EXPONENTIAL,
+# endif
 # ifdef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
 		CDS_FT_LOCK_SPACING_ROOT_ONLY,
 # endif
@@ -3554,16 +3556,17 @@ static int test_lifecycle_lock_spacing(void)
 			return -1;
 		}
 #endif
-#ifndef FEATURE_FT_ANCHOR_VALIDATE
+#ifndef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
 		/*
-		 * Anchoring is all-or-nothing, so a spacing coarser than per-node
-		 * is refused until every acquire site maps through the anchor.
+		 * Exponential is EXPERIMENTAL: without its build gate the
+		 * enumerator does not exist either, so this names the reserved
+		 * VALUE, as the root-only check above does.
 		 */
 		if (cds_ft_group_attr_set_lock_spacing(attr,
-				CDS_FT_LOCK_SPACING_EXPONENTIAL)
+				(enum cds_ft_lock_spacing) 2)
 					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
-			fprintf(stderr, "coarser-than-per-node spacing was accepted "
-				"while the conversion is incomplete\n");
+			fprintf(stderr, "exponential spacing was accepted by a build "
+				"without -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL\n");
 			cds_ft_group_attr_destroy(attr);
 			return -1;
 		}

@@ -3341,17 +3341,30 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
  *
  * CDS_FT_LOCK_SPACING_PER_NODE (the DEFAULT): a writer locks exactly the nodes
  *   it mutates -- maximum writer parallelism, widest acquire.
- * CDS_FT_LOCK_SPACING_EXPONENTIAL: lock levels at key-byte depths 0, 1, 2, 4,
- *   8, ... -- dense near the root, where one lock covers a subtree that may be
- *   half the trie, and sparse deeper, where a subtree is small enough that a
- *   lock spanning many levels excludes little.
+ * CDS_FT_LOCK_SPACING_EXPONENTIAL (EXPERIMENTAL, declared only with
+ *   -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL): lock levels at key-byte depths 0,
+ *   1, 2, 4, 8, ... -- dense near the root, where one lock covers a subtree that
+ *   may be half the trie, and sparse deeper, where a subtree is small enough
+ *   that a lock spanning many levels excludes little.
  * CDS_FT_LOCK_SPACING_ROOT_ONLY: the root is the only lock level, so every
  *   writer serializes on it.  This is the granularity axis meeting
  *   CDS_FT_WRITER_LOCK_COARSE from the other side: one lock per trie.
  */
 enum cds_ft_lock_spacing {
 	CDS_FT_LOCK_SPACING_PER_NODE = 1,
+#ifdef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
+	/*
+	 * EXPERIMENTAL, NOT PUBLIC API.  Its intended payoff is a bulk op taking
+	 * fewer locks along a deep path, and today's bulk ops take none: they
+	 * serialize on the FT-wide lock and flip point writers onto it.  For
+	 * point ops alone it measured SLOWER than per-node at every writer count
+	 * (DNS multi-writer bench, 2026-09-24), and it is the one spacing whose
+	 * lock word is derived from the node's DEPTH through an anchor ancestor
+	 * that a reshape can replace -- a defect class of its own.  Kept, behind
+	 * its own build gate, for a finer bulk-locking design to evaluate.
+	 */
 	CDS_FT_LOCK_SPACING_EXPONENTIAL = 2,
+#endif
 #ifdef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
 	/*
 	 * NOT PUBLIC API.  Root-only is the development axis that drives every
@@ -3367,7 +3380,10 @@ enum cds_ft_lock_spacing {
 	 */
 	CDS_FT_LOCK_SPACING_ROOT_ONLY = 3,
 #endif
-	/* The value 3 is RESERVED for the development-only root-only axis. */
+	/*
+	 * The value 2 is RESERVED for the experimental exponential axis, and 3
+	 * for the development-only root-only axis.
+	 */
 };
 
 /*
@@ -3380,16 +3396,16 @@ enum cds_ft_lock_spacing {
  * workload-shaped -- it depends on trie depth, key distribution and how
  * disjoint the writers are -- so it is a knob rather than a fixed schedule.
  *
- * Anchoring is ALL-OR-NOTHING: two ops mutating one node must acquire the SAME
- * word, so a spacing coarser than per-node is correct only once every acquire
- * site maps its members through the anchor.  Until then
- * CDS_FT_LOCK_SPACING_EXPONENTIAL is REFUSED with
- * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR, rather than offered as a setting that
- * silently excludes nothing.
- *
- * The value 3 (root-only) is a development axis, not a setting: it is refused
- * unless the library was built with -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY, and
- * its enumerator is not even declared without it.
+ * The value 2 (exponential) is EXPERIMENTAL: it is refused unless the library
+ * was built with -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL, and its enumerator is
+ * not even declared without it.  Experimental means UNCERTIFIED, not just
+ * unsupported: anchoring is ALL-OR-NOTHING -- two ops mutating one node must
+ * acquire the SAME word, so a spacing coarser than per-node is correct only
+ * once every acquire site maps its members through the anchor -- and that
+ * conversion has not been signed off
+ * (doc/design/mw-to-fine-locking-remainder.md, E.5).  The value 3 (root-only)
+ * is a development axis, not a setting, gated the same way on
+ * -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY.
  */
 enum cds_ft_status cds_ft_group_attr_set_lock_spacing(
 		struct cds_ft_group_attr *attr,

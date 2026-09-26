@@ -44,6 +44,8 @@
 #              -b $HOME/.cache/ft-parallel-gate/anchorval
 #   -t SUITE   inv (default) | unit
 #   -s SPACING per-node (default) | exponential | root-only
+#              (exponential / root-only need a build with
+#              -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL / _ROOT_ONLY)
 #   -f FILTER  test-name filter, passed as argv[1] to the suite (both
 #              suites take one); default runs everything
 #   -n N       iterations (default 48)

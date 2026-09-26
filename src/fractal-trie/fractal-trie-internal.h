@@ -136,6 +136,10 @@
  */
 #ifndef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
 # define CDS_FT_LOCK_SPACING_ROOT_ONLY	((enum cds_ft_lock_spacing) 3)
+#endif
+/* ...and the same for the experimental exponential axis (the value 2). */
+#ifndef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
+# define CDS_FT_LOCK_SPACING_EXPONENTIAL	((enum cds_ft_lock_spacing) 2)
 #endif	/* enum cds_ft_numa_policy, cds_ft_optimize */
 #include <assert.h>
 

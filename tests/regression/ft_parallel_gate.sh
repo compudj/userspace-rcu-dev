@@ -200,7 +200,7 @@ ALL_CONFIGS=(
 	# peer can park in it; root-only serialises every op on one word; only
 	# coarsening-to-an-ancestor leaves the slot open.  A defect can live in
 	# the MIDDLE of this axis, so testing its two ends proves nothing about it.
-	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_SETTLE -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw sp|per-node exponential root-only"
+	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_SETTLE -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL|u ion ioff imw sp|per-node exponential root-only"
 	# The FT's own resolved-pointer assertion (ft_assert_resolved): a parked
 	# flip proxy handed to an accessor that requires a resolved flag.  It is
 	# the embedder-side counterpart to txndbg's engine-side DEBUG_RCU, and it
@@ -218,7 +218,7 @@ ALL_CONFIGS=(
 	# 10 without skip-compression and never with it.
 	# Swept for the same reason txndbg is: this is the embedder-side detector
 	# for the same class, so it is blind to the same spacings.
-	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw|per-node exponential root-only"
+	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL|u ion ioff imw|per-node exponential root-only"
 	# Phase E.3's certification config: the self-collision ledger
 	# (FEATURE_FT_HOLD_TRACE) armed across the spacing sweep.  A collision
 	# aborts (ft_hold_trace_refused), so a red here is a leg abort, not a
@@ -232,7 +232,7 @@ ALL_CONFIGS=(
 	# ever collapse onto one word.  Its abort IS the failure signal -- a
 	# violation kills the leg rather than printing a line a grep must
 	# find.
-	"holdtrace|-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw|per-node exponential root-only"
+	"holdtrace|-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL|u ion ioff imw|per-node exponential root-only"
 	# ★ THE CONFIG THAT ACTUALLY CATCHES THE RAW-READ CLASS.
 	#
 	# txndbg above arms the same engine assert and NEVER FIRES IT: with
@@ -260,7 +260,7 @@ ALL_CONFIGS=(
 	# ★ The rate is ~1-4%, so ONE run of this config proves nothing -- it is
 	# here to be run with FT_GATE_REPEAT when hunting, and the 3-spacing sweep
 	# is mandatory because the defect it was built from is exponential-only.
-	"anchorval|-DDEBUG_RCU -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw|per-node exponential root-only"
+	"anchorval|-DDEBUG_RCU -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL|u ion ioff imw|per-node exponential root-only"
 	# ★ THE PROBE-FREE COARSE-SPACING LEG -- Phase E.5's missing control.
 	#
 	# Every other config that sweeps the spacing axis (txndbg, proxyassert,
@@ -292,7 +292,7 @@ ALL_CONFIGS=(
 	# run the all-MW content path -- sound, and stricter, but NOT the engine
 	# Phase B built.  Reading a green here as "E.5 is clear" would be reading a
 	# control as a result.
-	"spacingenv|-DFEATURE_FT_LOCK_SPACING_ENV -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw|per-node exponential root-only"
+	"spacingenv|-DFEATURE_FT_LOCK_SPACING_ENV -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL|u ion ioff imw|per-node exponential root-only"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	# ★ THE DUPLICATE CHAIN'"'"'S MW ABLATION.  cds_ft_node.next/.prev park SW by
 	# default; this builds the MW arm back.  It is here so the arm cannot ROT:
@@ -708,6 +708,18 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 		*FEATURE_FT_LOCK_SPACING_ROOT_ONLY*) ;;
 		*)
 			echo "$name: CONFIG ERROR (sweeps root-only but its flags lack -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -- the env knob aborts by design)" >> "$GATE/$name.result"
+			return ;;
+		esac ;;
+	esac
+	# ★ SAME FOR EXPONENTIAL since it was demoted to an experimental axis: the
+	# enumerator is declared only under -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL
+	# and the env knob aborts without it.
+	case " $spacings " in
+	*" exponential "*)
+		case "$flags" in
+		*FEATURE_FT_LOCK_SPACING_EXPONENTIAL*) ;;
+		*)
+			echo "$name: CONFIG ERROR (sweeps exponential but its flags lack -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL -- the env knob aborts by design)" >> "$GATE/$name.result"
 			return ;;
 		esac ;;
 	esac
