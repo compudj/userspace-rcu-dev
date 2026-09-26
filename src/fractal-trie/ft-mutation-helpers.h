@@ -7589,6 +7589,50 @@ bool ft_flip_txn_owns(const struct ft_flip_txn *t,
 	return false;
 }
 
+/*
+ * May a record on @meta's STATE WORD be parked SW -- i.e. does this commit hold
+ * THAT WORD, not merely @meta's lock?
+ *
+ * A state word is two things: @meta's content (nr_child, TOMBSTONE), which the
+ * holder of @meta's lock writes, and a LOCK BIT, which any op whose member
+ * ANCHORS on @meta takes by CAS.  An SW park is a plain store, sound only when
+ * every writer of the word is excluded -- so where the two exclusion domains
+ * differ, holding @meta's lock is not enough: a peer that took the word for a
+ * member anchored on @meta is not excluded by it, and the park erases that
+ * peer's LOCK bit (its release then asserts on a word no writer accounts for).
+ * The anchored retire already asks this question
+ * (ft_flip_txn_record_retire_anchored_arms); the count records did not.
+ *
+ *   PER-NODE: a node's lock IS its word -- ft_flip_txn_owns is exact.
+ *   ROOT-ONLY: only the root's word is ever taken, so no other state word
+ *     carries a LOCK bit to erase -- ft_flip_txn_owns, root shortcut included.
+ *   EXPONENTIAL: @meta's lock may be an ANCESTOR's word while @meta's own word
+ *     is an anchor for deeper members -- or, dated differently by a peer's
+ *     descent, @meta's own lock -- so only the exact word held counts.
+ *     MEASURED (insert tier, exponential, inv_prefix_shape_zoo, FT_DEBUG_SLOT_
+ *     HIST): an in-place insert holding the anchor parked {0x4 -> 0x8} on a
+ *     word a peer had just taken; the peer's release found 0x8 -- FT BAD
+ *     RELEASE, 5/6 runs.
+ *
+ * A miss makes the record MW: the live value is its expected old, so a peer
+ * holding the word fails the install and the op re-derives.
+ */
+static inline
+bool ft_flip_txn_owns_state_word(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *meta)
+{
+	unsigned int i;
+
+	if (!t->ft || t->ft->lock_spacing != CDS_FT_LOCK_SPACING_EXPONENTIAL)
+		return ft_flip_txn_owns(t, meta);
+	if (!meta)
+		return false;
+	for (i = 0; i < t->nr_locks; i++)
+		if (t->locks[i].meta == meta)
+			return true;
+	return false;
+}
+
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_lock_countdown;
 #endif
@@ -15473,6 +15517,14 @@ void ft_flip_txn_record_nr_child_inc(struct ft_flip_txn *t,
 	uintptr_t live = old & ~(uintptr_t) (FT_STATE_TOMBSTONE | FT_STATE_LOCK);
 
 	assert(ft_state_nr_child(live) < FT_STATE_NR_CHILD_VALMASK);
+#ifndef FT_DEBUG_COUNT_SW_ON_ANCHOR
+	/* SW only on a word this commit holds itself: see ft_flip_txn_owns_state_word. */
+	if (!ft_flip_txn_owns_state_word(t, meta)) {
+		ft_flip_txn_record_state_mw(t, meta,
+			(void *) live, (void *) (live + FT_STATE_NR_CHILD_ONE));
+		return;
+	}
+#endif
 	ft_flip_txn_record_state(t, meta,
 			(void *) live, (void *) (live + FT_STATE_NR_CHILD_ONE));
 }
@@ -19813,7 +19865,12 @@ int ft_remove_one_commit(struct cds_ft *ft,
 			 * (ft_sa_anchor_props: 481,980 of 481,980 exponential,
 			 * 2,084,317 of 2,084,321 root-only, 4 undatable).
 			 */
+			/* The exact word, not the anchor: ft_flip_txn_owns_state_word. */
+#ifndef FT_DEBUG_COUNT_SW_ON_ANCHOR
+			if (ft_flip_txn_owns_state_word(txn, state_meta)) {
+#else
 			if (ft_flip_txn_owns(txn, state_meta)) {
+#endif
 				ft_flip_txn_record_state(txn, state_meta,
 					(void *) live,
 					(void *) (live - FT_STATE_NR_CHILD_ONE));
