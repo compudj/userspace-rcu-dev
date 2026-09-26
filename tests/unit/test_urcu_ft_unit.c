@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 338 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 339 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,10 +79,13 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (401 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (402 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (350 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (351 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
+
+/* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
+#define FT_TEST_OVL_MAX	256
 
 /* ------------------------------------------------------------------ */
 /* Test-node infrastructure (mirrors test_urcu_ft.h).                 */
@@ -34084,6 +34087,138 @@ out:
 	return ret;
 }
 
+/*
+ * A junction that collapses into a run LONGER than a skip pointer can encode
+ * (FT_SKIP_LEN_MAX, 127 bytes on x86-64) must still collapse -- into the one
+ * compressed node cds_ft_insert builds for the same keys, published through a
+ * plain compressed flag.  The fused collapse used to decline such a merge and
+ * fall back to ft_node_replace_ptr, which left the junction a one-child
+ * keyless internal skip mode forbids: {ab, a+128*'c'}, remove "ab", and
+ * cds_ft_verify refused the trie (127 bytes: clean).  Every remove flavour
+ * that ends in the collapse, on each side of the bound, then the re-insert
+ * that splits the long run again.
+ */
+static int ovl_find(struct cds_ft *ft, const uint8_t *k, size_t len,
+		struct cds_ft_node *want)
+{
+	struct cds_ft_node *out = NULL;
+
+	if (cds_ft_eager_lookup_key(ft, k, len, 0, &out) != CDS_FT_STATUS_OK)
+		out = NULL;
+	return out == want ? 0 : -1;
+}
+
+static int ovl_remove(struct cds_ft *ft, const uint8_t *k, size_t len,
+		struct ft_test_node *n, bool all)
+{
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *head = NULL;
+	int ret = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	cds_ft_iter_set_key(iter, k, len);
+	if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK ||
+	    cds_ft_iter_node(iter) != &n->node)
+		ret = -1;
+	else if (all ? cds_ft_remove_all(ft, iter, &head) != CDS_FT_STATUS_OK ||
+			head != &n->node :
+		       cds_ft_remove(ft, iter, &n->node) != CDS_FT_STATUS_OK)
+		ret = -1;
+	cds_ft_iter_destroy(iter);
+	if (!ret)
+		node_free_rcu(n);
+	return ret;
+}
+
+/*
+ * @kind 0: sibling leaf {P+b, P+c*run} remove P+b; 1: prefix key {P, P+c*run}
+ * remove P; 2: the same through cds_ft_remove_all.  @plen bytes of 'p' prefix
+ * put a compressed run ABOVE the junction too.
+ */
+static int ovl_case(struct cds_ft *ft, const char *tag, int kind,
+		unsigned int plen, unsigned int run)
+{
+	uint8_t kl[FT_TEST_OVL_MAX], ks[FT_TEST_OVL_MAX];
+	size_t ll = plen + 1 + run, sl = kind ? plen + 1 : plen + 2;
+	struct ft_test_node *nl = node_alloc(0), *ns = node_alloc(1);
+	int ret = 0;
+
+	memset(kl, 'p', plen);
+	kl[plen] = 'a';
+	memset(kl + plen + 1, 'c', run);
+	memcpy(ks, kl, plen + 1);
+	ks[plen + 1] = 'b';	/* only read when @kind == 0 */
+	rcu_read_lock();
+	if (cds_ft_insert(ft, kl, ll, &nl->node) != CDS_FT_STATUS_OK ||
+	    cds_ft_insert(ft, ks, sl, &ns->node) != CDS_FT_STATUS_OK)
+		abort();
+	if (ovl_remove(ft, ks, sl, ns, kind == 2)) {
+		diag("overlong_collapse %s kind %d plen %u run %u: remove failed",
+			tag, kind, plen, run);
+		ret = -1;
+	} else if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+		   ovl_find(ft, kl, ll, &nl->node) ||
+		   ovl_find(ft, ks, sl, NULL)) {
+		diag("overlong_collapse %s kind %d plen %u run %u: bad trie after the collapse",
+			tag, kind, plen, run);
+		cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
+		ret = -1;
+	}
+	/* Split the (possibly plain-published) long run again. */
+	ns = node_alloc(1);
+	if (ret || cds_ft_insert(ft, ks, sl, &ns->node) != CDS_FT_STATUS_OK) {
+		if (!ret)
+			diag("overlong_collapse %s kind %d plen %u run %u: re-insert failed",
+				tag, kind, plen, run);
+		node_free(ns);	/* never published */
+		ret = -1;
+	} else if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+		   ovl_find(ft, kl, ll, &nl->node) ||
+		   ovl_find(ft, ks, sl, &ns->node)) {
+		diag("overlong_collapse %s kind %d plen %u run %u: bad trie after the re-insert",
+			tag, kind, plen, run);
+		ret = -1;	/* published: the drain frees it */
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+static int test_overlong_collapse(void)
+{
+	static const unsigned int runs[] = { 125, 126, 127, 128, 200, 250 };
+	static const unsigned int plens[] = { 0, 100 };
+	int ret = 0, variant;
+
+	for (variant = 0; variant < 4; variant++) {
+		static const char *const tags[] = { "varlen", "speculative",
+			"rankstats-list", "rankstats-nolist" };
+		unsigned int r, p;
+		int kind;
+
+		for (kind = 0; kind < 3; kind++)
+		for (p = 0; p < 2; p++)
+		for (r = 0; r < 6; r++) {
+			struct cds_ft_group *group;
+			struct cds_ft *ft;
+
+			if (plens[p] + 1 + runs[r] > FT_TEST_OVL_MAX)
+				continue;
+			switch (variant) {
+			case 0: ft = create_varlen_ft(&group); break;
+			case 1: ft = create_skip_compressed_ft(&group); break;
+			case 2: ft = create_varlen_rankstats_list_ft(true, &group); break;
+			default: ft = create_varlen_rankstats_list_ft(false, &group); break;
+			}
+			if (ovl_case(ft, tags[variant], kind, plens[p], runs[r]))
+				ret = -1;
+			if (drain_and_destroy(ft, group) < 0)
+				ret = -1;
+		}
+	}
+	return ret;
+}
+
 static int test_walk_past_empty_internal(void)
 {
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -40497,6 +40632,7 @@ int main(int argc, char **argv)
 #endif
 
 	RUN_TEST(test_walk_past_empty_internal);
+	RUN_TEST(test_overlong_collapse);
 	RUN_TEST(test_walk_past_deep_empty_internal);
 	RUN_TEST(test_verify_disjoint_cross_trie);
 

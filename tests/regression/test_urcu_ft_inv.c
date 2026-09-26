@@ -83,7 +83,7 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(142 + NR_TESTS_REKEY_DLM)	/* +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+#define NR_TESTS	(143 + NR_TESTS_REKEY_DLM)	/* +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -14778,7 +14778,7 @@ static int inv_prefix_shape_zoo(void)
 #define OWNED_WRITERS_MAX	4
 #define OWNED_STABLE	200
 #define OWNED_CHURN	200
-#define OWNED_KEY_MAX	16
+#define OWNED_KEY_MAX	250	/* FT_INV_OWNED_MAXLEN reaches past a skip pointer's run */
 
 struct owned_key {
 	uint8_t b[OWNED_KEY_MAX];
@@ -15277,6 +15277,11 @@ static int owned_body(const char *name, unsigned int nwriters,
 	churn = (struct owned_key *) calloc(OWNED_CHURN, sizeof(*churn));
 	if (!stable || !churn)
 		abort();
+	if (getenv("FT_INV_OWNED_MAXLEN")) {
+		maxlen = (unsigned int) atoi(getenv("FT_INV_OWNED_MAXLEN"));
+		if (maxlen < 1 || maxlen > OWNED_KEY_MAX)
+			maxlen = OWNED_KEY_MAX;
+	}
 	owned_mkkeys(stable, OWNED_STABLE, NULL, 0, maxlen, &s);
 	owned_mkkeys(churn, OWNED_CHURN, stable, OWNED_STABLE, maxlen, &s);
 	owned_dbg_stable = stable;
@@ -15442,6 +15447,19 @@ static int inv_owned_prefix_dense_remove_all(void)
 {
 	return owned_body("inv_owned_prefix_dense_remove_all", 4, 16, true,
 		true);
+}
+
+/*
+ * The same owners with keys of up to 250 bytes: over a two-letter alphabet
+ * every key ends in a long unique run, so a junction that loses a branch
+ * collapses into a run longer than a skip pointer can encode.  The collapse
+ * used to decline that and leave a one-child keyless internal; measured
+ * before the fix, 72 of 72 runs (5 s, 2 ms windows, every spacing, remove and
+ * remove_all) failed, and writers wedged at exponential spacing.
+ */
+static int inv_owned_long_runs(void)
+{
+	return owned_body("inv_owned_long_runs", 4, 250, true, false);
 }
 
 /*
@@ -28963,6 +28981,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_owned_prefix_dense);
 	RUN_TEST(inv_owned_prefix_dense_replace);
 	RUN_TEST(inv_owned_prefix_dense_remove_all);
+	RUN_TEST(inv_owned_long_runs);
 	RUN_TEST(inv_ir_prefix_roundtrip);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
