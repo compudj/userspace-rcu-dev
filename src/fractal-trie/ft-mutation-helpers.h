@@ -19193,7 +19193,32 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		 * NULL, the append fails this MW edge's install CAS: ABORT, which
 		 * the caller routes to a re-derivation that promotes the successor
 		 * instead.  See ft_hlist_freeze_sole_prepare.
+		 *
+		 * ☞ HELD, THE CHECK MOVES UNDER THE LOCK AND THE EDGE PARKS.  The
+		 * chain is protected by its HOLDER's lock -- the node whose slot
+		 * names this sole entry, @slot_owner, the same owner the
+		 * structural edge's re-check above asks -- and every append takes
+		 * it.  So when the op owns it, no append can land from here to
+		 * the commit, and the one that landed between the unheld
+		 * derivation and the take is caught by re-reading @next under it:
+		 * anything but NULL retries, exactly as the MW install's ABORT
+		 * did.  The edge is then an SW record owned by the holder.
+		 * MEASURED before (FT_DEBUG_MW_KEPT, ft_inv MW): the largest
+		 * producer of committed CAS left on fine tries (39%).
+		 * -DFT_DEBUG_FREEZE_LEAF_MW keeps it MW.
 		 */
+#ifndef FT_DEBUG_FREEZE_LEAF_MW
+		if (txn && slot_owner && ft_flip_txn_owns(txn, slot_owner)) {
+			if (rcu_dereference(freeze_leaf->next) != NULL) {
+				ft_remove_take_refused(txn, record_only);
+				return -EAGAIN;
+			}
+			ft_flip_txn_record_tag(txn, slot_owner,
+				(void **) &freeze_leaf->next, NULL,
+				ft_hlist_set_mark(NULL), FT_HLIST_TAG);
+			goto freeze_done;
+		}
+#endif
 		edges[n].slot = (struct ft_ord_cell **) &freeze_leaf->next;
 		edges[n].owner_cell = NULL;	/* not a cell link */
 		edges[n].old_target = NULL;
@@ -19202,6 +19227,9 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		edges[n].tag = FT_HLIST_TAG;
 		n++;
 	}
+#ifndef FT_DEBUG_FREEZE_LEAF_MW
+freeze_done:
+#endif
 	/*
 	 * @state_meta non-NULL (a delete): fuse its nr_child-- into THIS flip so
 	 * the structural unlink and the count decrement go live atomically.  Only
