@@ -45,6 +45,10 @@
 #                and have measured the room.
 #   FT_GATE_J    make -j per config                 (default: cores/12,
 #                so nconfigs*J stays near the core count)
+#   FT_GATE_SLICE  systemd user slice every leg's memory cage is created
+#                under (default: none -- app.slice).  Give it a slice with a
+#                MemoryMax to bound the SUM of the legs, which the per-leg
+#                caps do not.
 #   FT_GATE_REPEAT    run each leg N times (default 1).  For hunting an
 #                INTERMITTENT: the two measured instances of the
 #                raw-read-of-a-parked-slot class fired at ~10% and ~8%,
@@ -479,6 +483,12 @@ FT_GATE_MEM_U=${FT_GATE_MEM_U:-16G}
 FT_GATE_MEM_INV=${FT_GATE_MEM_INV:-16G}
 FT_GATE_MEM_IMW=${FT_GATE_MEM_IMW:-24G}
 FT_GATE_MEM_SP=${FT_GATE_MEM_SP:-4G}
+# ☠ A PER-LEG CAP BOUNDS NO SUM, and wrapping the gate in an outer scope does
+# not bound it either: each leg's `systemd-run --scope` lands in the DEFAULT
+# slice (app.slice), not under the scope it was started from.  FT_GATE_SLICE
+# names a slice (e.g. ftgate.slice, with its own MemoryMax) that EVERY leg's
+# cage is created under, so the whole matrix shares one total cap.
+FT_GATE_SLICE=${FT_GATE_SLICE:-}
 
 # Probed, never assumed: a gate that silently ran uncaged would be exactly the
 # configuration that took the machine down, so say so loudly instead.
@@ -511,6 +521,7 @@ run_leg() {	# $1=cwd $2=timeout-secs $3=MemoryMax ; $4.. = the command
 	  # already reports legibly, instead of taking its 24 siblings with it.
 	  if [ "$CAGE" = 1 ]; then
 		timeout "$tmo" systemd-run --user --scope -q \
+			${FT_GATE_SLICE:+--slice="$FT_GATE_SLICE"} \
 			-p MemoryMax="$mem" -p MemorySwapMax=0 -- "$@" 2>&1
 	  else
 		timeout "$tmo" "$@" 2>&1
