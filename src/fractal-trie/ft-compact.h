@@ -655,9 +655,26 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 			*bail = -EAGAIN;
 			return old;
 		}
+		/*
+		 * ☞ NAMED BY ITS HOLDER.  The word belongs to the chain holder,
+		 * which @h took above, and @prev_old was read and re-validated
+		 * under that lock (it still names @old, no parked proxy).  So it
+		 * is the owned record: the per-record gate parks it when this txn
+		 * owns the holder, and a SHARED take (held through another frame,
+		 * not registered here) keeps it MW as before.  Unowned, it was
+		 * FT_DEBUG_MW_KEPT's largest ft_unit population (HEAD_BACK,
+		 * ~620k per run).  -DFT_DEBUG_COMPACT_CELL_UNOWNED keeps it MW.
+		 */
+#ifndef FT_DEBUG_COMPACT_CELL_UNOWNED
+		ft_flip_txn_record_head_back_edge_owned(t, (void **) &head->prev,
+			prev_old, (void *) ft_ord_cell_flag(new_cell),
+			ft_flag_to_metadata(ft, holder_nf)
+			FT_BE_SITE(FT_BE_COMPACT_CELL, ctx));
+#else
 		ft_flip_txn_record_head_back_edge(t, (void **) &head->prev,
 			prev_old, (void *) ft_ord_cell_flag(new_cell)
 			FT_BE_SITE(FT_BE_COMPACT_CELL, ctx));
+#endif
 		st = ft_flip_txn_commit(ft, t);
 		if (st != URCU_TXN_STATUS_OK) {
 			if (ft_debug_counters())
