@@ -2656,6 +2656,26 @@ int ft_node_recompact(enum ft_recompact mode,
 		goto abandon_fresh;
 	}
 skip_copy:
+	/*
+	 * ☞ THE SWEEP'S RECORDS ARE C'S WORDS, AND C IS HELD.  The child
+	 * re-parent sweep below records each child's back edge; for an
+	 * external head that word belongs to the parent whose slot names it
+	 * (FT-SLOT-3), i.e. to C, which the acquire above fenced.  But C is
+	 * REGISTERED on @retire_txn only after the sweep (its terminal, below),
+	 * so ft_flip_txn_owns answered no and every head back edge committed as
+	 * a CAS (FT_DEBUG_MW_KEPT: HEAD_BACK, ~310k per ft_unit run, the
+	 * compaction relocations).  COVER it here: owns() then answers yes and
+	 * nothing gains a release duty.  No bail follows this point (the
+	 * sweep is the point of no return), so a covered record always reaches
+	 * the commit, by which C is registered and held until the release after
+	 * it.  A SHARED take (held through another frame) is left uncovered,
+	 * as its registration below skips it.
+	 * -DFT_DEBUG_RECOMPACT_SWEEP_UNCOVERED keeps those records MW.
+	 */
+#ifndef FT_DEBUG_RECOMPACT_SWEEP_UNCOVERED
+	if (fenced && retire_txn && !c_held.shared)
+		ft_flip_txn_cover_member(retire_txn, c_held.lock);
+#endif
 
 #ifdef FT_DEBUG_DEL_TOMB
 	ft_dt_check_node("rc-after-copy", 0, new_type, new_node, new_metadata,
