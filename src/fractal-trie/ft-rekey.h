@@ -7787,6 +7787,24 @@ detach_bail:
 				free(iedges);
 				goto cells_bail;
 			}
+#ifndef FT_DEBUG_REKEY_KEEP_POS_VALIDATE
+			/*
+			 * The interleave's VALIDATE edges (old == new) guard
+			 * against a peer splicing in between; under trie-wide
+			 * exclusion there is none, and a validate stays a CAS
+			 * even there -- the keep-position arm's reason, the
+			 * same knob.  Its writes are kept, in order.
+			 */
+			if (ft_flip_txn_excludes_all(txn, ft)) {
+				unsigned int ii, io = 0;
+
+				for (ii = 0; ii < in; ii++)
+					if (iedges[ii].old_target !=
+							iedges[ii].new_target)
+						iedges[io++] = iedges[ii];
+				in = io;
+			}
+#endif
 			ft_ord_cell_record_into_ft(ft, txn, iedges, in);
 			free(iedges);
 			goto cells_done;
