@@ -2946,10 +2946,16 @@ struct ft_flip_txn {
 	 * On every other terminal nothing was applied, and the word's owner
 	 * releases it exactly as when the terminal was a record: the registry
 	 * (ft_flip_txn_lock_release_all), or the frame / glue sweep that asked
-	 * ft_lock_terminal_query.  Full, a release falls back to the record.
+	 * ft_lock_terminal_query.  It grows like @locks, and like @locks a growth
+	 * that cannot allocate STOPS: a release is staged on paths past the
+	 * point where the op can still unwind, so there is no fallback -- and
+	 * the SW engine could not take one (a lock word's release recorded in
+	 * the txn would need the late-last settle, an MCAS-engine feature).
 	 */
-	struct cds_ft_metadata *rel_after[FT_FLIP_TXN_FLOOR_LOCKS];
+	struct cds_ft_metadata **rel_after;	/* @rel_after_floor, or heap */
 	unsigned int nr_rel_after;
+	unsigned int cap_rel_after;
+	struct cds_ft_metadata *rel_after_floor[FT_FLIP_TXN_FLOOR_LOCKS];
 	/*
 	 * Set when a per-node lock acquire MISSED (see
 	 * ft_flip_txn_lock_or_guard_parent).  The op then structurally writes a
@@ -3714,6 +3720,8 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
 	t->nr_rel_after = 0;
+	t->rel_after = t->rel_after_floor;
+	t->cap_rel_after = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->sw_body = false;
 	/*
 	 * ☠ AND @sw_per_op, WHICH NOTHING USED TO SET.  Its only other writer is
@@ -3992,6 +4000,8 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
 	t->nr_rel_after = 0;
+	t->rel_after = t->rel_after_floor;
+	t->cap_rel_after = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->sw_body = false;
 	/*
 	 * ☠ AND @sw_per_op, WHICH NOTHING USED TO SET.  Its only other writer is
@@ -4103,6 +4113,8 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
 	t->nr_rel_after = 0;
+	t->rel_after = t->rel_after_floor;
+	t->cap_rel_after = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->sw_body = false;
 	/*
 	 * ☠ AND @sw_per_op, WHICH NOTHING USED TO SET.  Its only other writer is
@@ -6651,6 +6663,8 @@ void ft_flip_txn_free(struct ft_flip_txn *t)
 	FT_TXN_OPEN_DEC();
 	if (t->locks != t->locks_floor)
 		free(t->locks);
+	if (t->rel_after != t->rel_after_floor)
+		free(t->rel_after);
 	free(t);
 }
 
@@ -6755,11 +6769,11 @@ bool ft_flip_txn_releases_after(const struct ft_flip_txn *t,
 }
 
 #ifdef FT_DEBUG_REL_AFTER_STATS
-static unsigned long ft_rel_after_n[3];	/* staged, deduped, overflow */
+static unsigned long ft_rel_after_n[3];	/* staged, deduped, grown */
 static void ft_rel_after_report(void) __attribute__((destructor));
 static void ft_rel_after_report(void)
 {
-	fprintf(stderr, "FT REL AFTER: staged %lu deduped %lu overflow %lu\n",
+	fprintf(stderr, "FT REL AFTER: staged %lu deduped %lu grown %lu\n",
 		ft_rel_after_n[0], ft_rel_after_n[1], ft_rel_after_n[2]);
 }
 # define FT_REL_AFTER_COUNT(i)	uatomic_inc(&ft_rel_after_n[i])
@@ -6768,9 +6782,9 @@ static void ft_rel_after_report(void)
 #endif
 
 /*
- * Stage @meta's release after the txn.  False when it cannot be staged -- the
- * list is full, or the -DFT_DEBUG_RELEASE_IN_TXN control -- and the caller
- * then records the release terminal as before.
+ * Stage @meta's release after the txn.  False only under the
+ * -DFT_DEBUG_RELEASE_IN_TXN control, whose caller then records the release
+ * terminal as before.
  */
 static inline
 bool ft_flip_txn_release_after_add(struct ft_flip_txn *t,
@@ -6785,9 +6799,24 @@ bool ft_flip_txn_release_after_add(struct ft_flip_txn *t,
 		FT_REL_AFTER_COUNT(1);
 		return true;
 	}
-	if (t->nr_rel_after == CAA_ARRAY_SIZE(t->rel_after)) {
+	if (caa_unlikely(t->nr_rel_after == t->cap_rel_after)) {
+		unsigned int cap = t->cap_rel_after * 2;
+		struct cds_ft_metadata **p = (struct cds_ft_metadata **)
+			malloc((size_t) cap * sizeof(*p));
+
+		if (!p) {
+			fprintf(stderr, "FT: out of memory growing the staged "
+				"release list (%u staged) -- cannot drop a "
+				"release without leaking the lock\n",
+				t->nr_rel_after);
+			abort();
+		}
+		memcpy(p, t->rel_after, (size_t) t->nr_rel_after * sizeof(*p));
+		if (t->rel_after != t->rel_after_floor)
+			free(t->rel_after);
+		t->rel_after = p;
+		t->cap_rel_after = cap;
 		FT_REL_AFTER_COUNT(2);
-		return false;
 	}
 	t->rel_after[t->nr_rel_after++] = meta;
 	FT_REL_AFTER_COUNT(0);
@@ -8741,6 +8770,7 @@ static void ft_ch_sa_score(struct ft_ch_site *s, const struct cds_ft *ft,
  * back, so they settle after every other record -- including the same-tagged
  * duplicate-chain links the lock protects.
  */
+#ifdef FT_DEBUG_RELEASE_IN_TXN
 static bool ft_flip_txn_late_last(void *arg, void **slot)
 {
 	const struct ft_flip_txn *t = (const struct ft_flip_txn *) arg;
@@ -8769,6 +8799,7 @@ static bool ft_flip_txn_late_last(void *arg, void **slot)
 		}
 	return false;
 }
+#endif
 
 /*
  * ☠ NO MW RECORD, ENFORCED.  The flip txn is being made engine-agnostic for
@@ -9183,6 +9214,15 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 #ifdef FT_DEBUG_HIDDEN_FILL
 	ft_hidden_fill_at_commit(t);
 #endif
+	/*
+	 * ☞ ONLY FOR THE RECORDED-RELEASE CONTROL.  The late-last settle below
+	 * orders a lock word's RELEASE after the words it protects; releases now
+	 * happen after the commit returns (@rel_after), when every record is
+	 * settled, so the order is given by construction and the settle needs
+	 * no late pass.  -DFT_DEBUG_RELEASE_IN_TXN records the releases again,
+	 * and keeps it.
+	 */
+#ifdef FT_DEBUG_RELEASE_IN_TXN
 	urcu_txn_desc_set_late_tag(t->mtxn->desc, FT_STATE_PROXY);
 	/*
 	 * ☠ AND FT_STATE_PROXY IS NOT ONLY THE STATE WORDS' TAG: the duplicate
@@ -9198,6 +9238,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	 * holder lock and ~3.4% after.  Settle the REGISTERED lock words last.
 	 */
 	urcu_txn_desc_set_late_last(t->mtxn->desc, ft_flip_txn_late_last, t);
+#endif
 	if (caa_unlikely(t->acquire_miss)) {
 #ifdef FT_DEBUG_RESERVE_RATCHET
 		{
