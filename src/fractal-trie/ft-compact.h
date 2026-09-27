@@ -409,7 +409,7 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 			gp_nf ? ft_flag_to_metadata(ft, gp_nf) :
 				FT_OWNER_UNPLUMBED,
 			(void **) gp_slot,
-			fine ? urcu_txn_load(t->mtxn, (void **) gp_slot,
+			fine ? ft_txn_load(t->mtxn, (void **) gp_slot,
 				FT_FLIP_PROXY_TAG) : *gp_slot,
 			cn2_flag);
 		cst = ft_flip_txn_commit(ft, t);

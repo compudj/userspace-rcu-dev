@@ -378,7 +378,7 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 	 */
 	{
 		/* One load, and the owner FT-SLOT-3 names, derived from it. */
-		void *old_pw = urcu_txn_load(ft_flip_txn_handle(txn),
+		void *old_pw = ft_txn_load(ft_flip_txn_handle(txn),
 			(void **) field, FT_FLIP_PROXY_TAG);
 
 		ft_flip_txn_record_head_back_edge_owned(txn, (void **) field,

@@ -2961,9 +2961,9 @@ struct cds_ft_inode_flag **ft_txn_parent_slot_at(const struct cds_ft_metadata *m
 		*parent_out = NULL;
 	if (!mtxn)
 		return ft_resolve_parent_slot(meta, ft, parent_out);
-	parent = urcu_txn_load(mtxn,
+	parent = ft_txn_load(mtxn,
 		(void **) (uintptr_t) &meta->parent_word, FT_FLIP_PROXY_TAG);
-	state = urcu_txn_load(mtxn,
+	state = ft_txn_load(mtxn,
 		(void **) (uintptr_t) &meta->parent_slot_offset, FT_STATE_PROXY);
 	if (ft_parent_is_root_position(parent))
 		return &ft->root;

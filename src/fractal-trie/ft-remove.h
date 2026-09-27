@@ -2465,7 +2465,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * holds @publish_parent's own word, so no peer can park here.
 		 */
 		struct cds_ft_inode_flag *pub_expected_old =
-			urcu_txn_load(txn->mtxn, (void **) publish_slot,
+			ft_txn_load(txn->mtxn, (void **) publish_slot,
 				FT_FLIP_PROXY_TAG);
 
 		/*

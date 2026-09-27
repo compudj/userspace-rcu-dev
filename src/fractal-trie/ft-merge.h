@@ -1871,7 +1871,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * there; that proxy is a descriptor-record POINTER, and as an
 	 * expected-old it trips urcu_txn_add's !urcu_txn_is_proxy self-check.
 	 */
-	D_old = urcu_txn_load(txn->mtxn, (void **) pub_slot,
+	D_old = ft_txn_load(txn->mtxn, (void **) pub_slot,
 		FT_FLIP_PROXY_TAG);
 
 	/*

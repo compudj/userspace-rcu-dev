@@ -358,7 +358,7 @@ struct cds_ft_metadata *ft_rekey_cow_skip_meta_ryw(struct cds_ft *ft,
 	 */
 	r = urcu_txn_find(desc, field);
 	pw = r ? (struct cds_ft_inode_flag *) r->new_ptr :
-		(struct cds_ft_inode_flag *) urcu_txn_load(txn->mtxn, field,
+		(struct cds_ft_inode_flag *) ft_txn_load(txn->mtxn, field,
 			FT_FLIP_PROXY_TAG);
 	pw = ft_parent_prefix_strip(pw);
 	if (!pw || ft_node_flip_proxy(pw) || ft_node_external(pw) ||
@@ -513,7 +513,7 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 				 * offset is unchanged (the copy is verbatim) and so
 				 * is the incoming byte: neither is recorded.
 				 */
-				old_pw = pr ? pr->new_ptr : urcu_txn_load(txn->mtxn,
+				old_pw = pr ? pr->new_ptr : ft_txn_load(txn->mtxn,
 					(void **) &cm->parent_word,
 					FT_FLIP_PROXY_TAG);
 				new_pw = ft_parent_word(ft, new_flag);
@@ -545,7 +545,7 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 				if (!held_earlier && (!now || !urcu_txn_find(now,
 						(void **) &cm->state)) &&
 						!ft_flip_txn_releases_after(txn, cm)) {
-					uintptr_t live = (uintptr_t) urcu_txn_load(
+					uintptr_t live = (uintptr_t) ft_txn_load(
 						txn->mtxn, (void **) &cm->state,
 						FT_STATE_PROXY) &
 						~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
@@ -9175,7 +9175,7 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 	 * there; that proxy is a descriptor-record POINTER, and as an
 	 * expected-old it trips urcu_txn_add's !urcu_txn_is_proxy self-check.
 	 */
-	D_old = urcu_txn_load(txn->mtxn, (void **) pub_slot,
+	D_old = ft_txn_load(txn->mtxn, (void **) pub_slot,
 		FT_FLIP_PROXY_TAG);
 
 	/*

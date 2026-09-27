@@ -11730,7 +11730,7 @@ void ft_flip_txn_record_state_kind_ctx(struct ft_flip_txn *t,
 				return;		/* a pure release: nothing to record */
 		}
 	} else if (!(o & FT_STATE_LOCK) && ft_flip_txn_releases_after(t, meta)) {
-		uintptr_t pend = (uintptr_t) urcu_txn_load(t->mtxn,
+		uintptr_t pend = (uintptr_t) ft_txn_load(t->mtxn,
 				(void **) &meta->state, FT_STATE_PROXY);
 
 		if ((pend & FT_STATE_LOCK) &&
@@ -14434,7 +14434,7 @@ int ft_txn_list_insert_between_prepare(struct cds_ft *ft,
 	if (caa_unlikely(!pos || !succ_expected))
 		ft_ord_neighbour_null("ft_txn_list_insert_between_prepare",
 			pos ? (const void *) pos : (const void *) newp);
-	pn = urcu_txn_load(txn, (void **) &pos->next, URCU_TXN_TAG);
+	pn = ft_txn_load(txn, (void **) &pos->next, URCU_TXN_TAG);
 
 	if (urcu_txn_list_is_marked(pn))
 		return -ENOENT;				/* @pos was deleted */
@@ -15104,7 +15104,7 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 	 * returns the committed value, so every other call site is
 	 * behaviour-identical.
 	 */
-	uintptr_t old = (uintptr_t) urcu_txn_load(t->mtxn,
+	uintptr_t old = (uintptr_t) ft_txn_load(t->mtxn,
 			(void **) &meta->state, FT_STATE_PROXY);
 
 	/*
@@ -15277,7 +15277,7 @@ static inline
 void ft_flip_txn_record_nr_child_inc(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta)
 {
-	uintptr_t old = (uintptr_t) urcu_txn_load(t->mtxn,
+	uintptr_t old = (uintptr_t) ft_txn_load(t->mtxn,
 			(void **) &meta->state, FT_STATE_PROXY);
 	uintptr_t live = old & ~(uintptr_t) (FT_STATE_TOMBSTONE | FT_STATE_LOCK);
 
@@ -16157,7 +16157,7 @@ static inline
 void ft_flip_txn_record_anchor_release_held(struct ft_flip_txn *t,
 		struct cds_ft_metadata *lock)
 {
-	uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
+	uintptr_t pending = (uintptr_t) ft_txn_load(t->mtxn,
 			(void **) &lock->state, FT_STATE_PROXY);
 
 	/*
@@ -16373,7 +16373,7 @@ bool ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
 	assert(!h->shared);
 	if (h->lock == node)
 		return true;		/* fused: @node's own retire is the terminal */
-	pending = (uintptr_t) urcu_txn_load(t->mtxn, (void **) &h->lock->state,
+	pending = (uintptr_t) ft_txn_load(t->mtxn, (void **) &h->lock->state,
 			FT_STATE_PROXY);
 	if (caa_unlikely(pending & FT_STATE_TOMBSTONE))
 		return true;		/* the op retires the anchor itself */
@@ -16446,7 +16446,7 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 			 * set TOMBSTONE -- so the mask is what expresses it, and it
 			 * is a no-op where a release already cleared the bit.
 			 */
-			uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
+			uintptr_t pending = (uintptr_t) ft_txn_load(t->mtxn,
 					(void **) &node->state, FT_STATE_PROXY);
 
 			ft_flip_txn_record_state_ctx(t, ctx, node,
@@ -16540,7 +16540,7 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 			return;		/* the terminal is already recorded */
 	}
 	{
-		uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
+		uintptr_t pending = (uintptr_t) ft_txn_load(t->mtxn,
 				(void **) &node->state, FT_STATE_PROXY);
 		uintptr_t held_snap;
 		bool ratified;
@@ -16873,7 +16873,7 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 	 * one record either way, and a dead one still fails.  Dead-at-guard is
 	 * unreachable under a single writer.
 	 */
-	v = (uintptr_t) urcu_txn_load(t->mtxn,
+	v = (uintptr_t) ft_txn_load(t->mtxn,
 			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
 			FT_STATE_PROXY);
 	/*
@@ -18491,7 +18491,7 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	if (!ft_flip_txn_reserve_extra(t, 1)) {
 		return;
 	}
-	old_state = (uintptr_t) urcu_txn_load(t->mtxn,
+	old_state = (uintptr_t) ft_txn_load(t->mtxn,
 		(void **) &meta->state, FT_STATE_PROXY);
 	live_state = old_state & ~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
 	/*
@@ -19574,7 +19574,7 @@ freeze_done:
 			 * the transacted form of the hazard
 			 * ft_meta_state_transition waits out.
 			 */
-			uintptr_t old = (uintptr_t) urcu_txn_load(txn->mtxn,
+			uintptr_t old = (uintptr_t) ft_txn_load(txn->mtxn,
 				(void **) &state_meta->state, FT_STATE_PROXY);
 			/*
 			 * ☠ REFUSE A RETIRED HOLDER -- the insert's counterpart
@@ -19869,7 +19869,7 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 	{
 		/* One load, and the owner FT-SLOT-3 names, derived from it. */
-		void *old_pw = urcu_txn_load(txn->mtxn, (void **) field,
+		void *old_pw = ft_txn_load(txn->mtxn, (void **) field,
 			FT_FLIP_PROXY_TAG);
 
 		ft_flip_txn_record_head_back_edge_owned(txn, (void **) field,
@@ -22993,7 +22993,7 @@ struct cds_ft_metadata *ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 		struct ft_flip_txn *txn, struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf, bool child_held)
 {
-	void *old_pw = urcu_txn_load(txn->mtxn, (void **) &meta->parent_word,
+	void *old_pw = ft_txn_load(txn->mtxn, (void **) &meta->parent_word,
 			FT_FLIP_PROXY_TAG);
 	void *new_pw = ft_parent_word(ft, parent_nf);
 	/*
@@ -23359,7 +23359,7 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * acquire of it fails forever.  ft_meta_state_transition's wait loop is
 	 * the standalone counterpart of this load.
 	 */
-	uintptr_t old_state = (uintptr_t) urcu_txn_load(txn->mtxn,
+	uintptr_t old_state = (uintptr_t) ft_txn_load(txn->mtxn,
 		(void **) &meta->state, FT_STATE_PROXY);
 	/*
 	 * §4.B VALIDATE (Phase 4.3, MW): expect the re-homed child CLEAN-LIVE at
@@ -23402,7 +23402,7 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * attempt would be a guaranteed abort (or worse, mint a bogus
 		 * offset from pointer bits).  urcu_txn_load settles it first.
 		 */
-		old_pso = (uintptr_t) urcu_txn_load(txn->mtxn,
+		old_pso = (uintptr_t) ft_txn_load(txn->mtxn,
 			(void **) &meta->parent_slot_offset, FT_STATE_PROXY);
 		new_pso = FT_PSO_ENCODE(off);
 		record_pso = (old_pso != new_pso);
@@ -23439,7 +23439,7 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	struct cds_ft_metadata *sa_pso_owner = ft_sa_owner_of_parent_word(ft,
-		urcu_txn_load(txn->mtxn, (void **) &meta->parent_word,
+		ft_txn_load(txn->mtxn, (void **) &meta->parent_word,
 			FT_FLIP_PROXY_TAG));
 #endif
 	struct cds_ft_metadata *pow = ft_flip_txn_record_parent_word(ft, txn,
@@ -23693,7 +23693,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 			void **field = ft->ordered_list ?
 				(void **) &ft_ord_cell_ptr(en->prev)->parent :
 				(void **) &en->prev;
-			void *old_pw = urcu_txn_load(txn->mtxn, field,
+			void *old_pw = ft_txn_load(txn->mtxn, field,
 				FT_FLIP_PROXY_TAG);
 
 			ft_flip_txn_record_head_back_edge_owned(txn, field,
@@ -25130,7 +25130,7 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 			uintptr_t cur;
 
 			assert(g->fuse_free_list);
-			cur = (uintptr_t) urcu_txn_load(g->txn->mtxn,
+			cur = (uintptr_t) ft_txn_load(g->txn->mtxn,
 				(void **) &meta->state, FT_STATE_PROXY);
 			if (cur & FT_STATE_TOMBSTONE)
 				g->free_list[i].retired = false;
@@ -26582,7 +26582,7 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 */
 		{
 			struct urcu_txn *h = ft_flip_txn_handle(txn);
-			void *prev_old = urcu_txn_load(h, (void **) &src_head->prev,
+			void *prev_old = ft_txn_load(h, (void **) &src_head->prev,
 					FT_HLIST_PREV_TAG);
 			int ret;
 

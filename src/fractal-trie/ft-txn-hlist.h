@@ -522,7 +522,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
  */
 #ifndef NO_FEATURE_FT_CHAIN_SW
 # define FT_CHAIN_OLD(txn, slot, believed, tag)				\
-	urcu_txn_load((txn), (void **) (slot), (tag))
+	ft_txn_load((txn), (void **) (slot), (tag))
 #else
 # define FT_CHAIN_OLD(txn, slot, believed, tag)		((void *) (believed))
 #endif
@@ -667,7 +667,7 @@ int ft_hlist_insert_after_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 		struct cds_ft_node *pos)
 {
 	struct cds_ft_node *succ = (struct cds_ft_node *)
-			urcu_txn_load(txn, (void **) &pos->next, FT_HLIST_TAG);
+			ft_txn_load(txn, (void **) &pos->next, FT_HLIST_TAG);
 
 	/*
 	 * ☑ THE MARK CHECK IS BACK, and it is a REFUSAL now, not an assert.
@@ -776,9 +776,9 @@ static inline
 int ft_hlist_del_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct cds_ft_node *elem)
 {
 	struct cds_ft_node *next = (struct cds_ft_node *)
-			urcu_txn_load(txn, (void **) &elem->next, FT_HLIST_TAG);
+			ft_txn_load(txn, (void **) &elem->next, FT_HLIST_TAG);
 	struct cds_ft_node *pred = (struct cds_ft_node *)
-			urcu_txn_load(txn, (void **) &elem->prev, FT_HLIST_PREV_TAG);
+			ft_txn_load(txn, (void **) &elem->prev, FT_HLIST_PREV_TAG);
 
 	/*
 	 * ☠ ALREADY MARKED means @elem is ALREADY logically deleted, and building
@@ -840,9 +840,9 @@ int ft_hlist_replace_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 		struct cds_ft_node *old, struct cds_ft_node *newp)
 {
 	struct cds_ft_node *next = (struct cds_ft_node *)
-			urcu_txn_load(txn, (void **) &old->next, FT_HLIST_TAG);
+			ft_txn_load(txn, (void **) &old->next, FT_HLIST_TAG);
 	struct cds_ft_node *pred = (struct cds_ft_node *)
-			urcu_txn_load(txn, (void **) &old->prev, FT_HLIST_PREV_TAG);
+			ft_txn_load(txn, (void **) &old->prev, FT_HLIST_PREV_TAG);
 
 	/* Build @newp's links invisibly, then swing pred->next and next->prev. */
 	newp->next = next;
@@ -876,7 +876,7 @@ int ft_hlist_replace_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 static inline
 void ft_hlist_freeze_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct cds_ft_node *node)
 {
-	void *en = urcu_txn_load(txn, (void **) &node->next, FT_HLIST_TAG);
+	void *en = ft_txn_load(txn, (void **) &node->next, FT_HLIST_TAG);
 	int ret;
 
 	ret = ft_hlist_store_chain(ft, txn, (void **) &node->next, en,
@@ -1446,7 +1446,7 @@ bool ft_hlist_chain_plan_ok(const struct cds_ft *ft, struct urcu_txn *txn,
 			FT_HLIST_PLAN_WHY(0);
 			return false;	/* shorter than @len: stale */
 		}
-		raw = urcu_txn_load_committed(txn, (void **) &head->next,
+		raw = ft_txn_load_committed(txn, (void **) &head->next,
 				FT_HLIST_TAG);
 		if (i + 1 == len) {
 			/*
@@ -1586,7 +1586,7 @@ void ft_hlist_freeze_chain_prepare_at(const struct cds_ft *ft,
 			 */
 			succ = NULL;
 			if (plan_checked) {
-				void *raw = urcu_txn_load_committed(txn,
+				void *raw = ft_txn_load_committed(txn,
 					(void **) &head->next, FT_HLIST_TAG);
 
 				/*
@@ -1632,7 +1632,7 @@ void ft_hlist_freeze_chain_prepare_at(const struct cds_ft *ft,
 					succ = (struct cds_ft_node *) raw;
 			}
 		} else {
-			succ = (struct cds_ft_node *) urcu_txn_load(txn,
+			succ = (struct cds_ft_node *) ft_txn_load(txn,
 				(void **) &head->next, FT_HLIST_TAG);
 			next = ft_hlist_unmark(succ);
 		}
