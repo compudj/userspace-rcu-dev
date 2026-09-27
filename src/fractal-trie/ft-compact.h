@@ -361,6 +361,18 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 			*bail = -ENOMEM;
 			return cn;
 		}
+		/*
+		 * ☞ THE TERMINALS FIRST: they register @cn's mark, and the child
+		 * re-parent just below writes @cn's own words (FT-SLOT-3), so its
+		 * owner has to be in the registry when it is made -- the rule the
+		 * slot record states further down.  Recorded after, every such
+		 * back edge committed as a CAS (FT_DEBUG_MW_KEPT, HEAD_BACK /
+		 * PARENT_WORD).  Order within one txn changes nothing else: the
+		 * terminals write @cn's and the grandparent's state words, the
+		 * re-parent the child's.
+		 */
+		if (fine)
+			ft_compact_record_terminals(t, ctx, set, cn_meta);
 		ft_reparent_record(ft, t, cn2->child, cn2_flag, &cn2->child,
 			/*child_marked=*/ false, /*hold_ctx=*/ NULL,
 			/*check_child=*/ false);	/* span-preserving */
@@ -390,10 +402,9 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		 * Under the lock, hand the marks to @t BEFORE the slot record so
 		 * the record's owner is in the registry when it is made, and read
 		 * the slot's expected-old THROUGH @t (a raw re-read could land on
-		 * a peer's parked proxy).
+		 * a peer's parked proxy).  (The marks were handed over above,
+		 * before the child re-parent.)
 		 */
-		if (fine)
-			ft_compact_record_terminals(t, ctx, set, cn_meta);
 		ft_flip_txn_record_reserved(t,
 			gp_nf ? ft_flag_to_metadata(ft, gp_nf) :
 				FT_OWNER_UNPLUMBED,
@@ -423,10 +434,11 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 			*bail = -ENOMEM;
 			return cn;
 		}
+		/* The terminals first, for the reason the arm above gives. */
+		ft_compact_record_terminals(t, ctx, set, cn_meta);
 		ft_reparent_record(ft, t, cn2->child, cn2_flag, &cn2->child,
 			/*child_marked=*/ false, /*hold_ctx=*/ NULL,
 			/*check_child=*/ false);	/* span-preserving */
-		ft_compact_record_terminals(t, ctx, set, cn_meta);
 		cst = ft_flip_txn_commit(ft, t);
 		if (cst != URCU_TXN_STATUS_OK) {
 			free_compressed_node_unpublished(ft, cn2);
