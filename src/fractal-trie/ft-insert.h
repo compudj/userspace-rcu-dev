@@ -6448,6 +6448,33 @@ bool ft_replace_hold_covers(struct cds_ft *ft, const struct cds_ft_metadata *hm,
 }
 
 /*
+ * Tell a content txn that the op holds {L}'s member -- the holder whose slots
+ * the head arms republish.
+ *
+ * {L} lives on the ACQUIRE txn (hctx's @extra), so the content txn's registry
+ * never names it, and every structural edge the op vouched for through it
+ * (ft_ord_cell_flip_into's @owner_held arm) was refused its SW park by the
+ * registry-only record gate: MEASURED 370k MW_STRUCT records per ft_inv
+ * FT_INV_MW=1 run at per-node, all of them on a word this op holds.  @covered
+ * answers ft_flip_txn_owns without taking on a release, which is exactly {L}'s
+ * shape: the routing was derived UNDER it (the plan needs no re-validation),
+ * and ft_replace_exit releases it only after the commit -- settle included --
+ * returned.  Only the member: under a coarse spacing the anchor ancestor's own
+ * words keep their CAS.
+ */
+static inline
+void ft_replace_cover_hold(struct ft_flip_txn *txn,
+		const struct cds_ft_metadata *hm, const struct ft_held_anchor *hh)
+{
+#ifndef FT_DEBUG_REPLACE_HOLD_UNCOVERED
+	if (txn && hm)
+		ft_flip_txn_cover_member(txn, hh->member);
+#else
+	(void) txn; (void) hm; (void) hh;
+#endif
+}
+
+/*
  * cds_ft_replace's SINGLE EXIT for the holder hold {L}.
  *
  * The hold is taken ONCE, above the routing derivation, and every one of this
@@ -7055,6 +7082,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				s = CDS_FT_STATUS_MEMORY_ERROR;
 				return ft_replace_exit(&hm, s);
 			}
+			ft_replace_cover_hold(txn, hm, &hh);
 			if (new_node->next)
 				new_node->next->prev = new_node;
 			cds_ft_item_to_metadata(new_cell)->incoming_byte =
@@ -7190,6 +7218,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				s = CDS_FT_STATUS_MEMORY_ERROR;
 				return ft_replace_exit(&hm, s);
 			}
+			ft_replace_cover_hold(txn, hm, &hh);
 			if (new_node->next)
 				new_node->next->prev = new_node;
 			new_node->prev = old_prev;	/* resolved, see @old_prev */
