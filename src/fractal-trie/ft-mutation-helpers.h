@@ -16948,10 +16948,26 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	ft_sa_anchor_props(t, ctx, node, h->lock);
 #endif
+	/*
+	 * ☞ ...EXCEPT AT ROOT-ONLY, where there is no second path to date.
+	 * Every member anchors on the root's word, so no op locks @node's own
+	 * word at all and every writer of it holds the root: the MW snapshot
+	 * defended against a peer the lock already excludes, the MW-CAS era's
+	 * detect-and-abort with nothing left to detect.  Offered SW; the
+	 * per-record gate still grants it only when this txn holds the root's
+	 * word (ft_flip_txn_owns' root arm), and MEASURED 4.68M such retires
+	 * per ft_inv FT_INV_MW=1 run at root-only.
+	 */
+	int sw_ok = 0;
+
+#ifndef FT_DEBUG_ANCHORED_RETIRE_MW
+	sw_ok = t->ft &&
+		t->ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY;
+#endif
 	ft_flip_txn_record_state_kind_ctx(t, ctx, node,
 			(void *) h->node_snap,
 			(void *) (h->node_snap | FT_STATE_TOMBSTONE),
-			/*sw_ok=*/ 0);
+			sw_ok);
 }
 
 /*
