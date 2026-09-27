@@ -8862,6 +8862,13 @@ static unsigned int ft_mk_nstacks;
 static unsigned long ft_mk_overflow;
 static pthread_mutex_t ft_mk_mutex = PTHREAD_MUTEX_INITIALIZER;
 static __thread unsigned long ft_mk_tcount[FT_AB_CLS_NR + 1];
+/*
+ * Every record DECIDED MW, committed or not.  The SW engine cannot take an MW
+ * record at all -- not even into a txn that is later discarded -- so the
+ * engine-agnostic flip txn needs this count at zero, not only the committed
+ * one above.
+ */
+static unsigned long ft_mk_rec_mw[FT_AB_CLS_NR + 1];
 
 static __attribute__((noinline))
 void ft_mk_sample(unsigned int cls)
@@ -8872,6 +8879,7 @@ void ft_mk_sample(unsigned int cls)
 
 	if (cls > FT_AB_CLS_NR)
 		cls = FT_AB_UNSET;
+	uatomic_inc(&ft_mk_rec_mw[cls]);
 	if (ft_mk_tcount[cls]++ >= 32 && (ft_mk_tcount[cls] & 511))
 		return;
 	depth = backtrace(pc, FT_MK_DEPTH + 1) - 1;
@@ -8906,6 +8914,17 @@ static void ft_mk_stack_report(void)
 {
 	unsigned int i, j;
 
+	{
+		unsigned int c;
+
+		fprintf(stderr, "  records DECIDED MW at record time "
+			"(committed or not):\n");
+		for (c = 0; c <= FT_AB_CLS_NR; c++)
+			if (ft_mk_rec_mw[c])
+				fprintf(stderr, "      %-18s %12lu\n",
+					c == FT_AB_CLS_NR ? "MIXED" :
+					ft_ab_cls_name(c), ft_mk_rec_mw[c]);
+	}
 	fprintf(stderr, "  MW record stacks: %u (overflow %lu)\n",
 		ft_mk_nstacks, ft_mk_overflow);
 	for (i = 0; i < ft_mk_nstacks; i++) {
@@ -16592,6 +16611,7 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 	}
 #endif
 	FT_AB_ARM(FT_AB_VALIDATE, FT_AB_OWN_NA);
+	FT_MK_SAMPLE(FT_AB_VALIDATE);
 	urcu_txn_validate(t->mtxn,
 			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
 			(void *) live, FT_STATE_PROXY);
