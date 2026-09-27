@@ -230,6 +230,24 @@ static void ft_ab_note_lost(const struct urcu_txn_desc *t,
 
 #define URCU_TXN_STAT_ABORT(t, r)	ft_ab_note_lost((t), (r))
 
+#ifdef FT_DEBUG_SAME_SLOT
+/*
+ * THE SAME-SLOT CENSUS (-DFT_DEBUG_SAME_SLOT, on top of the two defines above):
+ * every record FT adds onto a slot its descriptor already holds.  The MW
+ * front end fuses the pair (read-your-own-writes chain at age 1+, escalation
+ * at age 0), so the DEBUG_RCU duplicate scan at commit never sees it; the SW
+ * engine (<urcu/rcu-txn-sw.h>) would append it blindly and settle both,
+ * last-wins.  This is the list the engine swap must empty or route through
+ * urcu_txn_sw_load / urcu_txn_sw_record_chain.  Declared against the
+ * incomplete record, defined in ft-txn-kind-stats.h.
+ */
+static void ft_ss_note(const struct urcu_txn_record *r, void *old_ptr,
+		void *new_ptr, int upgrade, unsigned int kind);
+
+#define URCU_TXN_REC_DBG_SAME_SLOT(r, o, n, up, k)	\
+	ft_ss_note((r), (o), (n), (up), (k))
+#endif
+
 #ifdef FT_WINNER_DBG
 /*
  * THE WINNER LEDGER (-DFT_WINNER_DBG, on top of the two defines above).  The
@@ -271,6 +289,9 @@ static void ft_win_lost(const struct urcu_txn_record *rec, void *seen);
 
 #else	/* the instrument is not built */
 
+#ifdef FT_DEBUG_SAME_SLOT
+#error "-DFT_DEBUG_SAME_SLOT needs both -DFT_DEBUG_TXN_KIND and -DURCU_TXN_REC_DBG"
+#endif
 #define FT_AB_ARM(cls, own)		do { } while (0)
 #define FT_AB_NOTE_OWNER(slot_, owner_)	do { } while (0)
 

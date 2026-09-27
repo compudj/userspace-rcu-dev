@@ -1241,6 +1241,195 @@ void ft_ab_note_lost(const struct urcu_txn_desc *t,
 #endif
 }
 
+#ifdef FT_DEBUG_SAME_SLOT
+#include <execinfo.h>
+#include <dlfcn.h>
+/*
+ * THE SAME-SLOT CENSUS, defined here where the record is complete (the hook
+ * and its reason are in ft-txn-rec-dbg.h).  Each hit is classified by what
+ * the SW engine would need to know about it:
+ *
+ *   had / got   the FT class of the record already there and of the new one
+ *               (FT_AB_MIXED when two classes were already folded onto it);
+ *   kinds       SW or MW, for both;
+ *   validate    old == new for the one already there / the new one is a
+ *               load-validate or a same-value store;
+ *   chained     the new expected-old IS the pending new value -- a fusable
+ *               read-your-own-writes store.  Unchained, the MW engine POISONS
+ *               the descriptor (the commit aborts), so those are the ones a
+ *               swap would turn from an abort into a silent last-wins.
+ *
+ * A sampled backtrace (the first 64 hits per thread, then 1 in 256) names the
+ * producer: module+offset, for addr2line -f -i against that module.
+ */
+#define FT_SS_HAD	(FT_AB_CLS_NR + 1)	/* + MIXED */
+#define FT_SS_STACKS	512
+#define FT_SS_DEPTH	12
+
+static unsigned long ft_ss_tab[FT_SS_HAD][FT_AB_CLS_NR][2][2][2][2][2];
+static unsigned long ft_ss_total;
+/*
+ * The LOCK bit's transition on each side of the pair, for the words that
+ * carry one (every class but RANK): 0 no lock bit, 1 RELEASE (L -> ~L),
+ * 2 edit UNDER the lock (L -> L), 3 TAKE (~L -> L).  A pair with a RELEASE
+ * on either side is a chain the split-out release removes by itself; the
+ * rest are content edits the caller must combine.
+ */
+static unsigned long ft_ss_lock[4][4];
+
+static inline
+unsigned int ft_ss_lock_shape(const void *o, const void *n)
+{
+	uintptr_t ov = (uintptr_t) o, nv = (uintptr_t) n;
+
+	if (!(ov & FT_STATE_LOCK))
+		return (nv & FT_STATE_LOCK) ? 3 : 0;
+	return (nv & FT_STATE_LOCK) ? 2 : 1;
+}
+
+struct ft_ss_stack {
+	unsigned int key;
+	int depth;
+	unsigned long n;
+	void *pc[FT_SS_DEPTH];
+};
+static struct ft_ss_stack ft_ss_stacks[FT_SS_STACKS];
+static unsigned int ft_ss_nstacks;
+static unsigned long ft_ss_overflow;
+static pthread_mutex_t ft_ss_mutex = PTHREAD_MUTEX_INITIALIZER;
+static __thread unsigned long ft_ss_tcount;
+
+static __attribute__((noinline))
+void ft_ss_note(const struct urcu_txn_record *r, void *old_ptr,
+		void *new_ptr, int upgrade, unsigned int kind)
+{
+	unsigned int had = r->dbg_embedder, got = ft_ab_pending;
+	unsigned int hc = (had & FT_AB_MIXED) ? FT_AB_CLS_NR :
+		ft_ab_code_cls(had);
+	unsigned int gc = ft_ab_code_cls(got);
+	unsigned int hk = r->kind == URCU_TXN_KIND_MW;
+	unsigned int gk = kind == URCU_TXN_KIND_MW;
+	unsigned int hv = r->old_ptr == r->new_ptr;
+	unsigned int gv = !upgrade || old_ptr == new_ptr;
+	unsigned int ch = r->new_ptr == old_ptr;
+	unsigned int key, i;
+	void *pc[FT_SS_DEPTH + 1];
+	int depth;
+
+	if (hc >= FT_SS_HAD)
+		hc = FT_AB_UNSET;
+	if (gc >= FT_AB_CLS_NR)
+		gc = FT_AB_UNSET;
+	uatomic_inc(&ft_ss_tab[hc][gc][hk][gk][hv][gv][ch]);
+	uatomic_inc(&ft_ss_total);
+	if (gc != FT_AB_MWA_BASE + FT_TK_MWA_RANK)
+		uatomic_inc(&ft_ss_lock[ft_ss_lock_shape(r->old_ptr, r->new_ptr)]
+			[ft_ss_lock_shape(old_ptr, new_ptr)]);
+	if (ft_ss_tcount++ >= 64 && (ft_ss_tcount & 255))
+		return;
+	key = (((((hc * FT_AB_CLS_NR + gc) * 2 + hk) * 2 + gk) * 2 + hv) * 2
+		+ gv) * 2 + ch;
+	depth = backtrace(pc, FT_SS_DEPTH + 1) - 1;	/* drop this frame */
+	if (depth < 0)
+		depth = 0;
+	pthread_mutex_lock(&ft_ss_mutex);
+	for (i = 0; i < ft_ss_nstacks; i++) {
+		struct ft_ss_stack *s = &ft_ss_stacks[i];
+
+		if (s->key == key && s->depth == depth &&
+				!memcmp(s->pc, pc + 1, depth * sizeof(void *))) {
+			s->n++;
+			goto out;
+		}
+	}
+	if (ft_ss_nstacks < FT_SS_STACKS) {
+		struct ft_ss_stack *s = &ft_ss_stacks[ft_ss_nstacks++];
+
+		s->key = key;
+		s->depth = depth;
+		s->n = 1;
+		memcpy(s->pc, pc + 1, depth * sizeof(void *));
+	} else {
+		ft_ss_overflow++;
+	}
+out:
+	pthread_mutex_unlock(&ft_ss_mutex);
+}
+
+static
+const char *ft_ss_had_name(unsigned int hc)
+{
+	return hc == FT_AB_CLS_NR ? "MIXED" : ft_ab_cls_name(hc);
+}
+
+static void ft_ss_report(void) __attribute__((destructor));
+static
+void ft_ss_report(void)
+{
+	unsigned int hc, gc, hk, gk, hv, gv, ch, i, j;
+
+	fprintf(stderr, "=== FT_DEBUG_SAME_SLOT: records added onto a slot the "
+		"descriptor already holds: %lu ===\n", ft_ss_total);
+	fprintf(stderr, "  %-14s %-14s had got  had-val got-val chained %12s\n",
+		"had", "got", "n");
+	for (hc = 0; hc < FT_SS_HAD; hc++)
+	for (gc = 0; gc < FT_AB_CLS_NR; gc++)
+	for (hk = 0; hk < 2; hk++)
+	for (gk = 0; gk < 2; gk++)
+	for (hv = 0; hv < 2; hv++)
+	for (gv = 0; gv < 2; gv++)
+	for (ch = 0; ch < 2; ch++) {
+		unsigned long n = ft_ss_tab[hc][gc][hk][gk][hv][gv][ch];
+
+		if (!n)
+			continue;
+		fprintf(stderr, "  %-14s %-14s  %s  %s   %d       %d       %d   "
+			"%12lu\n", ft_ss_had_name(hc), ft_ab_cls_name(gc),
+			hk ? "MW" : "SW", gk ? "MW" : "SW", hv, gv, ch, n);
+	}
+	{
+		static const char * const ls[4] = {
+			"nolock", "RELEASE", "under-lock", "TAKE" };
+
+		fprintf(stderr, "  LOCK-bit shape, had x got (non-RANK):\n");
+		for (hc = 0; hc < 4; hc++)
+			for (gc = 0; gc < 4; gc++)
+				if (ft_ss_lock[hc][gc])
+					fprintf(stderr, "    %-10s -> %-10s %12lu\n",
+						ls[hc], ls[gc],
+						ft_ss_lock[hc][gc]);
+	}
+	fprintf(stderr, "  sampled stacks: %u (overflow %lu)\n", ft_ss_nstacks,
+		ft_ss_overflow);
+	for (i = 0; i < ft_ss_nstacks; i++) {
+		const struct ft_ss_stack *s = &ft_ss_stacks[i];
+		unsigned int k = s->key;
+
+		ch = k & 1; k >>= 1; gv = k & 1; k >>= 1; hv = k & 1; k >>= 1;
+		gk = k & 1; k >>= 1; hk = k & 1; k >>= 1;
+		gc = k % FT_AB_CLS_NR; hc = k / FT_AB_CLS_NR;
+		fprintf(stderr, "FT_SS_STACK n=%lu %s->%s %s->%s val=%d/%d "
+			"chained=%d :", s->n, ft_ss_had_name(hc),
+			ft_ab_cls_name(gc), hk ? "MW" : "SW", gk ? "MW" : "SW",
+			hv, gv, ch);
+		for (j = 0; j < (unsigned int) s->depth; j++) {
+			Dl_info di;
+
+			if (dladdr(s->pc[j], &di) && di.dli_fname)
+				fprintf(stderr, " %s+%#lx",
+					strrchr(di.dli_fname, '/') ?
+					strrchr(di.dli_fname, '/') + 1 :
+					di.dli_fname,
+					(unsigned long) ((char *) s->pc[j] -
+						(char *) di.dli_fbase));
+			else
+				fprintf(stderr, " %p", s->pc[j]);
+		}
+		fprintf(stderr, "\n");
+	}
+}
+#endif	/* FT_DEBUG_SAME_SLOT */
+
 /*
  * ★ THE ALARM.  An SW park cannot lose a CAS -- it does not do one -- and a
  * STRUCTURAL MW record whose owner the op HOLDS should not either, because the

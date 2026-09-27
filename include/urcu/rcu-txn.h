@@ -941,6 +941,26 @@ int urcu_txn__record(struct urcu_txn *txn, void **slot,
 		urcu_txn__bloom_reset(txn);
 		txn->desc = m;
 	}
+#ifdef URCU_TXN_REC_DBG_SAME_SLOT
+	/*
+	 * THE SAME-SLOT CENSUS HOOK (default-inert; the embedder defines it).
+	 * @slot is already in this descriptor's write set.  The reconcile
+	 * below (age 1+) or the escalation (age 0) collapses the pair, so
+	 * nothing downstream -- not even the DEBUG_RCU duplicate scan at
+	 * commit -- can tell an embedder that it records one slot twice.  An
+	 * embedder moving to <urcu/rcu-txn-sw.h>, whose record() appends
+	 * blindly and leaves pairwise-distinct slots to the caller, needs
+	 * exactly that count.  Asked with the exact find (O(nr) per record):
+	 * a debug build only.
+	 */
+	{
+		struct urcu_txn_record *dup_ = urcu_txn_find(m, slot);
+
+		if (dup_ != NULL)
+			URCU_TXN_REC_DBG_SAME_SLOT(dup_, old_ptr, new_ptr,
+					upgrade, kind);
+	}
+#endif
 	if (!txn->disjoint) {
 		int coincide = urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom,
 				slot);
