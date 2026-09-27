@@ -990,6 +990,27 @@ void ft_detach_freeze_one(struct ft_flip_txn *txn,
 		retires = ft_flip_txn_record_anchor_release(txn, h, m);
 		if (owned && retires)
 			txn->locks[slot].tombstone_terminal = true;
+#ifndef FT_DEBUG_FREEZE_TOMBSTONE_MW
+		/*
+		 * ...AND WHERE THE ANCHOR IS THE ORPHAN, SAY THAT THIS TXN HOLDS
+		 * IT.  That mark stays with the caller (no registry slot, see
+		 * above), so the retire's record-time ownership question
+		 * answered NO and the fused {LOCK|s -> TOMBSTONE|s} went MW --
+		 * 1.33M records per ft_inv FT_INV_MW=1 run at per-node, every
+		 * one on a word this op itself took.  Its expected-old check was
+		 * the MW-CAS era's detect-and-abort for a peer that grew the
+		 * orphan; under the lock that peer cannot even start
+		 * (ft_meta_nr_child_inc waits on FT_STATE_LOCK), and a peer's
+		 * {live -> live} validate cannot land on a LOCKED word either.
+		 * @covered answers ft_flip_txn_owns without taking on a release
+		 * (the caller's sweep keeps that), so the terminal parks SW.  It
+		 * settles outside the registry's late pass, which is harmless for
+		 * a TOMBSTONE: the word is unlockable from the moment it lands.
+		 * A full @covered drops the entry and the record stays MW.
+		 */
+		if (h->lock == m)
+			ft_flip_txn_cover_member(txn, m);
+#endif
 	}
 	ft_flip_txn_record_retire_anchored(txn, ctx, h, m);
 }
