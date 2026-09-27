@@ -274,34 +274,33 @@ bool ft_rekey_cow_fresh_has(const struct ft_rekey_cow_fresh *fresh,
  * geometry 6 with rank stats and the ordered list).  It only needs the grow
  * to land there, which the number of records ahead of the copy decides --
  * found when moving the lock releases out of the txn changed that number.
- * NULL when the copy must not see this commit (@ryw off) or the txn is out of
- * memory.
+ * The copy now looks records up through the txn HANDLE (ft_txn_find), which
+ * reads the array at each lookup.  NULL when the copy must not see this
+ * commit (@ryw off), or the txn holds no record set (none yet, or out of
+ * memory).
  */
 static inline
-struct urcu_txn_desc *ft_rekey_cow_desc(const struct ft_flip_txn *txn, bool ryw)
+struct urcu_txn *ft_rekey_cow_ryw(const struct ft_flip_txn *txn, bool ryw)
 {
-	struct urcu_txn_desc *d;
-
-	if (!ryw || !txn->mtxn)
+	if (!ryw || !ft_txn_live(txn->mtxn))
 		return NULL;
-	d = txn->mtxn->desc;
-	return d == URCU_TXN_ENOMEM ? NULL : d;
+	return txn->mtxn;
 }
 
 static inline
 bool ft_rekey_cow_slot_value(struct ft_flip_txn *txn,
-		struct urcu_txn_desc *desc,
+		struct urcu_txn *ryw,
 		struct cds_ft_inode_flag **src_slot,
 		struct cds_ft_inode_flag **iter_ret)
 {
 	void *resolved;
 
-	if (desc) {
-		const struct urcu_txn_record *r = urcu_txn_find(desc,
+	if (ryw) {
+		const struct ft_txn_rec *r = ft_txn_find(ryw,
 			(void **) src_slot);
 
 		if (r) {
-			*iter_ret = (struct cds_ft_inode_flag *) r->new_ptr;
+			*iter_ret = (struct cds_ft_inode_flag *) ft_txn_rec_new(r);
 			return true;
 		}
 		if (txn->pending_pub_slot == src_slot && txn->pending_pub_val) {
@@ -329,19 +328,19 @@ bool ft_rekey_cow_slot_value(struct ft_flip_txn *txn,
  */
 static
 struct cds_ft_metadata *ft_rekey_cow_skip_meta_ryw(struct cds_ft *ft,
-		struct ft_flip_txn *txn, struct urcu_txn_desc *desc,
+		struct ft_flip_txn *txn, struct urcu_txn *ryw,
 		struct cds_ft_inode_flag *skip)
 {
 	struct cds_ft_inode_flag *child = ft_skip_child_ptr(skip);
 	struct cds_ft_node *en;
-	const struct urcu_txn_record *r;
+	const struct ft_txn_rec *r;
 	struct cds_ft_inode_flag *pw;
 	void **field;
 
 	if (!child)
 		return NULL;
 	if (!ft_node_external(child))
-		return ft_count_walk_survivor_meta(ft, desc, skip);
+		return ft_count_walk_survivor_meta(ft, ryw, skip);
 	en = (struct cds_ft_node *) child;
 	if (ft->ordered_list) {
 		void *prev = ft_dereference_prev_resolved(en);
@@ -356,8 +355,8 @@ struct cds_ft_metadata *ft_rekey_cow_skip_meta_ryw(struct cds_ft *ft,
 	 * may enter the txn's write set below, and a raw read would launder a
 	 * peer's parked proxy into the peer's uncommitted parent.
 	 */
-	r = urcu_txn_find(desc, field);
-	pw = r ? (struct cds_ft_inode_flag *) r->new_ptr :
+	r = ft_txn_find(ryw, field);
+	pw = r ? (struct cds_ft_inode_flag *) ft_txn_rec_new(r) :
 		(struct cds_ft_inode_flag *) ft_txn_load(txn->mtxn, field,
 			FT_FLIP_PROXY_TAG);
 	pw = ft_parent_prefix_strip(pw);
@@ -410,14 +409,14 @@ struct cds_ft_metadata *ft_rekey_cow_glue_fresh_meta(struct cds_ft *ft,
 /* The node's key count as this commit will leave it (see @ryw above). */
 static inline
 unsigned long ft_rekey_cow_nr_keys(const struct cds_ft_metadata *m,
-		struct urcu_txn_desc *desc)
+		struct urcu_txn *ryw)
 {
-	if (desc) {
-		const struct urcu_txn_record *r = urcu_txn_find(desc,
+	if (ryw) {
+		const struct ft_txn_rec *r = ft_txn_find(ryw,
 			(void **) (uintptr_t) &m->nr_keys);
 
 		if (r)
-			return (unsigned long) r->new_ptr >> 1;
+			return (unsigned long) ft_txn_rec_new(r) >> 1;
 	}
 	return ft_nr_keys_get(m);
 }
@@ -434,7 +433,7 @@ unsigned long ft_rekey_cow_nr_keys(const struct cds_ft_metadata *m,
 static
 int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx, struct ft_lock_ctx *cctx,
-		struct ft_flip_txn *txn, struct urcu_txn_desc *desc,
+		struct ft_flip_txn *txn, struct urcu_txn *ryw,
 		struct cds_ft_inode_flag *iter, struct cds_ft_inode_flag *new_flag,
 		struct cds_ft_inode_flag **slot, struct cds_ft_inode_flag **src_slot,
 		unsigned int child_depth, const struct ft_rekey_cow_fresh *fresh,
@@ -446,10 +445,10 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 
 	(void) src_slot;
 
-	if (desc) {
+	if (ryw) {
 		struct ft_glue *glue = ctx ? (struct ft_glue *) ctx->held.glue :
 			NULL;
-		const struct urcu_txn_record *pr;
+		const struct ft_txn_rec *pr;
 		uintptr_t hs;
 		bool rat;
 
@@ -472,7 +471,7 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 			 * REPLACED, and what cannot be named coherently is
 			 * refused rather than guessed.
 			 */
-			cm = ft_rekey_cow_skip_meta_ryw(ft, txn, desc, iter);
+			cm = ft_rekey_cow_skip_meta_ryw(ft, txn, ryw, iter);
 			if (!cm)
 				return -EDOM;	/* FT_REKEY_UNCOVERED, defined below */
 			ryw_meta = true;
@@ -480,7 +479,7 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 #endif
 			cm = ft_child_state_meta(ft, iter);
 		if (cm) {
-			pr = urcu_txn_find(desc, (void **) &cm->parent_word);
+			pr = ft_txn_find(ryw, (void **) &cm->parent_word);
 			/* 2. an earlier step's unpublished product, NAMED. */
 			if (!pr && ft_rekey_cow_fresh_has(fresh, cm)) {
 				rcu_assign_pointer(cm->parent_word, new_flag);
@@ -492,7 +491,7 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 				bool held_earlier = ft_lock_ctx_holds(ctx, cm,
 					&hs, &rat);
 				void *old_pw, *new_pw;
-				unsigned int kind;
+				bool sw;
 
 				/*
 				 * An SW record on a word this op does not hold
@@ -500,8 +499,7 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 				 * is legal only under the holder's fence); refuse
 				 * rather than hand the word a second terminal.
 				 */
-				if (pr && pr->kind == URCU_TXN_KIND_SW &&
-						!held_earlier)
+				if (pr && ft_txn_rec_sw(pr) && !held_earlier)
 					return -EDOM;	/* FT_REKEY_UNCOVERED, defined below */
 				/*
 				 * The parent word, chained onto the earlier
@@ -513,13 +511,12 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 				 * offset is unchanged (the copy is verbatim) and so
 				 * is the incoming byte: neither is recorded.
 				 */
-				old_pw = pr ? pr->new_ptr : ft_txn_load(txn->mtxn,
+				old_pw = pr ? ft_txn_rec_new(pr) : ft_txn_load(txn->mtxn,
 					(void **) &cm->parent_word,
 					FT_FLIP_PROXY_TAG);
 				new_pw = ft_parent_word(ft, new_flag);
-				kind = pr ? pr->kind : (held_earlier ?
-					URCU_TXN_KIND_SW : URCU_TXN_KIND_MW);
-				if (kind == URCU_TXN_KIND_SW)
+				sw = pr ? ft_txn_rec_sw(pr) : held_earlier;
+				if (sw)
 					ft_flip_txn_record_reserved(txn, cm,
 						(void **) &cm->parent_word, old_pw,
 						new_pw);
@@ -536,14 +533,12 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 				 * records.
 				 */
 				/*
-				 * Re-read: the records just above can have
-				 * grown (moved) the descriptor.
+				 * Through the handle: the records just above
+				 * can have grown (moved) the record array.
 				 */
-				struct urcu_txn_desc *now =
-					ft_rekey_cow_desc(txn, true);
-
-				if (!held_earlier && (!now || !urcu_txn_find(now,
-						(void **) &cm->state)) &&
+				if (!held_earlier &&
+						!ft_txn_recorded(txn->mtxn,
+							(void **) &cm->state) &&
 						!ft_flip_txn_releases_after(txn, cm)) {
 					uintptr_t live = (uintptr_t) ft_txn_load(
 						txn->mtxn, (void **) &cm->state,
@@ -574,13 +569,13 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 						&ft_ord_cell_ptr(prev)->parent;
 			} else
 				field = (void **) &en->prev;
-			pr = field ? urcu_txn_find(desc, field) : NULL;
+			pr = field ? ft_txn_find(ryw, field) : NULL;
 			if (pr) {
 				ft_head_stamp_incoming_byte(ft, en, new_flag, slot);
 				ft_flip_txn_record_head_back_edge_owned(txn,
-					field, pr->new_ptr,
+					field, ft_txn_rec_new(pr),
 					ft_head_parent_word_slot(new_flag, slot),
-					ft_back_edge_owner(pr->new_ptr)
+					ft_back_edge_owner(ft_txn_rec_new(pr))
 					FT_BE_SITE(FT_BE_REPARENT_META, ctx));
 				return 0;
 			}
@@ -825,7 +820,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	new_flag = ft_node_flag(new_node, ti);
 	child_depth = stop_depth + 1;	/* a bitmap node spans ONE key byte */
 	ft_nr_keys_store(ft, new_meta, ft_rekey_cow_nr_keys(stop_meta,
-		ft_rekey_cow_desc(txn, ryw)),
+		ft_rekey_cow_ryw(txn, ryw)),
 		CMM_RELAXED);
 
 	/*
@@ -853,7 +848,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				continue;
 			ft_node_get_nth_skip(stop_flag, &src_slot, v, FT_PF_NONE);
 			if (!ft_rekey_cow_slot_value(txn,
-					ft_rekey_cow_desc(txn, ryw), src_slot,
+					ft_rekey_cow_ryw(txn, ryw), src_slot,
 					&iter)) {
 				ret = -EAGAIN;
 				goto abandon;
@@ -883,7 +878,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			ft_node_get_nth_skip(stop_flag, &src_slot, (uint8_t) i,
 					FT_PF_NONE);
 			if (!ft_rekey_cow_slot_value(txn,
-					ft_rekey_cow_desc(txn, ryw), src_slot,
+					ft_rekey_cow_ryw(txn, ryw), src_slot,
 					&iter)) {
 				ret = -EAGAIN;
 				goto abandon;
@@ -949,7 +944,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			ft_node_get_nth_skip(new_flag, &slot, v, FT_PF_NONE);
 			ft_node_get_nth_skip(stop_flag, &src_slot, v, FT_PF_NONE);
 			ret = ft_rekey_cow_reparent_child(ft, ctx, &cctx, txn,
-				ft_rekey_cow_desc(txn, ryw),
+				ft_rekey_cow_ryw(txn, ryw),
 				iter, new_flag, slot, src_slot, child_depth, fresh,
 				marks, &nm, nr_marks);
 			if (ret)
@@ -966,7 +961,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			ft_node_get_nth_skip(stop_flag, &src_slot, (uint8_t) i,
 					FT_PF_NONE);
 			ret = ft_rekey_cow_reparent_child(ft, ctx, &cctx, txn,
-				ft_rekey_cow_desc(txn, ryw),
+				ft_rekey_cow_ryw(txn, ryw),
 				iter, new_flag, slot, src_slot, child_depth, fresh,
 				marks, &nm, nr_marks);
 			if (ret)

@@ -97,12 +97,106 @@ void *ft_txn_read(void **slot, uintptr_t tag)
 	return urcu_txn_read(slot, tag);
 }
 
+/*
+ * THE TXN'S OWN RECORDS.  FT reads what a txn recorded and never edits it:
+ * a struct ft_txn_rec is one recorded edge, read through the accessors
+ * below.  Lookups take the HANDLE, not the engine's record array, because
+ * a record or a reservation that grows the array moves it: a pointer to
+ * the array taken earlier names the old block (6f774617).
+ */
+struct ft_txn_rec;
+
+/* Does the txn behind @h hold a record set (not empty, not out of memory)? */
+FT_TXN_INLINE
+bool ft_txn_live(const struct urcu_txn *h)
+{
+	return h && h->desc && h->desc != URCU_TXN_ENOMEM;
+}
+
+/* The txn's record on @slot, or NULL.  @h may be NULL. */
+FT_TXN_INLINE
+const struct ft_txn_rec *ft_txn_find(struct urcu_txn *h, void **slot)
+{
+	if (!ft_txn_live(h))
+		return NULL;
+	return (const struct ft_txn_rec *) urcu_txn_find(h->desc, slot);
+}
+
 /* Has the txn behind @h recorded an edge on @slot? */
 FT_TXN_INLINE
 bool ft_txn_recorded(struct urcu_txn *h, void **slot)
 {
-	return h->desc && h->desc != URCU_TXN_ENOMEM &&
-		urcu_txn_find(h->desc, slot) != NULL;
+	return ft_txn_find(h, slot) != NULL;
+}
+
+/* A record's expected old value. */
+FT_TXN_INLINE
+void *ft_txn_rec_old(const struct ft_txn_rec *r)
+{
+	return ((const struct urcu_txn_record *) r)->old_ptr;
+}
+
+/* A record's new value: what the slot holds once the txn commits. */
+FT_TXN_INLINE
+void *ft_txn_rec_new(const struct ft_txn_rec *r)
+{
+	return ((const struct urcu_txn_record *) r)->new_ptr;
+}
+
+/*
+ * Was the edge recorded SW (a park under the holder's lock) rather than MW
+ * (installed by a CAS against its expected old)?  Always, under the SW
+ * engine.
+ */
+FT_TXN_INLINE
+bool ft_txn_rec_sw(const struct ft_txn_rec *r)
+{
+	return ((const struct urcu_txn_record *) r)->kind == URCU_TXN_KIND_SW;
+}
+
+/* How many edges the txn behind @h has recorded. */
+FT_TXN_INLINE
+unsigned int ft_txn_nr_records(const struct urcu_txn *h)
+{
+	return ft_txn_live(h) ? h->desc->nr : 0;
+}
+
+/*
+ * Where the txn behind @h stands.  EMPTY: no record set (none yet, or out of
+ * memory).  A record set is UNDECIDED until its commit decides it.
+ */
+enum ft_txn_state {
+	FT_TXN_EMPTY,
+	FT_TXN_UNDECIDED,
+	FT_TXN_COMMITTED,
+	FT_TXN_FAILED,
+};
+
+FT_TXN_INLINE
+enum ft_txn_state ft_txn_state(const struct urcu_txn *h)
+{
+	unsigned long st;
+
+	if (!ft_txn_live(h))
+		return FT_TXN_EMPTY;
+	st = urcu_txn_desc_status(h->desc);
+	if (st == URCU_TXN_DESC_UNDECIDED)
+		return FT_TXN_UNDECIDED;
+	return st == URCU_TXN_DESC_SUCCEEDED ? FT_TXN_COMMITTED :
+		FT_TXN_FAILED;
+}
+
+/*
+ * Drop the txn's record set without committing it.  An out-of-memory mark
+ * stays, so the failure still surfaces at the commit.
+ */
+FT_TXN_INLINE
+void ft_txn_discard(struct urcu_txn *h)
+{
+	if (ft_txn_live(h)) {
+		urcu_txn_destroy(h->desc);
+		h->desc = NULL;
+	}
 }
 
 /*

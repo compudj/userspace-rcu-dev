@@ -4157,8 +4157,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_at(FT_TK_SITE_PARAM
 	if (!t)
 		return NULL;
 	if (!ft_flip_txn_reserve(t, cap)) {
-		if (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM)
-			urcu_txn_destroy(t->mtxn->desc);
+		ft_txn_discard(t->mtxn);
 		ft_flip_txn_free(t);
 		return NULL;
 	}
@@ -4485,8 +4484,7 @@ bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
 static inline
 bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
 {
-	unsigned int nr = (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM) ?
-			t->mtxn->desc->nr : 0;
+	unsigned int nr = ft_txn_nr_records(t->mtxn);
 	/*
 	 * ☠ WIDEN FROM WHAT THIS ATTEMPT OWES, AND @reserved IS WHAT SAYS SO.
 	 * @min_alloc lives on the OP handle, which outlives an attempt, and the
@@ -7132,28 +7130,22 @@ void ft_flip_txn_lock_register_held(struct ft_flip_txn *t,
  * caller can read what the terminal will DO to the word.
  */
 static inline
-struct urcu_txn_record *ft_lock_terminal_pending(const struct ft_flip_txn *t,
+const struct ft_txn_rec *ft_lock_terminal_pending(const struct ft_flip_txn *t,
 		const struct cds_ft_metadata *lock)
 {
-	struct urcu_txn_desc *d;
-
 	if (!t || !t->mtxn || !lock)
 		return NULL;
-	d = t->mtxn->desc;
 	/*
-	 * ☠ URCU_TXN_ENOMEM IS A SENTINEL, NOT A DESCRIPTOR: (void *) -1.  An
-	 * UNBOUNDED txn whose grow fails parks it in @desc and the FT record
-	 * helpers carry on STICKY, surfacing it at the commit as MEMORY_ERROR
-	 * -- so a detach can reach this sweep with it in place.  Dereferencing
-	 * it here (urcu_txn_desc_status loads through it) is a SIGSEGV with the
+	 * ☠ AN OUT-OF-MEMORY TXN HAS NO RECORD SET (FT_TXN_EMPTY).  An
+	 * UNBOUNDED txn whose grow fails carries on STICKY, surfacing it at
+	 * the commit as MEMORY_ERROR -- so a detach can reach this sweep in
+	 * that state.  Reading a record set out of it was a SIGSEGV with the
 	 * orphan LOCK bits still set, where the code this replaced released
-	 * them by CAS and returned a clean MEMORY_ERROR.  Every other raw
-	 * reader of @desc in this file guards the sentinel; this one did not.
+	 * them by CAS and returned a clean MEMORY_ERROR.
 	 */
-	if (!d || d == URCU_TXN_ENOMEM ||
-			urcu_txn_desc_status(d) != URCU_TXN_DESC_UNDECIDED)
+	if (ft_txn_state(t->mtxn) != FT_TXN_UNDECIDED)
 		return NULL;
-	return urcu_txn_find(d, (void **) (void *)
+	return ft_txn_find(t->mtxn, (void **) (void *)
 		&((struct cds_ft_metadata *) (uintptr_t) lock)->state);
 }
 
@@ -7186,45 +7178,41 @@ enum ft_lock_terminal_state {
 static inline
 enum ft_lock_terminal_state ft_lock_terminal_query(const struct ft_flip_txn *t,
 		const struct cds_ft_metadata *lock,
-		struct urcu_txn_record **rec)
+		const struct ft_txn_rec **rec)
 {
-	struct urcu_txn_desc *d;
-	struct urcu_txn_record *r;
-	unsigned long st;
+	const struct ft_txn_rec *r;
+	enum ft_txn_state st;
 
 	if (rec)
 		*rec = NULL;
 	if (!t || !t->mtxn || !lock)
 		return FT_LOCK_TERMINAL_NONE;
-	d = t->mtxn->desc;
+	st = ft_txn_state(t->mtxn);
 	/*
 	 * A release STAGED after the txn (@rel_after) is this word's terminal
 	 * too, with no record to find: the txn owes it until it decides, gives
 	 * it back after a committed commit, and applied nothing otherwise.
 	 */
 	if (ft_flip_txn_releases_after(t, lock)) {
-		if (!d || d == URCU_TXN_ENOMEM ||
-				urcu_txn_desc_status(d) == URCU_TXN_DESC_UNDECIDED)
+		if (st == FT_TXN_EMPTY || st == FT_TXN_UNDECIDED)
 			return FT_LOCK_TERMINAL_PENDING;
-		return urcu_txn_desc_status(d) == URCU_TXN_DESC_SUCCEEDED ?
+		return st == FT_TXN_COMMITTED ?
 			FT_LOCK_TERMINAL_CONSUMED : FT_LOCK_TERMINAL_KEPT;
 	}
-	/* The ENOMEM sentinel is (void *) -1, not a descriptor: never deref. */
-	if (!d || d == URCU_TXN_ENOMEM)
+	if (st == FT_TXN_EMPTY)
 		return FT_LOCK_TERMINAL_NONE;
-	r = urcu_txn_find(d, (void **) (void *)
+	r = ft_txn_find(t->mtxn, (void **) (void *)
 		&((struct cds_ft_metadata *) (uintptr_t) lock)->state);
 	if (!r)
 		return FT_LOCK_TERMINAL_NONE;
 	if (rec)
 		*rec = r;
-	st = urcu_txn_desc_status(d);
-	if (st == URCU_TXN_DESC_UNDECIDED)
+	if (st == FT_TXN_UNDECIDED)
 		return FT_LOCK_TERMINAL_PENDING;
-	if (st != URCU_TXN_DESC_SUCCEEDED)
+	if (st != FT_TXN_COMMITTED)
 		return FT_LOCK_TERMINAL_KEPT;	/* failed: nothing was applied */
-	return (((uintptr_t) r->old_ptr & FT_STATE_LOCK) &&
-			!((uintptr_t) r->new_ptr & FT_STATE_LOCK)) ?
+	return (((uintptr_t) ft_txn_rec_old(r) & FT_STATE_LOCK) &&
+			!((uintptr_t) ft_txn_rec_new(r) & FT_STATE_LOCK)) ?
 		FT_LOCK_TERMINAL_CONSUMED : FT_LOCK_TERMINAL_KEPT;
 }
 
@@ -7244,7 +7232,7 @@ static inline
 bool ft_lock_terminal_drops_lock(const struct ft_flip_txn *t,
 		const struct cds_ft_metadata *lock)
 {
-	struct urcu_txn_record *r = NULL;
+	const struct ft_txn_rec *r = NULL;
 
 	/*
 	 * A release staged after the txn (@rel_after) drops the lock too, with
@@ -7254,8 +7242,8 @@ bool ft_lock_terminal_drops_lock(const struct ft_flip_txn *t,
 	if (ft_flip_txn_releases_after(t, lock))
 		return true;
 	(void) ft_lock_terminal_query(t, lock, &r);
-	return r && (((uintptr_t) r->old_ptr & FT_STATE_LOCK) &&
-			!((uintptr_t) r->new_ptr & FT_STATE_LOCK));
+	return r && (((uintptr_t) ft_txn_rec_old(r) & FT_STATE_LOCK) &&
+			!((uintptr_t) ft_txn_rec_new(r) & FT_STATE_LOCK));
 }
 
 /*
@@ -8255,18 +8243,14 @@ void ft_flip_txn_destroy(struct ft_flip_txn *t)
 		FT_ORPHAN_CONSUMED();
 		t->nr_locks = 0;
 	}
-	if (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM) {
-		urcu_txn_destroy(t->mtxn->desc);
-		/*
-		 * Leave a BOUND persistent handle clean for the op's next
-		 * attempt / its urcu_txn_end() (which would otherwise
-		 * double-destroy).  A sticky URCU_TXN_ENOMEM marker is
-		 * preserved above (only a live descriptor is destroyed), so
-		 * an OOM already recorded on the handle still surfaces.
-		 * Harmless for a standalone txn (@own dies with the wrapper).
-		 */
-		t->mtxn->desc = NULL;
-	}
+	/*
+	 * Leave a BOUND persistent handle clean for the op's next attempt /
+	 * its urcu_txn_end() (which would otherwise double-destroy).  A sticky
+	 * out-of-memory mark is kept, so an OOM already recorded on the handle
+	 * still surfaces.  Harmless for a standalone txn (@own dies with the
+	 * wrapper).
+	 */
+	ft_txn_discard(t->mtxn);
 	ft_flip_txn_free(t);
 }
 
@@ -9770,16 +9754,12 @@ bool ft_flip_txn_record_is_noop(const struct ft_flip_txn *t, void **slot,
 	(void) t; (void) slot; (void) old_ptr; (void) new_ptr;
 	return false;
 #else
-	struct urcu_txn_desc *d;
-	const struct urcu_txn_record *r;
+	const struct ft_txn_rec *r;
 
 	if (old_ptr != new_ptr || !t->mtxn)
 		return false;
-	d = t->mtxn->desc;
-	if (!d || d == URCU_TXN_ENOMEM)
-		return false;
-	r = urcu_txn_find(d, slot);
-	return r && r->new_ptr == old_ptr;
+	r = ft_txn_find(t->mtxn, slot);
+	return r && ft_txn_rec_new(r) == old_ptr;
 #endif
 }
 
@@ -12374,13 +12354,12 @@ bool ft_dlm_covering_release_recorded(const struct ft_lock_ctx *ctx,
 	const struct ft_held_set *hs;
 
 	for (hs = &ctx->held; hs; hs = hs->outer) {
-		struct urcu_txn_desc *d = hs->txn ? hs->txn->mtxn->desc : NULL;
-		const struct urcu_txn_record *r;
+		const struct ft_txn_rec *r;
 
-		if (hs->txn && ft_flip_txn_releases_after(hs->txn, lock))
-			return true;
-		if (!d || d == URCU_TXN_ENOMEM)
+		if (!hs->txn)
 			continue;
+		if (ft_flip_txn_releases_after(hs->txn, lock))
+			return true;
 		/*
 		 * ANY record on the word's slot: the txn owns the word's
 		 * transition, whatever its spelling -- the plain release
@@ -12391,7 +12370,7 @@ bool ft_dlm_covering_release_recorded(const struct ft_lock_ctx *ctx,
 		 * the designed fusion dedupe into a refusal livelock
 		 * (measured, exponential MW test 20).
 		 */
-		r = urcu_txn_find(d, (void **) &lock->state);
+		r = ft_txn_find(hs->txn->mtxn, (void **) &lock->state);
 		if (r)
 			return true;
 	}
@@ -13279,23 +13258,20 @@ take:
 				 */
 				for (hs__ = ctx ? &ctx->held : NULL; hs__;
 						hs__ = hs__->outer) {
-					struct urcu_txn_desc *d__ =
-						hs__->txn ?
-						hs__->txn->mtxn->desc : NULL;
-					const struct urcu_txn_record *r__;
+					const struct ft_txn_rec *r__;
 
-					if (hs__->txn &&
-						ft_flip_txn_releases_after(
+					if (!hs__->txn)
+						continue;
+					if (ft_flip_txn_releases_after(
 							hs__->txn, lock))
 						goto e2_closing;
-					if (!d__ || d__ == URCU_TXN_ENOMEM)
-						continue;
-					r__ = urcu_txn_find(d__, (void **)
-						&lock->state);
+					r__ = ft_txn_find(hs__->txn->mtxn,
+						(void **) &lock->state);
 					if (!r__ || !(((uintptr_t)
-							r__->old_ptr) &
+							ft_txn_rec_old(r__)) &
 							FT_STATE_LOCK) ||
-						(((uintptr_t) r__->new_ptr) &
+						(((uintptr_t)
+							ft_txn_rec_new(r__)) &
 							FT_STATE_LOCK))
 						continue;
 e2_closing:
@@ -14814,7 +14790,6 @@ static inline
 void ft_cell_edges_prove_unfailable(const char *who, struct ft_flip_txn *txn,
 		const struct ft_ord_cell_edge *edges, unsigned int n)
 {
-	struct urcu_txn_desc *d = txn->mtxn->desc;
 	unsigned int i;
 
 	for (i = 0; i < n; i++) {
@@ -14823,8 +14798,7 @@ void ft_cell_edges_prove_unfailable(const char *who, struct ft_flip_txn *txn,
 
 		if (e->root || ft_edge_tag(e) != URCU_TXN_TAG)
 			continue;
-		if (d && d != URCU_TXN_ENOMEM &&
-				urcu_txn_find(d, (void **) e->slot))
+		if (ft_txn_recorded(txn->mtxn, (void **) e->slot))
 			continue;
 		live = ft_ord_cell_resolve_ord(
 			(struct urcu_txn_list_node *const *) e->slot);
@@ -15120,11 +15094,10 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 	 */
 #ifndef FT_DEBUG_TOMBSTONE_RERECORD
 	{
-		struct urcu_txn_desc *d = t->mtxn ? t->mtxn->desc : NULL;
-		const struct urcu_txn_record *r = (d && d != URCU_TXN_ENOMEM) ?
-			urcu_txn_find(d, (void **) &meta->state) : NULL;
+		const struct ft_txn_rec *r = ft_txn_find(t->mtxn,
+			(void **) &meta->state);
 
-		if (r && ((uintptr_t) r->new_ptr & FT_STATE_TOMBSTONE)) {
+		if (r && ((uintptr_t) ft_txn_rec_new(r) & FT_STATE_TOMBSTONE)) {
 			ft_flip_txn_lock_mark_retiring(t, meta);
 			return old;
 		}
@@ -16530,13 +16503,12 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 	 * and removes a path nothing covers.)
 	 */
 	{
-		struct urcu_txn_desc *desc = t->mtxn->desc;
-		const struct urcu_txn_record *r = NULL;
+		const struct ft_txn_rec *r = ft_txn_find(t->mtxn,
+			(void **) &node->state);
 
-		if (desc && desc != URCU_TXN_ENOMEM)
-			r = urcu_txn_find(desc, (void **) &node->state);
 		if (caa_unlikely(r != NULL &&
-				((uintptr_t) r->new_ptr & FT_STATE_TOMBSTONE)))
+				((uintptr_t) ft_txn_rec_new(r) &
+					FT_STATE_TOMBSTONE)))
 			return;		/* the terminal is already recorded */
 	}
 	{
@@ -16839,13 +16811,10 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 			 * whose record masks the lock bit out of both values.
 			 * The descriptor is asked only for the carve-out.
 			 */
-			struct urcu_txn_desc *desc = t->mtxn->desc;
-			const struct urcu_txn_record *r = NULL;
+			const struct ft_txn_rec *r = ft_txn_find(t->mtxn,
+				(void **) &pm->state);
 
-			if (desc && desc != URCU_TXN_ENOMEM)
-				r = urcu_txn_find(desc,
-					(void **) &pm->state);
-			if (!r || !(((uintptr_t) r->new_ptr) &
+			if (!r || !(((uintptr_t) ft_txn_rec_new(r)) &
 					FT_STATE_TOMBSTONE))
 				return;
 		}
@@ -18480,10 +18449,7 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	 * resolve, so the no-op would force an extra commit attempt too.
 	 */
 	{
-		struct urcu_txn_desc *desc = t->mtxn ? t->mtxn->desc : NULL;
-
-		if (desc && desc != URCU_TXN_ENOMEM &&
-				urcu_txn_find(desc, (void **) &meta->state))
+		if (ft_txn_recorded(t->mtxn, (void **) &meta->state))
 			return;
 		if (ft_flip_txn_releases_after(t, meta))
 			return;		/* the staged release's word: held */
@@ -21004,7 +20970,7 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
  */
 static
 struct cds_ft_metadata *ft_count_walk_survivor_meta(struct cds_ft *ft,
-		struct urcu_txn_desc *desc, void *new_raw)
+		struct urcu_txn *ryw, void *new_raw)
 {
 	struct cds_ft_inode_flag *nf = (struct cds_ft_inode_flag *) new_raw;
 
@@ -21012,14 +20978,14 @@ struct cds_ft_metadata *ft_count_walk_survivor_meta(struct cds_ft *ft,
 	if (ft_node_skip_compressed(nf)) {
 		struct cds_ft_inode_flag *child = ft_skip_child_ptr(nf);
 		struct cds_ft_metadata *cm;
-		const struct urcu_txn_record *pr;
+		const struct ft_txn_rec *pr;
 		struct cds_ft_inode_flag *pw;
 
 		if (!child || ft_node_external(child))
 			return NULL;
 		cm = cds_ft_item_to_metadata(ft_node_ptr(child));
-		pr = urcu_txn_find(desc, (void **) &cm->parent_word);
-		pw = pr ? (struct cds_ft_inode_flag *) pr->new_ptr :
+		pr = ft_txn_find(ryw, (void **) &cm->parent_word);
+		pw = pr ? (struct cds_ft_inode_flag *) ft_txn_rec_new(pr) :
 			rcu_dereference(cm->parent_word);
 		if (ft_node_flip_proxy(pw))
 			return NULL;
@@ -21030,7 +20996,7 @@ struct cds_ft_metadata *ft_count_walk_survivor_meta(struct cds_ft *ft,
 		return ft_flag_to_metadata(ft, pw);
 	}
 #else
-	(void) desc;
+	(void) ryw;
 #endif
 	return ft_flag_to_metadata(ft, nf);
 }
@@ -21040,7 +21006,7 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		struct cds_ft_inode_flag *stable_base, long delta)
 {
 	struct cds_ft_inode_flag *cur = stable_base;
-	struct urcu_txn_desc *desc = NULL;
+	struct urcu_txn *ryw = NULL;
 	/*
 	 * The survivor bodies this walk has already charged.  Bounded by the
 	 * walk itself: one level of the chain adds at most one body.
@@ -21057,13 +21023,11 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		unsigned long old_raw, new_raw;
 
 		/*
-		 * Re-read per level: the previous level's record can have
-		 * grown the descriptor, and a grow MOVES it (see
-		 * ft_rekey_cow_desc) -- a cached pointer would look this
-		 * commit's records up in the old block and miss them.
+		 * Per level: the previous level's record can have given the
+		 * txn its first record set.  The lookups go through the
+		 * handle, which a grow of the record array cannot leave stale.
 		 */
-		desc = (t->mtxn && t->mtxn->desc != URCU_TXN_ENOMEM) ?
-			t->mtxn->desc : NULL;
+		ryw = ft_txn_live(t->mtxn) ? t->mtxn : NULL;
 
 		/*
 		 * ☠ THE CHAIN IS NOT THE OP'S OWN ANSWER EITHER -- FOLLOW THE
@@ -21119,25 +21083,27 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		 * survivor to charge; falling through keeps today's behaviour
 		 * for it.
 		 */
-		if (desc
+		if (ryw
 #ifdef FT_RED_NO_COUNT_SURVIVOR
 				&& 0	/* red control: the walk charges the retired copy again */
 #endif
 		   ) {
-			const struct urcu_txn_record *sr = urcu_txn_find(desc,
+			const struct ft_txn_rec *sr = ft_txn_find(ryw,
 				(void **) ft_resolve_parent_slot(m, ft, NULL));
+			void *s_old = sr ? ft_txn_rec_old(sr) : NULL;
+			void *s_new = sr ? ft_txn_rec_new(sr) : NULL;
 
-			if (sr && sr->old_ptr && sr->new_ptr &&
+			if (s_old && s_new &&
 					!ft_node_external((struct cds_ft_inode_flag *)
-						sr->old_ptr) &&
+						s_old) &&
 					!ft_node_external((struct cds_ft_inode_flag *)
-						sr->new_ptr) &&
+						s_new) &&
 					ft_flag_to_metadata(ft,
 						(struct cds_ft_inode_flag *)
-							sr->old_ptr) == m) {
+							s_old) == m) {
 				struct cds_ft_metadata *sm =
-					ft_count_walk_survivor_meta(ft, desc,
-						sr->new_ptr);
+					ft_count_walk_survivor_meta(ft, ryw,
+						s_new);
 
 				if (sm && sm != m) {
 					/*
@@ -21273,12 +21239,12 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		 * describes that fallback exactly -- it was only ever a
 		 * statement about PEERS, never about the op meeting itself.
 		 */
-		if (desc) {
-			const struct urcu_txn_record *r = urcu_txn_find(desc,
+		if (ryw) {
+			const struct ft_txn_rec *r = ft_txn_find(ryw,
 				(void **) &m->nr_keys);
 
 			if (r)
-				base = (unsigned long) r->new_ptr >> 1;
+				base = (unsigned long) ft_txn_rec_new(r) >> 1;
 		}
 		old_raw = base << 1;
 		new_raw = (base + delta) << 1;

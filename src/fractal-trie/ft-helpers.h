@@ -3751,14 +3751,10 @@ bool ft_dual_home_is_private(struct cds_ft *ft, const struct ft_pub_rec *rec,
 		struct cds_ft_inode_flag **skip_slot,
 		struct cds_ft_inode_flag *skip_owner_nf)
 {
-	struct urcu_txn_desc *desc;
-
 	if (!rec || !rec->mtxn || skip_slot == &ft->root || !skip_owner_nf)
 		return false;
-	desc = rec->mtxn->desc;
-	if (!desc || desc == URCU_TXN_ENOMEM)
-		return false;
-	if (!urcu_txn_find(desc, (void **) (uintptr_t) &cn_meta->parent_word))
+	if (!ft_txn_recorded(rec->mtxn,
+			(void **) (uintptr_t) &cn_meta->parent_word))
 		return false;
 #if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
 	{

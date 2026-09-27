@@ -6658,7 +6658,7 @@ end:
 				 */
 				struct ft_flip_txn *pend_txn = record_only ?
 					shared_txn : NULL;
-				struct urcu_txn_record *pend =
+				const struct ft_txn_rec *pend =
 					ft_lock_terminal_pending(pend_txn,
 						orphan_held[oi].lock);
 				/*
@@ -6717,7 +6717,7 @@ end:
 							orphan_held[oi].lock_snap,
 							orphan_held[oi].member);
 						ls = pend_txn->nr_locks - 1;
-						if ((uintptr_t) pend->new_ptr &
+						if ((uintptr_t) ft_txn_rec_new(pend) &
 								FT_STATE_TOMBSTONE)
 							pend_txn->locks[ls].
 								tombstone_terminal =
