@@ -3400,11 +3400,20 @@ void ft_txn_op_init(struct cds_ft *ft, struct ft_op *op)
 
 #ifdef FT_DEBUG_LANE
 __attribute__((weak)) unsigned long ft_op_lane_nr_begin, ft_op_lane_nr_want,
-	ft_op_lane_nr_enter, ft_op_lane_maxretry, ft_op_lane_nr_cabort;
+	ft_op_lane_nr_enter, ft_op_lane_maxretry, ft_op_lane_nr_cabort,
+	ft_op_lane_nr_rwait, ft_op_lane_nr_rwait_clear;
 # define FT_OP_LANE_STAT(c)	uatomic_inc(&ft_op_lane_nr_##c)
 #else
 # define FT_OP_LANE_STAT(c)	do { } while (0)
 #endif
+
+/*
+ * The lock word whose LOCK refused this thread's current attempt (the
+ * latest refusal), or NULL.  Stamped by ft_dlm_lock_now, cleared at every
+ * ft_op_begin -- a word left over from an earlier attempt or op must never
+ * drive a wait -- and read by ft_txn_attempt_bail (ft_lane_refused_wait).
+ */
+static __thread const struct cds_ft_metadata *ft_acq_refused_word;
 
 /*
  * The op's cost.  The MCAS engine learns it (loads + records, high-water)
@@ -3490,6 +3499,7 @@ static inline
 void ft_op_begin(struct ft_op *op)
 {
 	FT_OP_LANE_STAT(begin);
+	ft_acq_refused_word = NULL;
 #ifdef FT_DEBUG_LANE
 	if (op->retry > ft_op_lane_maxretry)
 		ft_op_lane_maxretry = op->retry;	/* racy max, diagnosis only */
@@ -3690,10 +3700,56 @@ static inline void ft_dbg_held_at(const struct cds_ft_metadata *meta, int line)
 # define FT_DBG_HELD_AT(meta)	do { (void) (meta); } while (0)
 #endif
 
+/*
+ * ☞ A LANE HOLDER WAITS FOR THE WORD, NOT FOR ANOTHER DESCENT.
+ *
+ * The lane orders its own members only.  A peer that took a lock before the
+ * episode began is outside it, so an op holding the lane that is refused by
+ * that lock bails, re-enters the empty lane at once, and re-descends into the
+ * same held word: measured on inv_prefix_pair_compressed_holder (2 CPUs), one
+ * remove took 43,463 attempts in 21 ms against a ~0.5 ms hold, burning the
+ * CPU a preempted holder needs.  ft_acq_lane_backoff cannot help: it queues
+ * on the lane, which this op already held.
+ *
+ * So after the bail -- lane released, read section closed, nothing held -- an
+ * op that held the lane for the refused attempt waits for the word to clear,
+ * then re-attempts at once.  The wait YIELDS (the ladder's microsecond rungs,
+ * 10us doubling to 640us, ~1.3 ms in all), because spinning here is what
+ * starves the holder, and stays ONLINE: a point op may run inside the
+ * caller's read section (a point op is not a quiescent state).  Bounded, so a
+ * word that stays held (a long bulk tail, or a lock this very thread holds)
+ * costs one bounded wait per attempt, never a hang.  Arena metadata is never
+ * unmapped, so the racy read cannot fault.
+ */
+#ifndef FT_LANE_REFUSED_WAIT_SPIN
+# define FT_LANE_REFUSED_WAIT_SPIN	100	/* cpu_relax before the first sleep */
+#endif
+
+static inline
+void ft_lane_refused_wait(void)
+{
+	const struct cds_ft_metadata *w = ft_acq_refused_word;
+	struct urcu_wait_ladder wl = URCU_WAIT_LADDER_INIT;
+
+	ft_acq_refused_word = NULL;
+	if (!w)
+		return;
+	FT_OP_LANE_STAT(rwait);
+	while (CMM_LOAD_SHARED(w->state) & FT_STATE_LOCK) {
+		if (wl.step >= FT_LANE_REFUSED_WAIT_SPIN +
+				URCU_WAIT_LADDER_US_RUNGS)
+			return;			/* the microsecond rungs are spent */
+		urcu_wait_ladder_wait(&wl, FT_LANE_REFUSED_WAIT_SPIN);
+	}
+	FT_OP_LANE_STAT(rwait_clear);
+}
+
 static inline
 void ft_txn_attempt_bail(struct ft_op *op, bool open)
 {
 	if (open) {
+		bool laned = op->in_lane;
+
 		ft_op_conflict(op);
 		/*
 		 * Then once per refused lock-set.  An attempt that lost three
@@ -3706,6 +3762,12 @@ void ft_txn_attempt_bail(struct ft_op *op, bool open)
 			ft_acq_contended--;
 		}
 		ft_op_end(op);
+#ifndef FT_DEBUG_LANE_REFUSED_SPIN
+		if (laned)
+			ft_lane_refused_wait();
+#else
+		(void) laned;
+#endif
 	}
 	/*
 	 * Refusals from an attempt that went on to SUCCEED belong to no retry.
@@ -11803,13 +11865,17 @@ int ft_dlm_lock_now(struct cds_ft_metadata *meta, uintptr_t *snap)
 
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_SA_DEAD_REFUSE |
 			FT_STATE_LOCK))) {
-		if (s & FT_STATE_LOCK)
+		if (s & FT_STATE_LOCK) {
 			FT_LL_REFUSED(meta, s);
+			ft_acq_refused_word = meta;	/* ft_lane_refused_wait */
+		}
 		return -EAGAIN;
 	}
 	if (caa_unlikely(uatomic_cmpxchg(&meta->state, s,
-			s | FT_STATE_LOCK) != s))
-		return -EAGAIN;		/* a peer won it between load and CAS */
+			s | FT_STATE_LOCK) != s)) {
+		ft_acq_refused_word = meta;	/* a peer won it between load and CAS */
+		return -EAGAIN;
+	}
 	*snap = s;
 #ifdef FT_DEBUG_BORN_RELEASE
 	ft_born_forget(meta);
@@ -12100,7 +12166,8 @@ static void ft_lane_report(void)
 		"  op wanted the lane           %12lu  %5.1f%% of begins\n"
 		"  op ESCALATED (took the lane) %12lu  %5.1f%% of begins\n"
 		"  max retry seen               %12lu\n"
-		"  insert commit aborts (aged)  %12lu\n",
+		"  insert commit aborts (aged)  %12lu\n"
+		"  lane holder refused waits    %12lu  (word cleared %lu)\n",
 		ft_op_lane_nr_begin,
 		ft_op_lane_nr_want,
 		ft_op_lane_nr_begin ?
@@ -12108,7 +12175,8 @@ static void ft_lane_report(void)
 		ft_op_lane_nr_enter,
 		ft_op_lane_nr_begin ?
 			100.0*ft_op_lane_nr_enter/ft_op_lane_nr_begin : 0.0,
-		ft_op_lane_maxretry, ft_op_lane_nr_cabort);
+		ft_op_lane_maxretry, ft_op_lane_nr_cabort,
+		ft_op_lane_nr_rwait, ft_op_lane_nr_rwait_clear);
 }
 # define FT_LANE(c)	uatomic_inc(&ft_lane_##c)
 #else
