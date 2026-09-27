@@ -3400,7 +3400,7 @@ void ft_txn_op_init(struct cds_ft *ft, struct ft_op *op)
 
 #ifdef FT_DEBUG_LANE
 __attribute__((weak)) unsigned long ft_op_lane_nr_begin, ft_op_lane_nr_want,
-	ft_op_lane_nr_enter, ft_op_lane_maxretry;
+	ft_op_lane_nr_enter, ft_op_lane_maxretry, ft_op_lane_nr_cabort;
 # define FT_OP_LANE_STAT(c)	uatomic_inc(&ft_op_lane_nr_##c)
 #else
 # define FT_OP_LANE_STAT(c)	do { } while (0)
@@ -12099,7 +12099,8 @@ static void ft_lane_report(void)
 		"  op begin                     %12lu\n"
 		"  op wanted the lane           %12lu  %5.1f%% of begins\n"
 		"  op ESCALATED (took the lane) %12lu  %5.1f%% of begins\n"
-		"  max retry seen               %12lu\n",
+		"  max retry seen               %12lu\n"
+		"  insert commit aborts (aged)  %12lu\n",
 		ft_op_lane_nr_begin,
 		ft_op_lane_nr_want,
 		ft_op_lane_nr_begin ?
@@ -12107,7 +12108,7 @@ static void ft_lane_report(void)
 		ft_op_lane_nr_enter,
 		ft_op_lane_nr_begin ?
 			100.0*ft_op_lane_nr_enter/ft_op_lane_nr_begin : 0.0,
-		ft_op_lane_maxretry);
+		ft_op_lane_maxretry, ft_op_lane_nr_cabort);
 }
 # define FT_LANE(c)	uatomic_inc(&ft_lane_##c)
 #else

@@ -4515,8 +4515,21 @@ insert_done:
 	 * re-descend and retry.
 	 */
 	if (cst == URCU_TXN_STATUS_ABORT) {
-		/* The commit already aged the handle (retry++, keep the turn). */
+		/*
+		 * A BAIL, AND IT AGES THE OP.  The content txn is standalone
+		 * (ft_insert_commit_arm), so its commit aged its own handle,
+		 * never @optxn: restarting on a bare end left the op at the same
+		 * age however often it lost, and an insert that kept losing its
+		 * commit never escalated into the lane.  Every retry edge of a
+		 * loop that commits through a per-attempt txn is a bail
+		 * (ft_txn_attempt_bail).
+		 */
+		FT_OP_LANE_STAT(cabort);
+#ifdef FT_DEBUG_INSERT_ABORT_UNAGED
 		ft_op_end(&optxn);
+#else
+		ft_txn_attempt_bail(&optxn, true);
+#endif
 		goto restart_attempt;
 	}
 	if (caa_unlikely(cst == URCU_TXN_STATUS_MEMORY_ERROR && ret == 0)) {
@@ -6315,10 +6328,16 @@ insert_replace_done:
 		 * A peer won the one-commit's expected-value CAS: nothing
 		 * published, the fresh cluster rolled back by the txn's on-abort
 		 * action, and @precell was not spliced (the commit is atomic).
-		 * Re-descend.  The commit already aged the handle, so this edge
-		 * KEEPS the turn -- ft_txn_attempt_end, not _bail.
+		 * Re-descend, as a BAIL that ages the op: the content txn is
+		 * standalone, so its commit aged its own handle, never @optxn
+		 * (see _cds_ft_insert's twin edge).
 		 */
+		FT_OP_LANE_STAT(cabort);
+#ifdef FT_DEBUG_INSERT_ABORT_UNAGED
 		ft_txn_attempt_end(&optxn, true);
+#else
+		ft_txn_attempt_bail(&optxn, true);
+#endif
 		goto restart_replace_attempt;
 	}
 	if (caa_unlikely(cst != URCU_TXN_STATUS_OK) && ret == 0) {
