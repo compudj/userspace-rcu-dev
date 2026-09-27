@@ -14478,12 +14478,36 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 	 * fuses with a recompaction: ft_node_recompact already recorded the old
 	 * node's fenced {LOCK|s -> TOMBSTONE|s} edge into @t, so a plain
 	 * tombstone reading the COMMITTED old disagrees with that pending new.
-	 * The RYW load returns TOMBSTONE-already-set there, chaining to a no-op
-	 * upgrade; with no prior edge it returns the committed value, so every
-	 * other call site is behaviour-identical.
+	 * The RYW load returns TOMBSTONE-already-set there; with no prior edge it
+	 * returns the committed value, so every other call site is
+	 * behaviour-identical.
 	 */
 	uintptr_t old = (uintptr_t) urcu_txn_load(t->mtxn,
 			(void **) &meta->state, FT_STATE_PROXY);
+
+	/*
+	 * ☞ ALREADY RETIRED BY THIS TXN: RECORD NOTHING.  That same-value
+	 * {s|T -> s|T} used to chain onto the earlier retire as a no-op
+	 * upgrade, which the MW front end fuses and the SW engine cannot: its
+	 * record() appends blindly, and a second record on one slot is a
+	 * second park.  The same-slot census (-DFT_DEBUG_SAME_SLOT) measured it
+	 * as the whole residue after the lock releases left the txn (19k per
+	 * ft_inv MW run, the graft's commit-time tombstone over the reserve
+	 * recompact's retire).  ASK THE DESCRIPTOR: a TOMBSTONE on the live
+	 * word alone is someone else's retire, and keeps its record.
+	 */
+#ifndef FT_DEBUG_TOMBSTONE_RERECORD
+	{
+		struct urcu_txn_desc *d = t->mtxn ? t->mtxn->desc : NULL;
+		const struct urcu_txn_record *r = (d && d != URCU_TXN_ENOMEM) ?
+			urcu_txn_find(d, (void **) &meta->state) : NULL;
+
+		if (r && ((uintptr_t) r->new_ptr & FT_STATE_TOMBSTONE)) {
+			ft_flip_txn_lock_mark_retiring(t, meta);
+			return old;
+		}
+	}
+#endif
 
 	/*
 	 * ☞ TELL THE CENSUS THIS IS A RETIRE.  The record's owner IS the node
