@@ -8734,6 +8734,79 @@ static bool ft_flip_txn_late_last(void *arg, void **slot)
 	return false;
 }
 
+#ifdef FT_DEBUG_MW_KEPT
+# ifndef FT_ABORT_ATTRIB
+#  error "-DFT_DEBUG_MW_KEPT needs -DFT_DEBUG_TXN_KIND and -DURCU_TXN_REC_DBG"
+# endif
+/*
+ * THE CAS THAT REMAIN: every record that COMMITS as MW, by its FT class and by
+ * the writer mode of the txn's trie.  These are what the SW engine
+ * (<urcu/rcu-txn-sw.h>, no CAS) cannot carry.  Counted at the commit, after
+ * every per-record gate and door 1 have decided the kind, so a class counter
+ * taken at record time (MW_ALWAYS) cannot mislead it.
+ *
+ *   fine-op     a fine trie, the op's own locks
+ *   fine-wlock  a fine trie under the FT-wide writer lock (bulk windows)
+ *   trie-wide   coarse or exclusive (door 1): expected to be all SW
+ */
+enum { FT_MK_FINE_OP, FT_MK_FINE_WLOCK, FT_MK_TRIE_WIDE, FT_MK_NR };
+static unsigned long ft_mk_mw[FT_MK_NR][FT_AB_CLS_NR + 1];
+static unsigned long ft_mk_sw[FT_MK_NR], ft_mk_txn[FT_MK_NR];
+
+static inline
+void ft_mk_note(const struct ft_flip_txn *t, const struct cds_ft *ft)
+{
+	struct urcu_txn_desc *d = t->mtxn ? t->mtxn->desc : NULL;
+	unsigned int i, mode;
+
+	if (!d || d == URCU_TXN_ENOMEM || !d->nr)
+		return;
+	mode = t->trie_wide_sw ? FT_MK_TRIE_WIDE :
+		(ft && ft_wlock_held == ft) ? FT_MK_FINE_WLOCK : FT_MK_FINE_OP;
+	uatomic_inc(&ft_mk_txn[mode]);
+	for (i = 0; i < d->nr; i++) {
+		const struct urcu_txn_record *r = &d->recs[i];
+		unsigned int c;
+
+		if (r->kind != URCU_TXN_KIND_MW) {
+			uatomic_inc(&ft_mk_sw[mode]);
+			continue;
+		}
+		c = (r->dbg_embedder & FT_AB_MIXED) ? FT_AB_CLS_NR :
+			ft_ab_code_cls(r->dbg_embedder);
+		if (c > FT_AB_CLS_NR)
+			c = FT_AB_UNSET;
+		uatomic_inc(&ft_mk_mw[mode][c]);
+	}
+}
+
+static void ft_mk_report(void) __attribute__((destructor));
+static void ft_mk_report(void)
+{
+	static const char * const mn[FT_MK_NR] = {
+		"fine-op", "fine-wlock", "trie-wide" };
+	unsigned int m, c;
+
+	fprintf(stderr, "=== FT_DEBUG_MW_KEPT: records committed as MW (CAS) ===\n");
+	for (m = 0; m < FT_MK_NR; m++) {
+		unsigned long tot = 0;
+
+		for (c = 0; c <= FT_AB_CLS_NR; c++)
+			tot += ft_mk_mw[m][c];
+		fprintf(stderr, "  %-10s txns %10lu  SW %12lu  MW %12lu\n",
+			mn[m], ft_mk_txn[m], ft_mk_sw[m], tot);
+		for (c = 0; c <= FT_AB_CLS_NR; c++)
+			if (ft_mk_mw[m][c])
+				fprintf(stderr, "      %-18s %12lu\n",
+					c == FT_AB_CLS_NR ? "MIXED" :
+					ft_ab_cls_name(c), ft_mk_mw[m][c]);
+	}
+}
+# define FT_MK_NOTE(t, ft)	ft_mk_note((t), (ft))
+#else
+# define FT_MK_NOTE(t, ft)	do { } while (0)
+#endif
+
 /*
  * Commit an FT flip-txn (ft_flip_txn_create*): commit @mtxn -- whose edge set was
  * recorded straight into it as the op built -- then free the handle.  The commit
@@ -9054,6 +9127,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		for (drop_i = 0; drop_i < t->nr_locks; drop_i++)
 			ft_hold_trace_drop(t->locks[drop_i].meta);
 	}
+	FT_MK_NOTE(t, ft);
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	for (sa_i = 0; sa_i < t->sa_npend; sa_i++) {
