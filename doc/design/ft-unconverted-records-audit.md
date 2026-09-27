@@ -115,6 +115,44 @@ Totals: **pn 2.14M / ro 431k / ex 1.51M**, OWN_HELD = 0 everywhere. By record pc
   gate 117/119. Both reds are pre-existing, attributed by a matched A/B against
   `76801d6d` (see the last two side findings).
 
+### Registry gaps and the tombstone CAS (2026-09-26, later)
+
+Mathieu: *"Afair tombstone need to be load validated. Likely the cause of the
+MW CAS records"* -- *"Was useful in the MW CAS era, not anymore with locks. A
+plain load resolve should work."*
+
+- **The orphan freeze** (`ft_detach_freeze_one`) was every OWN_MISS row of
+  the tombstone record: 1.33M `{LOCK|s -> TOMBSTONE|s}` CASes per run at
+  per-node, each on a word the op took itself. That mark deliberately stays
+  unregistered (lock budget), so `owns()` said no. Its expected-old was the
+  MW-CAS era's detect-and-abort for a peer growing the orphan, which the lock
+  now excludes. The txn now holds it through `@covered` (owns, no release
+  duty), and the terminal parks SW.
+- **cds_ft_replace's `{L}`** lives on the acquire txn. Its member is now
+  covered in the content txn, so the 370k structural edges vouched for
+  through it park SW.
+- **Result: OWN_MISS 2.06M -> 0 at per-node, 335k -> 0 at root-only** (0 at
+  exponential too). MW_STRUCT is only OWN_RETIRE (a node tombstoning its own
+  word).
+- **The anchored retire's MW arm at root-only** (the snapshot defence
+  against a second-path dating, which root-only cannot have): offered SW
+  there. The class STATE went from 5.2M to 0.22M.
+- Two findings along the way:
+  - The `nr_child++` fallback (~200k) runs only on coarse tries, where door 1
+    already parks it SW; the class counter counts it before the kind decision.
+  - The re-parent / installed-child validates now fire 0 times at every
+    spacing in ft_inv MW.
+- SW safety on the same runs (rcu-debug detectors): 0 stale expected-olds of
+  75-86M SW records, 0 blind records, 0 engine steals, 0 stolen locks.
+- The suites' long-standing `FT LOCK UNDERFLOW` reports were the detector:
+  its address-keyed balance outlived a destroyed trie's embedded lock words,
+  and a later pointer record at the reused address read as a release. Fixed
+  by forgetting those entries at `cds_ft_destroy`. 0 reports since, with the
+  detector's positive control still firing.
+- Landed as the four commits after `c095b5d0`. Gates: gate18 18/18, gate-mw
+  9/9 (0 underflow reports), parallel 118/119. The one red is the
+  pre-existing `_cds_ft_remove_all_locked` assertion.
+
 ## Suggested order (as audited)
 
 1. **The §4.B parent guard.** Drop the miss-path plant; make "a hold cancels the
@@ -138,12 +176,9 @@ Totals: **pn 2.14M / ro 431k / ex 1.51M**, OWN_HELD = 0 everywhere. By record pc
 
 ## Side findings (not part of the conversion)
 
-- Every rcu-debug ft_unit leg prints 5-8 `FT LOCK UNDERFLOW` reports. They also
-  appear in gates before today's commits, and in **none** of 424 isolated
-  per-test runs, so they need the suite's sequence. Suspect the address-keyed
-  take/release detector across heap `struct cds_ft` reuse (`root_lock` is not
-  reset on free; `FT_NR_KEYS_PROXY_TAG == FT_STATE_PROXY` also passes its
-  state-word filter). Unconfirmed.
+- ~~Every rcu-debug ft_unit leg prints 5-8 `FT LOCK UNDERFLOW` reports.~~
+  Confirmed as the detector (heap reuse of a destroyed trie's lock words) and
+  fixed; see the status section.
 - At exponential, the STRUCT_ANCHOR census reports op-vs-trie anchor mismatches
   at `ft_merge_lock_overlap:523` and `ft_glue_acquire_reparent_marks:24909`
   (exponential is experimental).
