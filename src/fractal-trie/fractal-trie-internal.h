@@ -4171,9 +4171,12 @@ static unsigned long ft_ba_seams_in_bulk __attribute__((unused));
  */
 #if FT_DT_ARMED
 void ft_dt_note_freed(const struct cds_ft_metadata *m);
+void ft_dt_note_forgotten(const struct cds_ft_metadata *m);
 # define FT_DT_NOTE_FREED(m_)	ft_dt_note_freed(m_)
+# define FT_DT_NOTE_FORGOTTEN(m_)	ft_dt_note_forgotten(m_)
 #else
 # define FT_DT_NOTE_FREED(m_)	do { } while (0)
+# define FT_DT_NOTE_FORGOTTEN(m_)	do { } while (0)
 #endif
 
 /*

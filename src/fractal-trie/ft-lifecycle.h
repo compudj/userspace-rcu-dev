@@ -1158,6 +1158,10 @@ void cds_ft_destroy(struct cds_ft *ft)
 	pthread_cond_destroy(&ft->move_gate_cond);
 	pthread_mutex_destroy(&ft->move_gate_lock);
 	uatomic_dec(&ft->group->nr_ft_instances, CMM_RELAXED);
+	/* The take/release balance must not outlive the lock words it keys. */
+	FT_DT_NOTE_FORGOTTEN(&ft->root_lock);
+	FT_DT_NOTE_FORGOTTEN(&ft->ord_begin_lock);
+	FT_DT_NOTE_FORGOTTEN(&ft->ord_end_lock);
 	free(ft);
 }
 

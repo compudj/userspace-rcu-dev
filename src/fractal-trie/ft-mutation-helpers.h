@@ -2355,6 +2355,31 @@ void ft_dt_note_freed(const struct cds_ft_metadata *m)
 	ft_dt_ent_unlock(e);
 }
 
+/*
+ * A lock word EMBEDDED IN A HEAP OBJECT that is going away (a struct cds_ft's
+ * root / list-end locks, at cds_ft_destroy): FORGET the entry rather than
+ * zero its balance.  An arena chunk is recycled as the SAME kind of node, so
+ * keeping the word is what lets a release into a freed chunk still report
+ * (ac5d18f0's class).  A malloc'd trie struct is recycled as ANYTHING, and a
+ * later record on a POINTER field at that address -- tagged 1 like a state
+ * word (FT_STATE_PROXY == URCU_TXN_TAG == FT_HLIST_TAG), its old value a heap
+ * pointer that happens to carry bit 19 -- read as a release of the dead lock:
+ * the rcu-debug suites' "FT LOCK UNDERFLOW" reports on a heap word, main
+ * thread, zero in every per-test isolated run.
+ */
+void ft_dt_note_forgotten(const struct cds_ft_metadata *m)
+{
+	struct ft_dt_ent *e = ft_dt_slot(m);
+
+	ft_dt_ent_lock(e);
+	if (uatomic_read(&e->word) == m) {
+		uatomic_set(&e->word, NULL);
+		uatomic_set(&e->bal, 0);
+		uatomic_set(&e->tid, 0);
+	}
+	ft_dt_ent_unlock(e);
+}
+
 static __attribute__((destructor)) void ft_dt_report(void)
 {
 	if (!uatomic_read(&ft_dt_sets))
