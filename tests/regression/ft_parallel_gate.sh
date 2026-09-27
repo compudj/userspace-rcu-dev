@@ -45,6 +45,9 @@
 #                and have measured the room.
 #   FT_GATE_J    make -j per config                 (default: cores/12,
 #                so nconfigs*J stays near the core count)
+#   FT_GATE_EXTRA_CPPFLAGS  appended to every config's CPPFLAGS (default
+#                none), e.g. -DDEBUG_RCU for a debug sweep of the whole
+#                matrix.  Use a separate FT_GATE_DIR for it.
 #   FT_GATE_SLICE  systemd user slice every leg's memory cage is created
 #                under (default: none -- app.slice).  Give it a slice with a
 #                MemoryMax to bound the SUM of the legs, which the per-leg
@@ -399,6 +402,10 @@ setup_tree() {	# $1=name $2=cppflags -- one-time: copy source + configure WITH f
 	# unsubstituted form would make every tree look correctly configured.
 	flags=${flags//@TREE@/$dir}
 	flags=${flags//@LTTNG_CFLAGS@/${FT_GATE_LTTNG_CFLAGS:-}}
+	# FT_GATE_EXTRA_CPPFLAGS rides on EVERY config (e.g. -DDEBUG_RCU to run
+	# the whole matrix with the engine's and FT's debug checks armed).
+	# Appended before the cache check, so a changed set reconfigures.
+	flags="$flags${FT_GATE_EXTRA_CPPFLAGS:+ $FT_GATE_EXTRA_CPPFLAGS}"
 	if [ -f "$dir/config.status" ] && \
 	   grep -qxF "CPPFLAGS=$flags" "$dir/.gate_flags" 2>/dev/null; then
 		return 0	# already configured with these exact flags
