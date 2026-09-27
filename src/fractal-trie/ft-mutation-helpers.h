@@ -20420,13 +20420,20 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 
 	if (!ft->rank_stats)
 		return;
-	if (t->mtxn && t->mtxn->desc != URCU_TXN_ENOMEM)
-		desc = t->mtxn->desc;
 	while (cur) {
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(cur));
 		unsigned long base;
 		unsigned long old_raw, new_raw;
+
+		/*
+		 * Re-read per level: the previous level's record can have
+		 * grown the descriptor, and a grow MOVES it (see
+		 * ft_rekey_cow_desc) -- a cached pointer would look this
+		 * commit's records up in the old block and miss them.
+		 */
+		desc = (t->mtxn && t->mtxn->desc != URCU_TXN_ENOMEM) ?
+			t->mtxn->desc : NULL;
 
 		/*
 		 * ☠ THE CHAIN IS NOT THE OP'S OWN ANSWER EITHER -- FOLLOW THE
