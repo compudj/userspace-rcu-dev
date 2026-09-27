@@ -1,7 +1,14 @@
 # Completing the ordered-cell list's SW transition
 
-Status: the park is **OFF by default** (`-DFEATURE_FT_CELL_SW` opts in).
-Measured 2026-09-20 at `per-node` on the same-key contention shape.
+Status (2026-09-26): the park is **MANDATORY**. `FEATURE_FT_CELL_SW` and
+`NO_FEATURE_FT_ROOT_SW` are gone; a held cell edge and a held `&ft->root` are
+always recorded SW, and an unheld one aborts (`FT CELL UNHELD` / `FT ROOT
+UNHELD`). `-DNO_FT_CELL_OWNED_STRICT` / `-DNO_FT_ROOT_OWNED_STRICT` remain, as
+red controls only. Per-node is the only lock spacing (@7b842e0b), so the
+coarse-spacing refusal in step 4 no longer exists.
+
+The history below was measured 2026-09-20 at `per-node` on the same-key
+contention shape, while the park was still opt-in.
 
 **Target: 100% SW records.** Not "sound" -- sound is what turning the park off
 already bought. The four steps below are what it takes to park every cell edge,
@@ -293,14 +300,14 @@ Two steps, not four -- the sentinel is not a blocker (see the table above).
    for the root pointer, `&ft->ord_begin_lock` when the slot is
    `&ord_sentinel.node.next`, `&ft->ord_end_lock` when it is `.prev`.
 
-4. Flip the default and delete `FT_CELL_SW_ENABLED`. **The target is 100% SW
+4. ☑ (2026-09-26) Flip the default and delete `FT_CELL_SW_ENABLED`. **The target is 100% SW
    records** — `notheld`, `nocell`, `nodepth`, `nometa`, `sentinel` and the
    insert lane all 0 — not merely "no per-op refusal". The coarse spacings
    remain a separate axis: they refuse uniformly today (`!e->ctx &&
    lock_spacing != PER_NODE`), so they are sound, and threading `@ctx` to the
    cell producers is what converts them.
 
-## ☠ Why the ablation is NOT in the gate matrix yet
+## ☠ Why the ablation is NOT in the gate matrix yet (historical: the opt-in is gone)
 
 `chainmw` exists so `-DNO_FEATURE_FT_CHAIN_SW` cannot go unbuildable -- an
 ablation nobody compiles is worthless exactly when a bisect needs it -- and the

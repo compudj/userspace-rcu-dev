@@ -9773,31 +9773,14 @@ void ft_flip_txn_record_tag_mw_pinned(struct ft_flip_txn *t, void **slot,
 		true FT_TK_MWA(dbg_mwa));
 }
 
-#ifdef FEATURE_FT_CELL_SW
-# define FT_CELL_SW_ENABLED	1
-#else
-# define FT_CELL_SW_ENABLED	0
-#endif
 /*
- * The flip's own check.  Defaults ON wherever the park is on: a partial
- * conversion is the defect, so shipping the park without the guard would be
- * shipping the thing the guard exists to catch.  -DNO_FT_CELL_OWNED_STRICT is
- * for the RED CONTROL -- drop one take, confirm the guard fires, put it back.
+ * The cell and root parks are MANDATORY: a cell edge or &ft->root whose word's
+ * lock the op holds is recorded SW, always.  The flip's own check stays on with
+ * them: a partial conversion is the defect, so an unheld cell or root record
+ * aborts.  -DNO_FT_CELL_OWNED_STRICT / -DNO_FT_ROOT_OWNED_STRICT are the RED
+ * CONTROLS -- drop one take, confirm the guard fires, put it back.
  */
-/*
- * Stage 5's PARK rides the same flip: one flag turns the record kinds over.  The
- * root's LOCK does not -- like the cell locks, @root_lock is taken in every build
- * (locks first; MW after the take is correct, only a spare CAS), so the default
- * build exercises the locking half before any root parks SW.
- * -DNO_FEATURE_FT_ROOT_SW keeps the root's record MW while the cells park.
- */
-#if defined(FEATURE_FT_CELL_SW) && !defined(NO_FEATURE_FT_ROOT_SW)
-# define FT_ROOT_SW_ENABLED	1
-#else
-# define FT_ROOT_SW_ENABLED	0
-#endif
-
-#if defined(FEATURE_FT_CELL_SW) && !defined(NO_FT_CELL_OWNED_STRICT)
+#if !defined(NO_FT_CELL_OWNED_STRICT)
 # define FT_CELL_OWNED_STRICT	1
 #else
 # define FT_CELL_OWNED_STRICT	0
@@ -9813,7 +9796,7 @@ void ft_flip_txn_record_tag_mw_pinned(struct ft_flip_txn *t, void **slot,
 /* What one root take costs a reserved txn: its release terminal. */
 #define FT_ROOT_LOCK_MAX_RECORDS	1
 
-#if FT_ROOT_SW_ENABLED && !defined(NO_FT_ROOT_OWNED_STRICT)
+#if !defined(NO_FT_ROOT_OWNED_STRICT)
 # define FT_ROOT_OWNED_STRICT	1
 #else
 # define FT_ROOT_OWNED_STRICT	0
@@ -9935,14 +9918,9 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 
 		if (ft_flip_txn_holds(t, &owner_ft->root_lock)) {
 			FT_COW_ROOT_HELD();
-			if (FT_ROOT_SW_ENABLED) {
-				ft_flip_txn_record_tag(t, &owner_ft->root_lock,
-					slot, old_ptr, new_ptr,
-					FT_FLIP_PROXY_TAG);
-				return;
-			}
-			/* Park off: held, recorded MW -- a spare CAS, no mix. */
-			goto pinned;
+			ft_flip_txn_record_tag(t, &owner_ft->root_lock,
+				slot, old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
+			return;
 		}
 		if (!owner_ft->lock_fine || owner_ft->exclusive) {
 			FT_COW_ROOT_EXEMPT();	/* one lock for the whole trie */
@@ -13111,10 +13089,9 @@ uintptr_t ft_edge_tag(const struct ft_ord_cell_edge *edge)
  *   1. route ft_txn_list_insert_between_prepare through this recorder;
  *   2. widen the three ft-remove.h acquires so NOT HELD reaches 0;
  *   3. decide the sentinel, which no holder owns.
- * Until all three land, -DFEATURE_FT_CELL_SW is the only way to get the park,
- * and the default build is ALL-MW -- sound, and exactly what shipped before
- * the conversion.  The census is the progress meter: flip the default when
- * NOT HELD, the sentinel row and the insert lane are all zero.
+ * All three landed; the park is now MANDATORY (no build switch), and the
+ * strict guard below aborts on any unheld cell record.  The census remains
+ * the meter: NOT HELD, the sentinel row and the insert lane stay zero.
  * ⇒ Mathieu's standing rule: complete the lock-set transition FIRST; only when
  * COMPLETE can MW become SW.  No per-class conversion, no partial flip.
  */
@@ -13125,17 +13102,11 @@ uintptr_t ft_edge_tag(const struct ft_ord_cell_edge *edge)
  * a PLUMBING one (no @ctx threaded to this producer) is cheap to close, a
  * NOT-HELD one means the splice's lock set has to be widened to take it.
  */
-/*
- * THE CELL-EDGE SW PARK'S SWITCH.  Off by default: see the header above for why
- * a partial conversion is a correctness bug and not a missed optimisation.
- * -DFEATURE_FT_CELL_SW turns it on, which is how the conversion work and its
- * ablation leg stay alive without shipping the mix.
- */
 
 #ifdef FT_DEBUG_CELL_OWNER
 __attribute__((weak)) unsigned long ft_cow_ok, ft_cow_noctx, ft_cow_nocell,
 	ft_cow_sentinel, ft_cow_nodepth, ft_cow_nometa, ft_cow_notheld,
-	ft_cow_disabled, ft_cow_reported;
+	ft_cow_reported;
 /*
  * ☞ AND WHICH ACQUIRE OWES THE ANCHOR.  The bucket above sizes the NOT-HELD
  * remainder; it cannot name the op, and the op is the whole deliverable --
@@ -13203,12 +13174,6 @@ static inline void ft_cow_note_site(const struct ft_flip_txn *t, bool held)
 static void ft_cow_report(void) __attribute__((destructor));
 static void ft_cow_report(void)
 {
-	/*
-	 * ☠ @ft_cow_disabled IS A SUBSET OF @ok, NOT A BUCKET.  It counts the
-	 * edges that WOULD have parked and did not because the feature is off,
-	 * so adding it here would double-count them and the tally would stop
-	 * summing to the population.
-	 */
 	unsigned long t = ft_cow_ok + ft_cow_nocell + ft_cow_notheld;
 
 	if (!t || __atomic_fetch_add(&ft_cow_reported, 1, __ATOMIC_RELAXED))
@@ -13218,8 +13183,6 @@ static void ft_cow_report(void)
 		"  WOULD HOLD                  %12lu  %5.1f%%\n"
 		"  not a cell link             %12lu  %5.1f%%\n"
 		"  NOT HELD (the work)         %12lu  %5.1f%%\n"
-		"    of WOULD HOLD, unparked "
-		"(no FEATURE_FT_CELL_SW) %12lu\n"
 		"  ENGINE LANE (never asked)   %12lu   [not in the total]\n"
 		"  --- &ft->root (stage 5) ---\n"
 		"  root HELD                   %12lu\n"
@@ -13229,7 +13192,7 @@ static void ft_cow_report(void)
 		ft_cow_ok, 100.0*ft_cow_ok/t,
 		ft_cow_nocell, 100.0*ft_cow_nocell/t,
 		ft_cow_notheld, 100.0*ft_cow_notheld/t,
-		ft_cow_disabled, ft_cow_engine_lane,
+		ft_cow_engine_lane,
 		ft_cow_root_held_e, ft_cow_root_exempt_e,
 		ft_cow_root_notheld_e);
 	fprintf(stderr, "  root TAKES: calls %lu = held %lu + took %lu + "
@@ -13456,14 +13419,6 @@ struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
 		FT_COW(nocell);
 		return NULL;
 	}
-	/*
-	 * ☞ ASK BEFORE THE FEATURE GATE, SO THE CENSUS MEASURES THE TRIE AND
-	 * NOT THE BUILD.  The park is still off; what the migration needs to
-	 * know at every stage is how many cell words the op WOULD hold, per
-	 * producer and at BOTH spacings.  Counting the refusal first and the
-	 * gate second is what makes `notheld` a work item rather than an
-	 * artefact of FEATURE_FT_CELL_SW being unset.
-	 */
 	if (!ft_cell_word_held(t, e, lock)) {
 		FT_COW_NOTHELD(t);
 		FT_COW_NH_PC();
@@ -13482,7 +13437,7 @@ struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
 		 * the txn site names an op that reaches several builders and
 		 * only some of them forgot the take.
 		 */
-		if (FT_CELL_SW_ENABLED && FT_CELL_OWNED_STRICT) {
+		if (FT_CELL_OWNED_STRICT) {
 			fprintf(stderr, "FT CELL UNHELD: slot %p owner %p "
 				"producer %p -- a cell word recorded without "
 				"its lock while the SW park is on\n",
@@ -13494,15 +13449,6 @@ struct cds_ft_metadata *ft_cell_edge_owner(const struct cds_ft *ft,
 		return NULL;
 	}
 	FT_COW_HELD(t);
-	if (!FT_CELL_SW_ENABLED) {
-		/*
-		 * A SUBSET of @ok, not a bucket of its own: these are the edges
-		 * that would have parked.  Deliberately not added into the
-		 * total -- a tally that double-counted them would stop summing.
-		 */
-		FT_COW(disabled);
-		return NULL;
-	}
 	return lock;
 }
 
