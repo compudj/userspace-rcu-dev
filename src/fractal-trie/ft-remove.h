@@ -10023,8 +10023,15 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * store) rather than a bare store.
 		 */
 		if (ft->ordered_list || ft->rank_stats) {
+			/*
+			 * Read under the root's lock, after the re-check above,
+			 * so this prev is settled (every producer of a parked
+			 * head prev holds the chain holder); resolved anyway, as
+			 * the plan-time read below must be.
+			 */
 			struct ft_ord_cell *dead = ft->ordered_list ?
-				ft_ord_cell_ptr(external_nodes->prev) : NULL;
+				ft_ord_cell_ptr(ft_dereference_prev_resolved(
+					external_nodes)) : NULL;
 			struct ft_flip_txn *txn = root_txn;
 
 			/*
@@ -10196,8 +10203,42 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	 * compressed-parent shapes stay two-commit (pub unarmed).
 	 */
 	struct ft_remove_pub pub = { .armed = false };
+	/*
+	 * THE HEAD'S CELL, FROM ONE RESOLVED LOAD -- cds_ft_remove's discipline.
+	 * Nothing is held here, and a peer that removes the head before
+	 * @chain_head and PROMOTES it parks a flip proxy on @chain_head->prev
+	 * for the length of its commit.  Read raw, ft_ord_cell_ptr() masked the
+	 * proxy's tag into an address INSIDE the peer's descriptor (...0xe), the
+	 * under-lock re-checks passed once the peer had committed, and the cell
+	 * lock take then followed that "cell" into unmapped memory: the zoo's
+	 * SEGV in ft_cell_word_lock (probe: every wild cell ended in 0xe and
+	 * resolved to a real one; the two that got past the re-checks reached
+	 * ft_detach_node's take).  insert_replace had the same raw read
+	 * (f8f6cd3e).
+	 *
+	 * Resolved, the value is the word before or after that peer's commit,
+	 * never a descriptor, and a stale-but-real cell is what the under-lock
+	 * re-validation (the chain plan, the cell plan) already catches.  A prev
+	 * naming a PREDECESSOR says @chain_head is no longer a head: re-plan.
+	 */
+#ifdef FT_DEBUG_RA_PLAN_CELL_RAW
 	struct ft_ord_cell *dead_cell = ft->ordered_list ?
 		ft_ord_cell_ptr(chain_head->prev) : NULL;
+#else
+	struct ft_ord_cell *dead_cell = NULL;
+
+	if (ft->ordered_list) {
+		void *head_prev = ft_dereference_prev_resolved(chain_head);
+
+		if (ft_node_external((struct cds_ft_inode_flag *) head_prev)) {
+			*result_node = NULL;
+			FT_DBG_RETRY_SITE();
+			*need_retry = true;
+			return CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+		}
+		dead_cell = ft_ord_cell_ptr(head_prev);
+	}
+#endif
 	/*
 	 * PRE-RESERVE the dead cell's standalone-unsplice txn before any
 	 * structural change (see cds_ft_remove): the prefix / recompaction /
