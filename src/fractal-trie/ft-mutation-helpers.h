@@ -8770,6 +8770,41 @@ static bool ft_flip_txn_late_last(void *arg, void **slot)
 	return false;
 }
 
+/*
+ * ☠ NO MW RECORD, ENFORCED.  The flip txn is being made engine-agnostic for
+ * the SW engine (<urcu/rcu-txn-sw.h>), which has no CAS and cannot take an MW
+ * record at all -- not even one bound for a discarded txn.  After the
+ * conversions every FT record is SW (FT_DEBUG_MW_KEPT: zero decided MW on
+ * ft_inv FT_INV_MW=1 and ft_unit), so a record decided MW is now a
+ * regression: in a DEBUG_RCU build it aborts, naming the class, the slot, the
+ * values and the producer.  -DFT_ALLOW_MW_RECORDS lifts it, for a build that
+ * enables one of the ablation knobs restoring an MW record on purpose.
+ */
+#if (defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)) && \
+	!defined(FT_ALLOW_MW_RECORDS)
+static __attribute__((noinline, noreturn))
+void ft_mw_record_trap(const char *what, void **slot, void *old_ptr,
+		void *new_ptr, const void *producer)
+{
+	Dl_info di;
+
+	fprintf(stderr, "FT MW RECORD: %s slot %p {%p -> %p} producer %s+%#lx "
+		"-- the flip txn records SW only now; -DFT_ALLOW_MW_RECORDS "
+		"lifts this for an ablation build\n", what, (void *) slot,
+		old_ptr, new_ptr,
+		dladdr(producer, &di) && di.dli_fname ? di.dli_fname : "?",
+		dladdr(producer, &di) ? (unsigned long) ((const char *)
+			producer - (const char *) di.dli_fbase) : 0UL);
+	fflush(stderr);
+	abort();
+}
+# define FT_MW_RECORD_TRAP(what, slot, o, n)				\
+	ft_mw_record_trap((what), (void **) (slot), (void *) (o),	\
+		(void *) (n), __builtin_return_address(0))
+#else
+# define FT_MW_RECORD_TRAP(what, slot, o, n)	do { } while (0)
+#endif
+
 #ifdef FT_DEBUG_MW_KEPT
 # ifndef FT_ABORT_ATTRIB
 #  error "-DFT_DEBUG_MW_KEPT needs -DFT_DEBUG_TXN_KIND and -DURCU_TXN_REC_DBG"
@@ -9883,6 +9918,7 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 					FT_AB_OWN_MISS));
 		FT_LL_REC(t, slot, old_ptr, new_ptr, false);
 		FT_MK_SAMPLE(FT_AB_MW_STRUCT);
+		FT_MW_RECORD_TRAP("structural", slot, old_ptr, new_ptr);
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	}
 	assert(!ret);
@@ -10141,6 +10177,7 @@ void __ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 		FT_MWA_DOOR1_KEPT(t, old_ptr == new_ptr);
 		FT_LL_REC(t, slot, old_ptr, new_ptr, false);
 		FT_MK_SAMPLE(FT_AB_MWA_BASE + dbg_mwa);
+		FT_MW_RECORD_TRAP("always-MW lane", slot, old_ptr, new_ptr);
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	}
 	assert(!ret);
@@ -16629,6 +16666,8 @@ void ft_flip_txn_guard_parent_ctx(const struct cds_ft *ft, struct ft_flip_txn *t
 #endif
 	FT_AB_ARM(FT_AB_VALIDATE, FT_AB_OWN_NA);
 	FT_MK_SAMPLE(FT_AB_VALIDATE);
+	FT_MW_RECORD_TRAP("parent-guard validate",
+		&ft_flag_to_metadata(ft, parent_nf)->state, live, live);
 	urcu_txn_validate(t->mtxn,
 			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
 			(void *) live, FT_STATE_PROXY);
