@@ -7695,7 +7695,20 @@ detach_bail:
 			 * neighbour, and an edge on a dying cell's slot is worse than one
 			 * on a cell this move already owns.  Distinct by construction --
 			 * ->prev and ->next are different fields even for a one-cell run.
+			 *
+			 * ☞ ONLY WHERE A PEER CAN EXIST.  Under trie-wide exclusion (a
+			 * coarse or exclusive trie, or a bulk window holding the fine
+			 * trie's FT-wide writer lock) no writer can splice into the run's
+			 * boundary, so the validates have nothing to catch -- and a
+			 * validate is a CAS that stays MW even there (a park cannot fail).
+			 * MEASURED before (FT_DEBUG_MW_KEPT, ft_inv MW per run): these
+			 * two were the whole bulk-window residue, CELL ~24k.
+			 * -DFT_DEBUG_REKEY_KEEP_POS_VALIDATE records them anyway.
 			 */
+#ifndef FT_DEBUG_REKEY_KEEP_POS_VALIDATE
+			if (ft_flip_txn_excludes_all(txn, ft))
+				goto cells_done;
+#endif
 			cedges[0].tag = URCU_TXN_TAG;
 			cedges[0].slot = (struct ft_ord_cell **) &rfc->lnode.prev;
 			cedges[0].old_target = src_pred;
