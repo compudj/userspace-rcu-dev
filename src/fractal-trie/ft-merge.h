@@ -2719,8 +2719,8 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	/*
 	 * PERSISTENT OP HANDLE for this retry loop.  Without one, every attempt
 	 * built its transaction with the UNBOUND ft_flip_txn_create(): a fresh
-	 * handle whose retry age restarts at zero, so urcu_txn_conflict() never
-	 * advances it, urcu_txn__self_qualifies() is never reached, and the
+	 * handle whose retry age restarts at zero, so ft_op_conflict() never
+	 * advances it, ft_op_earned_lane() is never reached, and the
 	 * writer can never take its per-trie FIFO turn.  A contended writer then
 	 * livelocks by construction -- ft_flip_txn_create's own docstring says so,
 	 * and this loop was measured spinning 266-587 attempts deep on ONE op in
@@ -2732,8 +2732,8 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * disagree with the arm actually opened.
 	 *
 	 * WHY THE BODY MAY BE BRACKETED AT ALL.  urcu_txn_begin() enters the RCU
-	 * read side, and urcu_txn_conflict() ages into the domain's FIFO fallback
-	 * lane -- where ft_writer_lock_gp_wait asserts !urcu_txn_in_fallback().
+	 * read side, and ft_op_conflict() ages into the trie's FIFO
+	 * lane -- where ft_writer_lock_gp_wait asserts !ft_op_in_lane().
 	 * Either one is fatal over a grace period, so the body must take none.
 	 * Established by REACHABILITY CLOSURE over the whole translation unit, not
 	 * by grep: seeding {ft_writer_lock_gp_wait, ft_move_gate_enter} (the only
@@ -3508,9 +3508,9 @@ merge_spine_retry:
 				dst_ft->group->flavor->read_unlock();
 				/*
 				 * AGE IT.  This is the arm that spun 348 deep with
-				 * nothing to make it terminate: urcu_txn_conflict
+				 * nothing to make it terminate: ft_op_conflict
 				 * carries the retry count on the persistent handle, so
-				 * the domain escalates this writer into the FIFO lane
+				 * this writer escalates into the FIFO lane
 				 * and the contention drains.  end() then FORFEITS the
 				 * turn -- this is a pre-commit bail, and a bail that
 				 * keeps its turn while the peer it waits on queues

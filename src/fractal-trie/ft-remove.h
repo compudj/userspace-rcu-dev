@@ -9598,8 +9598,8 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * tree and re-attempts.  The op's internal txns are still standalone
 	 * (the pre-reserved unsplice txn coexists with the main commit txn, so
 	 * they cannot share one handle), so contention aging is carried
-	 * manually on the PERSISTENT @optxn via urcu_txn_conflict: after
-	 * URCU_TXN_FALLBACK conflicts the domain escalates this writer into
+	 * manually on the PERSISTENT @optxn via ft_op_conflict: after
+	 * its lane budget of conflicts this writer escalates into
 	 * the per-trie FIFO fair-mutex lane -- every writer's begin() honors
 	 * domain->active, so the lane drains the contention and the retry
 	 * terminates (no livelock).  Exclusive trie: the bracket opens nothing
@@ -9638,14 +9638,14 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				ft_remove_attempts == 1000 ||
 				ft_remove_attempts == 10000)) {
 			fprintf(stderr, "FT REMOVE RETRY TAIL: attempts=%u "
-				"retry=%lu in_fallback=%d(th %d) "
-				"fb_published=%d active=%d "
+				"retry=%lu in_lane=%d(th %d) "
+				"lane_published=%d active=%d "
 				"dirtyLOCK=%u dirtyOTHER=%u cabort=%u\n",
-				ft_remove_attempts, optxn.txn.retry,
-				optxn.txn.in_fallback, urcu_txn_in_fallback(),
-				optxn.txn.fb_published,
-				optxn.txn.domain ? (int) uatomic_load(
-					&optxn.txn.domain->active, CMM_RELAXED)
+				ft_remove_attempts, optxn.retry,
+				optxn.in_lane, ft_op_in_lane(),
+				optxn.lane_published,
+				optxn.lane ? (int) uatomic_load(
+					&optxn.lane->active, CMM_RELAXED)
 					: -1,
 				ft_dbg_acq_dirty_lock, ft_dbg_acq_dirty_other,
 				ft_dbg_acq_cabort);
@@ -10735,8 +10735,8 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
  * calls failed that way.
  *
  * ⇒ the conversion is the LOOP, not new exclusion.  Aging is carried on the
- * PERSISTENT @optxn via urcu_txn_conflict (ft_txn_attempt_bail): after
- * URCU_TXN_FALLBACK conflicts the domain escalates this writer into the per-trie
+ * PERSISTENT @optxn via ft_op_conflict (ft_txn_attempt_bail): after
+ * its lane budget of conflicts this writer escalates into the per-trie
  * FIFO fair-mutex lane, which drains the contention so the retry TERMINATES.
  * That is also why a caller looping on BUSY_ERROR was never an adequate
  * substitute -- a fresh txn per attempt ages nothing and can starve.  An

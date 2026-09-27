@@ -518,7 +518,6 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 	assert(ft_group->max_tree_depth <= FT_MAX_DEPTH);
 	ft_group->flavor = flavor;
 	pthread_mutex_init(&ft_group->arena_lock, NULL);
-	urcu_txn_domain_init(&ft_group->domain);
 	if (attr) {
 		ft_group->key_map = attr->key_map;
 		ft_group->flags = attr->flags;
@@ -941,10 +940,11 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	pthread_mutex_init(&ft->move_gate_lock, NULL);
 	pthread_cond_init(&ft->move_gate_cond, NULL);
 	/*
-	 * Writer-contention escalation domain for the concurrent-mode ops'
-	 * persistent txn handles (ft_txn_op_init, doc §11).
+	 * Writer-contention escalation lane for the concurrent-mode ops
+	 * (ft_txn_op_init, doc §11).
 	 */
-	urcu_txn_domain_init(&ft->txn_domain);
+	cds_fair_mutex_init(&ft->lane.lock);
+	ft->lane.active = 0;
 
 	/*
 	 * Allocate the root node (smallest popcount_2l type, initially empty).

@@ -8697,7 +8697,7 @@ static int inv_concurrent_writers_shared(void)
  * disjoint, which saturates the per-node-lock (FINE) path, the FT-wide writer
  * lock SERIALIZES every mutation here, so
  * this must be violation-free -- it proves the acquire / escalate / release
- * plumbing under real contention through ft->txn_domain, and that a coarse
+ * plumbing under real contention through ft->lane, and that a coarse
  * lock-mode trie stays coherent under 16 writers (no lost key, count == live,
  * cds_ft_verify passes).  Reuses the mw_writer thread body (its lost-key oracle
  * and reference-lifetime discipline are strategy-agnostic).  Opt-in

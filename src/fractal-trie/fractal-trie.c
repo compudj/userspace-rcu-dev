@@ -311,6 +311,8 @@ struct cds_ft_node *cds_ft_node_next_resolve(void *raw)
  * must not widen against itself.  Depth-counted because bulk bodies nest.
  */
 __thread unsigned long ft_bulk_self_depth;
+/* Escalation lane depth for THIS thread: see ft_op_in_lane. */
+__thread unsigned int ft_op_lane_depth;
 
 /*
  * G5.5's ancestor ledger (ft-mutation-helpers.h): the descent path for a point

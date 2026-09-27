@@ -521,7 +521,7 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 splice_conflict:
 		ft_free_unpublished_split_cluster(ft, ic->created,
 			ic->nr_created);
-		urcu_txn_conflict(ft_flip_txn_handle(ic->txn));
+		ft_flip_txn_conflict(ic->txn);
 		ft_flip_txn_destroy(ic->txn);
 		ic->txn = NULL;
 		return URCU_TXN_STATUS_ABORT;
@@ -4429,7 +4429,7 @@ insert_done:
 			ic.txn = NULL;
 		}
 		/*
-		 * Age the pre-commit conflict (urcu_txn_conflict): without it a
+		 * Age the pre-commit conflict (ft_op_conflict): without it a
 		 * writer that keeps bailing on the same hot slot never advances
 		 * txn->retry, never escalates, and can livelock.  Aging is all
 		 * it does here -- the bail forfeits the FIFO turn, because the
@@ -7285,8 +7285,8 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
  * RETRY: an attempt that loses the chain's holder lock, or whose commit returns
  * ABORT, publishes NOTHING and signals @need_retry; the loop re-derives from
  * node->prev against the current tree and re-attempts.  Aging is carried on the
- * PERSISTENT @optxn via urcu_txn_conflict: after URCU_TXN_FALLBACK conflicts the
- * domain escalates this writer into the per-trie FIFO fair-mutex lane, which
+ * PERSISTENT @optxn via ft_op_conflict: after its lane budget of conflicts
+ * this writer escalates into the per-trie FIFO fair-mutex lane, which
  * drains the contention so the retry TERMINATES (no livelock).  An exclusive
  * trie opens nothing and never conflicts.
  *

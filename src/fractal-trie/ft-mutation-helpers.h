@@ -2795,6 +2795,7 @@ struct ft_flip_txn {
 					 * (doc/design/mcas-multiwriter-readiness.md
 					 * §11) */
 	struct urcu_txn own;	/* backing handle for standalone txns */
+	struct ft_op *op;	/* the op whose handle @mtxn is, or NULL */
 	bool reserved;			/* @mtxn pre-reserved (bounded) => infallible commit */
 	/*
 	 * ☠ DID THIS TXN COMMIT?  ft_flip_txn_destroy documents itself as
@@ -3330,15 +3331,16 @@ struct urcu_txn *ft_flip_txn_handle(struct ft_flip_txn *t)
 }
 
 /*
- * Initialize an op's PERSISTENT engine handle (doc §11): one handle spans the
- * op's whole restart_attempt retry loop, so contention aging (txn->retry, the
- * FIFO fair-mutex turn) and the learned descriptor size survive across
- * attempts instead of resetting with each per-attempt ft_flip_txn.  Bind the
- * trie's escalation domain and the group's RCU flavor, so urcu_txn_begin() /
- * urcu_txn_end() bracket each attempt in the FT's RUNTIME flavor -- the FT
- * owns the read-side bracket; a caller-held section merely nests.
+ * Initialize an op's PERSISTENT handle (doc §11): one handle spans the op's
+ * whole restart_attempt retry loop, so contention aging (@retry, the FIFO
+ * turn) and the engine's learned descriptor size survive across attempts
+ * instead of resetting with each per-attempt ft_flip_txn.  Bind the trie's
+ * escalation lane, and the group's RCU flavor into the engine handle, so
+ * urcu_txn_begin() / urcu_txn_end() bracket each attempt in the FT's RUNTIME
+ * flavor -- the FT owns the read-side bracket; a caller-held section merely
+ * nests.  The engine gets NO domain: the lane is FT's (ft_op_begin).
  *
- * EXCLUSIVE trie: no concurrent writer (NULL domain -- never escalates) and
+ * EXCLUSIVE trie: no concurrent writer (NULL lane -- never escalates) and
  * no concurrent reader (NULL flavor -- the bracket falls back to the
  * URCU_TXN_RCU_READ_LOCK macro, which fractal-trie-internal.h no-ops), so
  * begin()/end() only manage the per-attempt descriptor / deferred-cleanup
@@ -3354,32 +3356,212 @@ static inline
 void ft_txn_op_init(struct cds_ft *ft, struct ft_op *op)
 {
 	ft_hold_trace_leak_canary();
-	if (ft->exclusive)
+	if (ft->exclusive) {
 		urcu_txn_init_flavor(&op->txn, NULL, NULL);
-	else
-		urcu_txn_init_flavor(&op->txn, &ft->txn_domain,
-			ft->group->flavor);
+		op->lane = NULL;
+		op->flavor = NULL;
+	} else {
+		urcu_txn_init_flavor(&op->txn, NULL, ft->group->flavor);
+		op->lane = &ft->lane;
+		op->flavor = ft->group->flavor;
+	}
+	op->retry = 0;
+	op->in_lane = 0;
+	op->lane_published = 0;
+	op->park_quiescent = 0;
+	op->retrying = 0;
 }
 
-/* Open one attempt of the op's retry loop. */
+/*
+ * THE ESCALATION LANE.  An op that keeps losing queues on its trie's FIFO fair
+ * mutex, so progress is bounded.  The policy is the one the MCAS engine's
+ * domain carried (<urcu/rcu-txn.h>, whose header argues each constant): an op
+ * earns the lane once it has lost
+ *
+ *	budget = PER_COST_NUM * cost / PER_COST_DEN, within [MIN, MAX]
+ *
+ * attempts, where cost is the op's high-water of loads plus records.  An op
+ * that earns it raises @active, and while that episode lasts every op on the
+ * trie queues too.  A commit that ABORTED keeps the turn for its re-attempt;
+ * a pre-commit bail forfeits it (see ft_txn_attempt_bail).
+ */
+#ifndef FT_OP_LANE_PER_COST_NUM
+# define FT_OP_LANE_PER_COST_NUM	11	/* 11/4 = 2.75 */
+#endif
+#ifndef FT_OP_LANE_PER_COST_DEN
+# define FT_OP_LANE_PER_COST_DEN	4
+#endif
+#ifndef FT_OP_LANE_MIN
+# define FT_OP_LANE_MIN			64
+#endif
+#ifndef FT_OP_LANE_MAX
+# define FT_OP_LANE_MAX			4096
+#endif
+
+#ifdef FT_DEBUG_LANE
+__attribute__((weak)) unsigned long ft_op_lane_nr_begin, ft_op_lane_nr_want,
+	ft_op_lane_nr_enter, ft_op_lane_maxretry;
+# define FT_OP_LANE_STAT(c)	uatomic_inc(&ft_op_lane_nr_##c)
+#else
+# define FT_OP_LANE_STAT(c)	do { } while (0)
+#endif
+
+/*
+ * The op's cost.  The MCAS engine learns it (loads + records, high-water)
+ * as its handle commits and conflicts, and FT reads it here; an engine
+ * without that count needs FT to keep its own.
+ */
+static inline
+unsigned long ft_op_cost(const struct ft_op *op)
+{
+	return urcu_txn_last_cost(&op->txn);
+}
+
+/* Attempts this op may lose before it earns the lane. */
+static inline
+unsigned long ft_op_lane_at(const struct ft_op *op)
+{
+	uint64_t n = ft_op_cost(op), t;
+
+	if (!n)
+		n = 1;
+	t = ((uint64_t) FT_OP_LANE_PER_COST_NUM * n) / FT_OP_LANE_PER_COST_DEN;
+	if (t < FT_OP_LANE_MIN)
+		t = FT_OP_LANE_MIN;
+	return t > FT_OP_LANE_MAX ? FT_OP_LANE_MAX : t;
+}
+
+static inline
+int ft_op_earned_lane(const struct ft_op *op)
+{
+	return op->retry >= ft_op_lane_at(op);
+}
+
+static inline
+void ft_op_lane_publish(struct ft_op *op)
+{
+	uatomic_store(&op->lane->active, 1, CMM_RELAXED);
+	op->lane_published = 1;
+}
+
+static inline
+void ft_op_lane_enter(struct ft_op *op)
+{
+	int was_online = 0;
+
+	FT_OP_LANE_STAT(enter);
+	ft_op_lane_depth++;
+	/*
+	 * Quiesce across the park only where the op said it is safe: see
+	 * ft_op_set_park_quiescent.  Guarded on read_ongoing so a caller that
+	 * is ALREADY offline is left offline.
+	 */
+	if (op->park_quiescent && op->flavor) {
+		was_online = op->flavor->read_ongoing();
+		if (was_online)
+			op->flavor->thread_offline();
+	}
+	cds_fair_mutex_lock(&op->lane->lock, &op->waiter);
+	if (was_online)
+		op->flavor->thread_online();
+	if (ft_op_earned_lane(op))
+		ft_op_lane_publish(op);
+	op->in_lane = 1;
+}
+
+static inline
+void ft_op_lane_exit(struct ft_op *op)
+{
+	if (op->lane_published) {
+		uatomic_store(&op->lane->active, 0, CMM_RELAXED);
+		op->lane_published = 0;
+	}
+	op->in_lane = 0;
+	ft_op_lane_depth--;
+	(void) cds_fair_mutex_unlock(&op->lane->lock, &op->waiter);
+}
+
+/*
+ * Open one attempt of the op's retry loop.  The lane is taken BEFORE the
+ * engine opens the attempt's read section, so the park holds no section
+ * the op opened.
+ */
 static inline
 void ft_op_begin(struct ft_op *op)
 {
+	FT_OP_LANE_STAT(begin);
+#ifdef FT_DEBUG_LANE
+	if (op->retry > ft_op_lane_maxretry)
+		ft_op_lane_maxretry = op->retry;	/* racy max, diagnosis only */
+#endif
+	op->retrying = 0;
+	if (op->lane && !op->in_lane) {
+		if (uatomic_load(&op->lane->active, CMM_RELAXED) ||
+				ft_op_earned_lane(op)) {
+			FT_OP_LANE_STAT(want);
+			ft_op_lane_enter(op);
+		}
+	} else if (op->in_lane && !op->lane_published &&
+			ft_op_earned_lane(op)) {
+		ft_op_lane_publish(op);
+	}
 	urcu_txn_begin(&op->txn);
 }
 
-/* Close the attempt ft_op_begin() opened.  Always paired with it. */
+/*
+ * Close the attempt ft_op_begin() opened.  Always paired with it.  The turn
+ * is released unless a commit aborted and the op re-attempts.
+ */
 static inline
 void ft_op_end(struct ft_op *op)
 {
 	urcu_txn_end(&op->txn);
+	if (op->in_lane && !op->retrying)
+		ft_op_lane_exit(op);
 }
 
-/* See urcu_txn_set_park_quiescent: only an op entered from no read section. */
+/*
+ * The attempt lost before its commit: age the op.  The turn is forfeited at
+ * ft_op_end(), since @retrying stays clear.  The engine handle is aged too,
+ * for the engine's own policy and for the cost ft_op_cost() reads.
+ */
+static inline
+void ft_op_conflict(struct ft_op *op)
+{
+	urcu_txn_conflict(&op->txn);
+	op->retry++;
+}
+
+/* A commit through the op's handle aborted: age it and keep the turn. */
+static inline
+void ft_op_commit_aborted(struct ft_op *op)
+{
+	op->retry++;
+	op->retrying = 1;
+}
+
+/*
+ * Park the lane QUIESCENT (RCU-offline).  Only for an op whose entry
+ * forbids being called from a read section: under QSBR, going offline ends
+ * any section a caller holds across the call.
+ */
 static inline
 void ft_op_set_park_quiescent(struct ft_op *op, int on)
 {
-	urcu_txn_set_park_quiescent(&op->txn, on);
+	op->park_quiescent = on;
+}
+
+/*
+ * A flip txn lost before its commit: age the op it is built on, or its own
+ * standalone handle.
+ */
+static inline
+void ft_flip_txn_conflict(struct ft_flip_txn *t)
+{
+	if (t->op)
+		ft_op_conflict(t->op);
+	else
+		urcu_txn_conflict(t->mtxn);
 }
 
 /*
@@ -3403,10 +3585,10 @@ void ft_txn_attempt_end(struct ft_op *op, bool open)
 /*
  * Close one attempt that BAILED BEFORE ITS OWN COMMIT and will re-attempt.
  *
- * Two things, in this order.  urcu_txn_conflict() AGES the handle, which is the
+ * Two things, in this order.  ft_op_conflict() AGES the op, which is the
  * entire point of giving the loop one: without it every attempt restarts at
- * retry 0, the domain never escalates the writer into its per-trie FIFO
- * fair-mutex lane, and the loop has no termination argument at all.  Then
+ * retry 0, the op never escalates into its trie's FIFO fair-mutex lane, and
+ * the loop has no termination argument at all.  Then
  * end(), which FORFEITS the turn -- a pre-commit bail re-descends and asks a
  * peer for the very thing it just lost, so keeping the lane across that ask
  * queues the holder behind the waiter (the insert livelock).
@@ -3512,7 +3694,7 @@ static inline
 void ft_txn_attempt_bail(struct ft_op *op, bool open)
 {
 	if (open) {
-		urcu_txn_conflict(&op->txn);
+		ft_op_conflict(op);
 		/*
 		 * Then once per refused lock-set.  An attempt that lost three
 		 * acquires waited on three peers, and folding them into the one
@@ -3520,7 +3702,7 @@ void ft_txn_attempt_bail(struct ft_op *op, bool open)
 		 * to rescue.
 		 */
 		while (ft_acq_contended) {
-			urcu_txn_conflict(&op->txn);
+			ft_op_conflict(op);
 			ft_acq_contended--;
 		}
 		ft_op_end(op);
@@ -3574,7 +3756,7 @@ void ft_dlm_linger(struct ft_op *op)
 	 * rates the mechanism itself deflated.  The measured victims are all
 	 * at the lane head, so this gate loses none of the target class.
 	 */
-	if (op->txn.retry < URCU_TXN_FALLBACK_MIN)
+	if (op->retry < FT_OP_LANE_MIN)
 		return;
 	if (!(CMM_LOAD_SHARED(w->state) & FT_STATE_LOCK))
 		return;
@@ -3723,6 +3905,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->nr_hidden = 0;	/* ☠ a REUSED struct is the PREVIOUS op */
 #endif
 	t->mtxn = &t->own;
+	t->op = NULL;
 	urcu_txn_init(t->mtxn, NULL);	/* flavor-agnostic: the caller brackets the
 					 * RCU read side; no escalation domain
 					 * under POC exclusion */
@@ -3988,10 +4171,10 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_at(FT_TK_SITE_PARAM
  * count is not known up front.
  *
  * WHY IT HAS TO EXIST: ft_flip_txn_create() inits its own handle with NO
- * escalation domain ("no escalation domain under POC exclusion"), so an op
+ * escalation lane (it is not an op), so an op
  * built on it can NEVER escalate however many times it retries -- every
  * attempt is a fresh handle, retry aging resets to zero, and
- * urcu_txn__self_qualifies is never reached.  A contended writer then
+ * ft_op_earned_lane is never reached.  A contended writer then
  * livelocks by construction rather than taking its FIFO turn.  Binding to
  * @op is what makes the retry loop terminate.
  *
@@ -4011,6 +4194,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->nr_hidden = 0;	/* ☠ a REUSED struct is the PREVIOUS op */
 #endif
 	t->mtxn = &op->txn;
+	t->op = op;
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->committed = false;
@@ -4121,6 +4305,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->nr_hidden = 0;	/* ☠ a REUSED struct is the PREVIOUS op */
 #endif
 	t->mtxn = &op->txn;
+	t->op = op;
 	if (urcu_txn_reserve(t->mtxn, cap) < 0) {
 		ft_flip_txn_free(t);
 		return NULL;
@@ -9307,7 +9492,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		FT_MISS_ACCOUNT(t);
 
 		if (miss_st == URCU_TXN_STATUS_ABORT)
-			urcu_txn_conflict(t->mtxn);
+			ft_flip_txn_conflict(t);
 		FT_TP(txn_commit, (const void *) t->mtxn, (int) miss_st);
 		FT_TK_COUNT_END(t, FT_TK_MISS);
 		ft_flip_txn_destroy(t);
@@ -9375,6 +9560,8 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	}
 	FT_MK_NOTE(t, ft);
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
+	if (st == URCU_TXN_STATUS_ABORT && t->op)
+		ft_op_commit_aborted(t->op);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	for (sa_i = 0; sa_i < t->sa_npend; sa_i++) {
 		const struct ft_sa_pend *sp = &t->sa_pend[sa_i];
@@ -11845,7 +12032,7 @@ static __thread struct cds_fair_mutex_node ft_acq_lane_waiter;
  * 8/8 legs killed against 4/8.
  *
  * So put the arbitration back where it belongs -- on the SAME lane the engine
- * uses (@ctx->op->domain), reached through the op's persistent handle, with no
+ * uses (@ctx->op->lane), reached through the op's persistent handle, with no
  * descriptor and no grace period owed.
  *
  * ☠ QUEUE HOLDING NOTHING (ft_lock_ctx_holds_nothing), and go QUIESCENT across
@@ -11908,7 +12095,7 @@ static void ft_lane_report(void)
 		"(calls %lu) ===\n"
 		"  ENGAGED (queued on the lane) %12lu  %5.1f%%\n"
 		"  refused: no ctx/op/ft        %12lu  %5.1f%%\n"
-		"  refused: no domain           %12lu  %5.1f%%\n"
+		"  refused: no lane             %12lu  %5.1f%%\n"
 		"  refused: too young           %12lu  %5.1f%%\n"
 		"  refused: in fallback         %12lu  %5.1f%%\n"
 		"  refused: op HOLDS SOMETHING  %12lu  %5.1f%%\n",
@@ -11919,30 +12106,28 @@ static void ft_lane_report(void)
 		ft_lane_too_young, 100.0*ft_lane_too_young/c,
 		ft_lane_in_fallback, 100.0*ft_lane_in_fallback/c,
 		ft_lane_holds_something, 100.0*ft_lane_holds_something/c);
-#ifdef URCU_TXN_FALLBACK_STATS
 	/*
-	 * ☞ AND THE OTHER DOOR TO THE SAME LANE.  urcu_txn__enter_fallback
-	 * takes cds_fair_mutex_lock(&txn->domain->lock) -- the SAME fair mutex
-	 * ft_acq_lane_backoff queues on -- gated on the TXN's retry age, which
+	 * ☞ AND THE OTHER DOOR TO THE SAME LANE.  ft_op_lane_enter takes
+	 * cds_fair_mutex_lock(&op->lane->lock) -- the SAME fair mutex
+	 * ft_acq_lane_backoff queues on -- gated on the op's retry age, which
 	 * is what ft_txn_attempt_bail feeds when it drains @ft_acq_contended
-	 * into urcu_txn_conflict().  So the FT-side counter is CONVERTED, not
+	 * into ft_op_conflict().  So the FT-side counter is CONVERTED, not
 	 * discarded, and "the lane never engages" is only true of THIS door.
 	 */
 	fprintf(stderr,
-		"  --- the engine's door to the same lane ---\n"
-		"  txn begin                    %12lu\n"
-		"  txn wanted fallback          %12lu  %5.1f%% of begins\n"
-		"  txn ESCALATED (took the lane)%12lu  %5.1f%% of begins\n"
+		"  --- the op's door to the same lane ---\n"
+		"  op begin                     %12lu\n"
+		"  op wanted the lane           %12lu  %5.1f%% of begins\n"
+		"  op ESCALATED (took the lane) %12lu  %5.1f%% of begins\n"
 		"  max retry seen               %12lu\n",
-		urcu_txn_stat_begin,
-		urcu_txn_stat_wantfb,
-		urcu_txn_stat_begin ?
-			100.0*urcu_txn_stat_wantfb/urcu_txn_stat_begin : 0.0,
-		urcu_txn_stat_escalate,
-		urcu_txn_stat_begin ?
-			100.0*urcu_txn_stat_escalate/urcu_txn_stat_begin : 0.0,
-		urcu_txn_stat_maxretry);
-#endif
+		ft_op_lane_nr_begin,
+		ft_op_lane_nr_want,
+		ft_op_lane_nr_begin ?
+			100.0*ft_op_lane_nr_want/ft_op_lane_nr_begin : 0.0,
+		ft_op_lane_nr_enter,
+		ft_op_lane_nr_begin ?
+			100.0*ft_op_lane_nr_enter/ft_op_lane_nr_begin : 0.0,
+		ft_op_lane_maxretry);
 }
 # define FT_LANE(c)	uatomic_inc(&ft_lane_##c)
 #else
@@ -11954,14 +12139,14 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx)
 {
 	const struct rcu_flavor_struct *flavor;
-	struct urcu_txn_domain *dom;
+	struct ft_lane *lane;
 
 	FT_LANE(calls);
 
 	if (!ctx || !ctx->op || !ft)
 		{ FT_LANE(no_ctx); return; }
-	dom = ctx->op->txn.domain;
-	if (!dom)
+	lane = ctx->op->lane;
+	if (!lane)
 		{ FT_LANE(no_dom); return; }
 	if (ft_acq_contended < FT_ACQ_LANE_AGE)
 		{ FT_LANE(too_young); return; }
@@ -11981,7 +12166,7 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 	 * threads parked in cds_fair_mutex_park under BOTH ft_dlm_acquire_set_at
 	 * and urcu_txn_begin at once -- which is the cycle written out.
 	 */
-	if (urcu_txn_in_fallback())
+	if (ft_op_in_lane())
 		{ FT_LANE(in_fallback); return; }
 	if (!ft_lock_ctx_holds_nothing(ctx))
 		{ FT_LANE(holds_something); return; }		/* see ft_lock_ctx_holds_nothing: lane cycle */
@@ -12040,7 +12225,7 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 	 */
 	/* The park itself, widened for the offline/online A/B (see the site). */
 	ft_delay_seam(FT_DELAY_SITE_LANE);
-	cds_fair_mutex_lock(&dom->lock, &ft_acq_lane_waiter);
+	cds_fair_mutex_lock(&lane->lock, &ft_acq_lane_waiter);
 #ifdef FT_DEBUG_LANE_GP
 	/*
 	 * DID A GRACE PERIOD COMPLETE INSIDE THIS PARK?  That is the whole
@@ -12066,7 +12251,7 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 	 * waiting on us.  Holding it across the retry would serialize the whole
 	 * op and put a lock holder in the lane, which is the cycle above.
 	 */
-	(void) cds_fair_mutex_unlock(&dom->lock, &ft_acq_lane_waiter);
+	(void) cds_fair_mutex_unlock(&lane->lock, &ft_acq_lane_waiter);
 #ifdef FT_RED_ACQ_LANE_OFFLINE
 	flavor->thread_online();
 #endif
@@ -13257,7 +13442,7 @@ e2_closing:
 		sl->meta = taken[i];
 		sl->fn = fn;
 		sl->line = line;
-		sl->op_bound = !!(ctx && ctx->op && ctx->op->txn.domain);
+		sl->op_bound = !!(ctx && ctx->op && ctx->op->lane);
 		sl->tid = (unsigned long) pthread_self();
 		sl->ts_ns = ft_dbg_now_ns();
 		/*

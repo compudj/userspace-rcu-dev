@@ -2471,9 +2471,9 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		/*
 		 * The op's PERSISTENT engine handle (doc §11), spanning the whole
 		 * @retry_attach loop as ft_txn_op_init does for insert, remove and
-		 * replace.  It is what makes this loop terminate: urcu_txn_conflict()
-		 * ages contention ACROSS attempts, so the domain escalates this
-		 * writer into its per-trie FIFO fair-mutex lane and the contention
+		 * replace.  It is what makes this loop terminate: ft_op_conflict()
+		 * ages contention ACROSS attempts, so this writer escalates
+		 * into its per-trie FIFO fair-mutex lane and the contention
 		 * drains.  Unaged, every attempt restarts at retry 0 and the loop
 		 * has no termination argument at all -- 679819 retries over one inv
 		 * run, 4214 of them for a single op.  That is STARVATION, not
@@ -2485,11 +2485,11 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * reasons: urcu_txn_begin() enters the RCU read side (a GP under it
 		 * waits on this very thread), and an aged handle escalates into the
 		 * fallback lane (ft_writer_lock_gp_wait asserts
-		 * !urcu_txn_in_fallback(), a peer parked on that lane being an
+		 * !ft_op_in_lane(), a peer parked on that lane being an
 		 * ONLINE, non-quiescent reader that holds the GP open).  The only
 		 * grace period reachable from this body is its own src drain, which
 		 * is !src_ft->exclusive-gated, and dst_ft->lock_fine is what binds
-		 * the escalation domain at all -- so the conjunction IS the GP-free
+		 * the escalation lane at all -- so the conjunction IS the GP-free
 		 * contract, and it is the same condition ft_merge_at_inner already
 		 * read_lock()s this call under.  It covers every retry the loop
 		 * takes: excl=679819 live=0, against 225 ops entering off-contract
@@ -3923,9 +3923,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	/*
 	 * ESCALATION LANE for retry_swap.  Without a persistent handle this loop
 	 * ages nothing: every attempt commits through its own ft_flip_txn, so
-	 * urcu_txn_conflict() is never called, txn->retry never advances and
-	 * urcu_txn__self_qualifies() is never reached -- and a standalone handle
-	 * carries no domain anyway.  A contended writer then spins with no
+	 * ft_op_conflict() is never called, the op's retry never advances and
+	 * ft_op_earned_lane() is never reached -- and a standalone handle
+	 * carries no lane anyway.  A contended writer then spins with no
 	 * termination argument instead of taking its FIFO turn.
 	 *
 	 * SCOPED to the contended region, not the whole op: all four retry edges
@@ -4863,7 +4863,7 @@ retry_swap:
 		 * ft_writer_lock_gp_wait() waits a grace period, and a writer parked
 		 * on the domain's FIFO lane is an ONLINE, non-quiescent reader holding
 		 * that grace period open -- which is why that function asserts
-		 * !urcu_txn_in_fallback().  Same reason the read section is released
+		 * !ft_op_in_lane().  Same reason the read section is released
 		 * immediately below.
 		 */
 		ft_txn_attempt_end(&optxn, gs_open);
@@ -5075,7 +5075,7 @@ retry_swap:
 		 * ft_writer_lock_gp_wait() waits a grace period, and a writer parked
 		 * on the domain's FIFO lane is an ONLINE, non-quiescent reader holding
 		 * that grace period open -- which is why that function asserts
-		 * !urcu_txn_in_fallback().  Same reason the read section is released
+		 * !ft_op_in_lane().  Same reason the read section is released
 		 * immediately below.
 		 */
 		ft_txn_attempt_end(&optxn, gs_open);

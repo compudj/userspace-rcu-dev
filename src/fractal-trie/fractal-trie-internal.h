@@ -127,17 +127,48 @@
 #include <urcu/rcu-txn-list.h>
 
 /*
+ * A trie's ESCALATION LANE: the FIFO fair mutex a starving op queues on, so
+ * a writer that keeps losing makes progress.  @active is raised by an op
+ * that EARNED the lane (aged past its budget) and tells every other op to
+ * queue behind it too, for the length of that episode.
+ */
+struct ft_lane {
+	struct cds_fair_mutex lock;
+	unsigned long active;
+};
+
+/*
  * THE FT OP HANDLE.  One per operation, spanning its retry loop.  @txn is the
  * commit engine's handle: each attempt opens and closes it (ft_op_begin /
  * ft_op_end), and a flip txn built on the op (ft_flip_txn_create_on) records
- * into it.  The op is FT's own type so that FT policy -- the escalation lane
- * that serializes a starving op, and the retry age that earns it -- can live
- * with FT rather than with one engine: the SW engine (<urcu/rcu-txn-sw.h>)
- * has no lane.
+ * into it.  Everything else here is FT policy, so it lives with FT and not
+ * with one engine (the SW engine, <urcu/rcu-txn-sw.h>, has no lane): the
+ * lane, the retry age that earns it, and the turn the op holds.
  */
 struct ft_op {
-	struct urcu_txn txn;
+	struct urcu_txn txn;		/* the engine handle (no domain) */
+	struct ft_lane *lane;		/* NULL: never escalates (exclusive trie) */
+	const struct rcu_flavor_struct *flavor;	/* for the quiescent park */
+	unsigned long retry;		/* attempts lost so far */
+	struct cds_fair_mutex_node waiter;	/* our node while awaiting the turn */
+	int in_lane;			/* we hold the lane */
+	int lane_published;		/* we raised lane->active and owe the clear */
+	int park_quiescent;		/* park OFFLINE (ft_op_set_park_quiescent) */
+	int retrying;			/* a COMMIT aborted: keep the turn */
 };
+
+/*
+ * Depth of the escalation lane THIS THREAD holds (0 = none).  It exists for
+ * one invariant: never wait for a grace period while holding the lane (see
+ * ft_writer_lock_gp_wait).
+ */
+extern __thread unsigned int ft_op_lane_depth;
+
+static inline
+int ft_op_in_lane(void)
+{
+	return ft_op_lane_depth != 0;
+}
 #include <urcu/rculfhash.h>
 #include <urcu/arch.h>
 #include <urcu/assert.h>	/* urcu_assert_debug: the engine self-checks' arm */
@@ -2127,15 +2158,6 @@ struct cds_ft_group {
 	unsigned int flags;		/* CDS_FT_FLAG_* creation-time flags. */
 	const struct rcu_flavor_struct *flavor;
 	/*
-	 * Concurrent-engine escalation domain for the group's structural
-	 * transactions (urcu_txn_*).  Shared by every trie in the group: a
-	 * writer that keeps losing the optimistic race escalates to the
-	 * domain's fair lock so progress is bounded.  Currently exercised
-	 * under retained caller exclusion (no contention), so the fast path
-	 * never escalates.
-	 */
-	struct urcu_txn_domain domain;
-	/*
 	 * Structural-writer concurrency strategy for the group's tries (MW
 	 * lock-escalation model).  Copied to each trie at create; a locking
 	 * strategy (COARSE or FINE) makes the trie take the FT-wide writer lock
@@ -2597,17 +2619,17 @@ struct cds_ft {
 	struct cds_ft_compact_state *active_compact;
 
 	/*
-	 * Per-trie writer-contention escalation domain (<urcu/rcu-txn.h>): a
-	 * concurrent-mode op's persistent txn handle binds it (ft_txn_op_init)
-	 * so a starved writer escalates into the FIFO fair-mutex lane after
-	 * URCU_TXN_FALLBACK aborted attempts (doc/design/
+	 * Per-trie writer-contention escalation lane (struct ft_lane): a
+	 * concurrent-mode op binds it (ft_txn_op_init) so a starved writer
+	 * escalates into the FIFO fair-mutex lane once it has lost its
+	 * budget of attempts (ft_op_lane_at; doc/design/
 	 * mcas-multiwriter-readiness.md §11).  Per-trie because writer
 	 * contention is per-trie (ops on different tries share no slots).
 	 * Initialized at create; no destructor (futex/word state only).
 	 * Unused (never escalates) on an exclusive trie -- ft_txn_op_init
 	 * binds NULL there.
 	 */
-	struct urcu_txn_domain txn_domain;
+	struct ft_lane lane;
 
 	/*
 	 * MW COARSE lock-mode FT-wide writer lock (doc/design/
@@ -2896,9 +2918,9 @@ extern unsigned long ft_probe_rspin[6];
  * merely desirable -- the same question ft_probe_mspin[4] answered for
  * merge_spine_retry (exclsrc=585250 livesrc=0).
  *
- * urcu_txn_begin() opens an RCU read section AND urcu_txn_conflict() ages the
- * handle into the domain's FIFO fallback lane; ft_writer_lock_gp_wait() both
- * self-deadlocks under the first and asserts !urcu_txn_in_fallback() under the
+ * ft_op_begin() opens an RCU read section AND ft_op_conflict() ages the
+ * op into the trie's FIFO lane; ft_writer_lock_gp_wait() both
+ * self-deadlocks under the first and asserts !ft_op_in_lane() under the
  * second.  So a bracket may only span a body that takes NO grace period, and
  * every grace period on these three paths is gated on a source being LIVE:
  *
@@ -4253,7 +4275,7 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 	 * the cause the one time it is broken, because the wedge's own stacks
 	 * blame the innocent.
 	 */
-	assert(!urcu_txn_in_fallback());
+	assert(!ft_op_in_lane());
 #ifdef FEATURE_FT_HOLD_TRACE
 	ft_seam_check("ft_writer_lock_gp_wait");
 #endif
@@ -4629,7 +4651,7 @@ void ft_bulk_gate_enter_gp(struct cds_ft *ft, enum ft_bulk_kind kind)
 		 * already inside a critical section when the store landed may
 		 * still believe they are in the old mode, so let them finish.
 		 */
-		assert(!urcu_txn_in_fallback());	/* see gp_wait */
+		assert(!ft_op_in_lane());	/* see gp_wait */
 		/*
 		 * A bulk op enters its gate before any writer scope, so it
 		 * holds none of the scope read sections this GP would wait on.

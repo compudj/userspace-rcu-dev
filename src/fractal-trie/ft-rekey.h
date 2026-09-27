@@ -4119,7 +4119,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				 * -digit retries) and far below a livelock (the
 				 * measured one ran 193k attempts).
 				 */
-				if (optxn->txn.retry < FT_REKEY_UNCOVERED_AFTER)
+				if (optxn->retry < FT_REKEY_UNCOVERED_AFTER)
 					return -EAGAIN;
 				/*
 				 * Aged out, so the reading is STRUCTURAL: the
@@ -8483,8 +8483,8 @@ sweep:
  * Every bail in the attempt above is abort-clean (the trie is byte-for-byte as
  * before), so retrying is just calling again -- but calling again is not enough
  * on its own.  Progress under contention comes from AGING a PERSISTENT handle:
- * urcu_txn_conflict() advances @optxn->retry, and once it reaches the fallback
- * budget the writer takes its FIFO turn on the trie's escalation domain and
+ * ft_op_conflict() advances @optxn->retry, and once it reaches the fallback
+ * budget the writer takes its FIFO turn on the trie's escalation lane and
  * commits without competition.  A fresh handle per attempt -- which is what the
  * caller's external "just call again" loop produced -- resets that age to zero
  * every time, so the writer never qualifies and spins instead.
@@ -10747,9 +10747,9 @@ merge_spine_retry:
 				dst_ft->group->flavor->read_unlock();
 				/*
 				 * AGE IT.  This is the arm that spun 348 deep with
-				 * nothing to make it terminate: urcu_txn_conflict
+				 * nothing to make it terminate: ft_op_conflict
 				 * carries the retry count on the persistent handle, so
-				 * the domain escalates this writer into the FIFO lane
+				 * this writer escalates into the FIFO lane
 				 * and the contention drains.  end() then FORFEITS the
 				 * turn -- this is a pre-commit bail, and a bail that
 				 * keeps its turn while the peer it waits on queues

@@ -430,7 +430,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 * writer parked on the fallback lane is an ONLINE,
 				 * non-quiescent QSBR reader -- precisely what stops the
 				 * grace period it would then wait for.  That is the rule
-				 * ft_writer_lock_gp_wait asserts (!urcu_txn_in_fallback).
+				 * ft_writer_lock_gp_wait asserts (!ft_op_in_lane).
 				 * ft_detach_node itself takes no grace period -- there is
 				 * no ft_writer_lock_gp_wait anywhere in ft-remove.h -- so
 				 * a bracket around exactly it is provably clear of one.

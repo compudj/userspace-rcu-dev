@@ -234,3 +234,14 @@ the recorded release (the A/B control).
 
 Found on the way: `ft_rekey_cow_stop` cached the descriptor ahead of a
 reservation that can move it (6f774617).
+
+**The escalation lane is FT's** (2026-09-27, Mathieu: "Let FT own the
+escalation lane"). The SW engine has no domain, no retry age and no FIFO turn,
+so `struct ft_op` wraps the engine handle and carries them. `ft_op_begin` takes
+the trie's `ft_lane` before the engine opens the attempt's read section.
+`ft_op_end` releases the lane unless a commit aborted, and `ft_op_conflict`
+ages a pre-commit bail. The budget is the engine's (11/4 x cost, within
+[64, 4096]). The cost is still read from the MCAS handle
+(`urcu_txn_last_cost`), so the swap needs an FT count for it. The engine handle
+gets no domain. Parity on `ft_inv` MW (`-DFT_DEBUG_LANE`): before, 2.9% of
+begins escalated through the engine's lane; after, 2.8% through FT's.
