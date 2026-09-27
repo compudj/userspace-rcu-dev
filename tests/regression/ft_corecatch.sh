@@ -35,17 +35,14 @@
 #   * ulimit -c unlimited must be set INSIDE the iteration subshell.
 #
 # Usage:
-#   tests/regression/ft_corecatch.sh [-b BUILD] [-t SUITE] [-s SPACING]
+#   tests/regression/ft_corecatch.sh [-b BUILD] [-t SUITE]
 #                                    [-f FILTER] [-n N] [-p P] [-o OUT]
 #                                    [-T SECS] [-k] [-F]
 #
 #   -b BUILD   build directory (default: the repo root -- an in-tree build).
 #              A gate per-config tree works as-is and is the usual target:
-#              -b $HOME/.cache/ft-parallel-gate/anchorval
+#              -b $HOME/.cache/ft-parallel-gate/txndbg
 #   -t SUITE   inv (default) | unit
-#   -s SPACING per-node (default) | exponential | root-only
-#              (exponential / root-only need a build with
-#              -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL / _ROOT_ONLY)
 #   -f FILTER  test-name filter, passed as argv[1] to the suite (both
 #              suites take one); default runs everything
 #   -n N       iterations (default 48)
@@ -79,7 +76,7 @@ NCPU=$( (nproc 2>/dev/null || echo 8) )
 
 BUILD=$ROOT
 SUITE=inv
-SPACING=per-node
+SPACING=per-node	# the only lock spacing; kept in labels and file names
 FILTER=
 N=48
 # Per-workload-thread sizing; see the -p note above.  An explicit -p overrides.
@@ -95,11 +92,10 @@ FORCE=0
 
 usage() { sed -n '/^# Usage:/,/^# Exit status/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
-while getopts 'b:t:s:f:n:p:o:T:kFh' o; do
+while getopts 'b:t:f:n:p:o:T:kFh' o; do
 	case $o in
 	b) BUILD=$OPTARG ;;
 	t) SUITE=$OPTARG ;;
-	s) SPACING=$OPTARG ;;
 	f) FILTER=$OPTARG ;;
 	n) N=$OPTARG ;;
 	p) P=$OPTARG ;;
@@ -117,42 +113,11 @@ inv)  REL=tests/regression/.libs/test_urcu_ft_inv ;;
 unit) REL=tests/unit/.libs/test_urcu_ft_unit ;;
 *) echo "ft_corecatch: unknown suite '$SUITE' (want inv or unit)" >&2; exit 2 ;;
 esac
-case $SPACING in
-per-node|exponential|root-only) ;;
-*) echo "ft_corecatch: unknown spacing '$SPACING'" >&2; exit 2 ;;
-esac
 
 BIN=$(readlink -f "$BUILD/$REL" 2>/dev/null)
 LIBS=$(readlink -f "$BUILD/src/.libs" 2>/dev/null)
 [ -n "$BIN" ] && [ -x "$BIN" ] || { echo "ft_corecatch: no test binary at $BUILD/$REL (build it first)" >&2; exit 2; }
 [ -n "$LIBS" ] && [ -d "$LIBS" ] || { echo "ft_corecatch: no library dir at $BUILD/src/.libs" >&2; exit 2; }
-
-# ★ A SPACING THE BUILD CANNOT SELECT IS A SWEEP THAT DOES NOT HAPPEN.
-# CDS_FT_LOCK_SPACING is only read when FEATURE_FT_LOCK_SPACING_ENV is
-# compiled in (FEATURE_FT_ANCHOR_VALIDATE / FEATURE_FT_HOLD_TRACE imply it),
-# and without it every iteration silently runs per-node while the output says
-# otherwise -- which is how an exponential-only defect scored 0 in the
-# configs that "swept" for it.  Ask the ARTIFACT, not the configure line: the
-# getenv() argument is a string literal, so it exists in the built library if
-# and only if the arm that reads it was compiled.
-# Look in the shared library AND in the test binary: a --disable-shared tree
-# has no liburcu-cds.so at all, and there the literal lives in the statically
-# linked binary instead.  Refusing THAT build would be the same false negative
-# in the other direction.
-if [ "$SPACING" != per-node ]; then
-	if ! command -v strings >/dev/null 2>&1; then
-		echo "ft_corecatch: no 'strings' (binutils) -- cannot verify that this" >&2
-		echo "  build reads CDS_FT_LOCK_SPACING.  Proceeding UNVERIFIED: if it" >&2
-		echo "  does not, every iteration runs per-node under an '$SPACING' label." >&2
-	elif ! strings "$LIBS"/liburcu-cds.so* "$BIN" 2>/dev/null \
-			| grep -qx 'CDS_FT_LOCK_SPACING'; then
-		echo "ft_corecatch: $BUILD cannot select '$SPACING' -- neither its" >&2
-		echo "  liburcu-cds nor its test binary reads CDS_FT_LOCK_SPACING, so" >&2
-		echo "  every iteration would run per-node under an '$SPACING' label." >&2
-		echo "  Rebuild that tree with -DFEATURE_FT_ANCHOR_VALIDATE." >&2
-		exit 2
-	fi
-fi
 
 [ -n "$OUT" ] || OUT=./ft-corecatch-$SUITE-$SPACING-$$
 mkdir -p "$OUT" || exit 2
@@ -210,7 +175,6 @@ mkdir -p "\$d" || exit 1
 cd "\$d" || exit 1
 ulimit -c unlimited 2>/dev/null
 export LD_LIBRARY_PATH="$LIBS\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-export CDS_FT_LOCK_SPACING=$SPACING
 export FT_INV_MW=${FT_INV_MW:-0}
 export FT_INV_NO_ORDERED_LIST=${FT_INV_NO_ORDERED_LIST:-0}
 # Park this shell's stderr while the suite runs.  A crash is the EXPECTED

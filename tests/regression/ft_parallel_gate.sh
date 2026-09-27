@@ -45,11 +45,6 @@
 #                and have measured the room.
 #   FT_GATE_J    make -j per config                 (default: cores/12,
 #                so nconfigs*J stays near the core count)
-#   FT_GATE_SPACINGS  lock spacings to run every config at (default
-#                per-node).  The two DETECTOR configs (txndbg,
-#                proxyassert) carry their own 3-spacing sweep in the
-#                matrix and ignore this default -- see the comment there
-#                for why a defect can hide in the middle of that axis.
 #   FT_GATE_REPEAT    run each leg N times (default 1).  For hunting an
 #                INTERMITTENT: the two measured instances of the
 #                raw-read-of-a-parked-slot class fired at ~10% and ~8%,
@@ -190,17 +185,7 @@ ALL_CONFIGS=(
 	# arbitrates against a peer, so the raw-read class this config exists to
 	# detect is the class the missing leg hid.  The leg costs 82 s, alongside
 	# ioff's 76 s.
-	#
-	# ★ SWEPT ACROSS LOCK SPACINGS (the 4th field), because the class this
-	# config exists to detect HIDES IN ONE.  The gate ran every leg at the
-	# default per-node and found nothing for months; the same suite under
-	# CDS_FT_LOCK_SPACING=exponential produced a raw-read abort in 4 runs of
-	# 48 (ft_chain_compress_fused's forward slot, @f8b1640e), and 0 of 48
-	# under per-node AND root-only.  Per-node holds the slot's own word so no
-	# peer can park in it; root-only serialises every op on one word; only
-	# coarsening-to-an-ancestor leaves the slot open.  A defect can live in
-	# the MIDDLE of this axis, so testing its two ends proves nothing about it.
-	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_SETTLE -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL|u ion ioff imw sp|per-node exponential root-only"
+	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_SETTLE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw sp"
 	# The FT's own resolved-pointer assertion (ft_assert_resolved): a parked
 	# flip proxy handed to an accessor that requires a resolved flag.  It is
 	# the embedder-side counterpart to txndbg's engine-side DEBUG_RCU, and it
@@ -216,83 +201,12 @@ ALL_CONFIGS=(
 	# child-slot read, and skip-compression collapses the chains those reads
 	# walk -- the free-walk defect that motivated the config reproduced 10 of
 	# 10 without skip-compression and never with it.
-	# Swept for the same reason txndbg is: this is the embedder-side detector
-	# for the same class, so it is blind to the same spacings.
-	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL|u ion ioff imw|per-node exponential root-only"
+	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw"
 	# Phase E.3's certification config: the self-collision ledger
-	# (FEATURE_FT_HOLD_TRACE) armed across the spacing sweep.  A collision
-	# aborts (ft_hold_trace_refused), so a red here is a leg abort, not a
-	# grep.  DEBUG_RCU rides along so the engine's own asserts stay armed at
-	# the same spacings this config certifies.
-	# ★ imw AT ALL THREE SPACINGS IS THE POINT OF THIS CONFIG.  The E.2
-	# owner-stamp oracle only has two writers to arbitrate under MW, and
-	# the exclusion defects it exists for live at the COARSE spacings: a
-	# concurrent-writer leg at per-node alone cannot reach them, because
-	# per-node anchors every member on itself and no two members of one op
-	# ever collapse onto one word.  Its abort IS the failure signal -- a
-	# violation kills the leg rather than printing a line a grep must
-	# find.
-	"holdtrace|-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL|u ion ioff imw|per-node exponential root-only"
-	# ★ THE CONFIG THAT ACTUALLY CATCHES THE RAW-READ CLASS.
-	#
-	# txndbg above arms the same engine assert and NEVER FIRES IT: with
-	# ft_chain_compress_fused's raw-read defect (@f8b1640e) deliberately put
-	# back, txndbg scored 0 of 144 runs -- at -O2 AND at -O1, with and
-	# without the MW leg -- while this combination reproduced it.  The
-	# ingredient is FEATURE_FT_ANCHOR_VALIDATE, bisected against the same
-	# reverted defect on the same machine:
-	#
-	#   --enable-rcu-debug + ANCHOR_VALIDATE     6 / 144   (the repro)
-	#   --enable-rcu-debug, no ANCHOR_VALIDATE   0 /  96
-	#   -DDEBUG_RCU alone                        0 /  48
-	#   txndbg (DEBUG_RCU + READ_POLICY)         0 / 144
-	#   these exact CPPFLAGS                     1 /  96
-	#
-	# ANCHOR_VALIDATE is not an extra assert here -- it is what makes a COARSE
-	# SPACING SELECTABLE AT ALL.  Without it FEATURE_FT_LOCK_SPACING_ENV is not
-	# compiled in, so CDS_FT_LOCK_SPACING is never read and every leg runs
-	# per-node (and cds_ft_group_attr_set_lock_spacing refuses coarse outright).
-	# That, not a widened window, is why the table above reads the way it does:
-	# every 0-scoring row was running per-node against an EXPONENTIAL-only
-	# defect.  Hence the guard below -- a swept config without the flag is a
-	# sweep that silently does not happen.
-	#
-	# ★ The rate is ~1-4%, so ONE run of this config proves nothing -- it is
-	# here to be run with FT_GATE_REPEAT when hunting, and the 3-spacing sweep
-	# is mandatory because the defect it was built from is exponential-only.
-	"anchorval|-DDEBUG_RCU -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL|u ion ioff imw|per-node exponential root-only"
-	# ★ THE PROBE-FREE COARSE-SPACING LEG -- Phase E.5's missing control.
-	#
-	# Every other config that sweeps the spacing axis (txndbg, proxyassert,
-	# holdtrace, anchorval) carries FEATURE_FT_ANCHOR_VALIDATE or
-	# FEATURE_FT_HOLD_TRACE, because until this config existed those flags were
-	# the only way to make a coarse spacing SELECTABLE.  So the entire
-	# certification corpus for exponential and root-only was gathered on
-	# INSTRUMENTED builds, and the configuration the API gate would actually
-	# ship -- a coarse spacing with no probe compiled in -- had never been run.
-	#
-	# FEATURE_FT_LOCK_SPACING_ENV is the knob WITHOUT the probes.  It is reached
-	# through ft_lock_spacing_default() (ft-lifecycle.h), which sets the group's
-	# DEFAULT and is deliberately not behind the setter's refusal -- so this
-	# build selects a coarse spacing while cds_ft_group_attr_set_lock_spacing
-	# still refuses one, which is exactly the shipping API contract.
-	#
-	# ★ WHAT IT CAN AND CANNOT SEE, and that asymmetry is the point.  With no
-	# DEBUG_RCU, no anchor validation and no hold ledger, this leg detects only
-	# what a USER would: an invariant violation, a wrong key count, a crash, a
-	# hang.  It is not a better detector than anchorval -- it is the CONTROL for
-	# it, differing by exactly "-DDEBUG_RCU -DFEATURE_FT_ANCHOR_VALIDATE" over
-	# the same four suites at the same three spacings.  A failure HERE is a
-	# shipping-shape failure; a failure only in anchorval is a probe finding.
-	# It is also the uninstrumented arm the E.4 spacing bench had to fake by
-	# running its whole matrix under ANCHOR_VALIDATE for uniform overhead.
-	#
-	# ☠ It does NOT certify the coarse spacings.  The per-op arm refuses any
-	# spacing but per-node (ft_txn_per_op_spacing_ok), so the two coarse legs
-	# run the all-MW content path -- sound, and stricter, but NOT the engine
-	# Phase B built.  Reading a green here as "E.5 is clear" would be reading a
-	# control as a result.
-	"spacingenv|-DFEATURE_FT_LOCK_SPACING_ENV -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL|u ion ioff imw|per-node exponential root-only"
+	# (FEATURE_FT_HOLD_TRACE).  A collision aborts (ft_hold_trace_refused), so
+	# a red here is a leg abort, not a grep.  DEBUG_RCU rides along so the
+	# engine's own asserts stay armed.
+	"holdtrace|-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	# ★ THE DUPLICATE CHAIN'"'"'S MW ABLATION.  cds_ft_node.next/.prev park SW by
 	# default; this builds the MW arm back.  It is here so the arm cannot ROT:
@@ -631,7 +545,7 @@ run_leg_multi() {	# $1=name $2=cdir $3=spacing $4=bin $5=lib $6=outfile
 		dirs+=("$cdir/copy-$i")
 		( run_leg "$cdir/copy-$i" 1800 "$FT_GATE_MEM_IMW" \
 			env LD_LIBRARY_PATH="$lib" \
-			CDS_FT_LOCK_SPACING="$sp" FT_INV_MW=1 "$bin" \
+			FT_INV_MW=1 "$bin" \
 			> "$cdir/copy-$i.out" 2>&1; echo $? > "$cdir/copy-$i.rc" ) &
 		pids+=($!)
 	done
@@ -677,49 +591,9 @@ run_leg_multi() {	# $1=name $2=cdir $3=spacing $4=bin $5=lib $6=outfile
 
 run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run TAP
 	local name=$1 tests=$2 spacings=${3:-} flags=${4:-}
-	[ -n "$spacings" ] || spacings=${FT_GATE_SPACINGS:-per-node}
-	# ★ A SWEEP THE BUILD CANNOT HONOUR IS WORSE THAN NO SWEEP: it relabels
-	# three identical per-node runs as three spacings.  CDS_FT_LOCK_SPACING is
-	# only read when FEATURE_FT_LOCK_SPACING_ENV is compiled in, which
-	# FEATURE_FT_ANCHOR_VALIDATE / FEATURE_FT_HOLD_TRACE imply -- and without
-	# it the library refuses a coarse spacing anyway.  Refuse to pretend.
-	case " $spacings " in
-	*" exponential "*|*" root-only "*)
-		case "$flags" in
-		*FEATURE_FT_ANCHOR_VALIDATE*|*FEATURE_FT_HOLD_TRACE*|*FEATURE_FT_LOCK_SPACING_ENV*) ;;
-		*)
-			echo "$name: CONFIG ERROR (sweeps [$spacings] but its flags cannot select one -- add -DFEATURE_FT_ANCHOR_VALIDATE)" >> "$GATE/$name.result"
-			return ;;
-		esac ;;
-	esac
-	# ★ AND ROOT-ONLY NEEDS ITS OWN MACRO.  Since @20fcf938 the enumerator is
-	# declared only under -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY, and the env knob
-	# ABORTS (rc=134) rather than degrading to per-node -- deliberately, so a
-	# degraded creator cannot read GREEN.  Selecting a spacing at all is
-	# therefore no longer sufficient: without this check the leg still launches
-	# and dies on its first group create, which reads as a red of the SUITE when
-	# it is a red of the CONFIG.
-	case " $spacings " in
-	*" root-only "*)
-		case "$flags" in
-		*FEATURE_FT_LOCK_SPACING_ROOT_ONLY*) ;;
-		*)
-			echo "$name: CONFIG ERROR (sweeps root-only but its flags lack -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -- the env knob aborts by design)" >> "$GATE/$name.result"
-			return ;;
-		esac ;;
-	esac
-	# ★ SAME FOR EXPONENTIAL since it was demoted to an experimental axis: the
-	# enumerator is declared only under -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL
-	# and the env knob aborts without it.
-	case " $spacings " in
-	*" exponential "*)
-		case "$flags" in
-		*FEATURE_FT_LOCK_SPACING_EXPONENTIAL*) ;;
-		*)
-			echo "$name: CONFIG ERROR (sweeps exponential but its flags lack -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL -- the env knob aborts by design)" >> "$GATE/$name.result"
-			return ;;
-		esac ;;
-	esac
+	# Per-node is the only lock spacing (exponential and root-only were
+	# removed), so every config runs one pass, labelled per-node.
+	spacings=per-node
 	local dir=$GATE/$name out=$GATE/$name.result
 	local LIB=$dir/src/.libs U=$dir/tests/unit/.libs/test_urcu_ft_unit
 	local I=$dir/tests/regression/.libs/test_urcu_ft_inv
@@ -849,7 +723,6 @@ run_spacing() {	# $1=name $2=tests $3=spacing $4=outfile -- every leg at ONE spa
 		sp)   bin=$SP; tmo=120; lbl="txn settle"; env_x=() mem=$FT_GATE_MEM_SP ;;
 		esac
 		o=$(run_leg "$cdir" "$tmo" "$mem" env LD_LIBRARY_PATH="$LIB" \
-			CDS_FT_LOCK_SPACING="$sp" \
 			${env_x[@]+"${env_x[@]}"} "$bin"); rc=$?
 		# The SPACING rides every label below: a red that names only the
 		# suite is unattributable when three spacings run the same leg.
