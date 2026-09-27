@@ -1897,7 +1897,7 @@ int ft_node_recompact(enum ft_recompact mode,
 				"nonnull=%u holes=%u dead_ext=%u count=%u state=%#lx n=%u\n",
 				(int) mode, old_type_index, (void *) old_node, pc,
 				nonnull, holes, dead, ct,
-				(unsigned long) (uintptr_t) urcu_txn_read(
+				(unsigned long) (uintptr_t) ft_txn_read(
 					(void **) (uintptr_t) &metadata->state,
 					FT_STATE_PROXY),
 				(unsigned int) n);

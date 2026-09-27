@@ -285,13 +285,14 @@ bool ft_ord_empty(const struct cds_ft *ft)
 static __attribute__((noinline, cold, noreturn))
 void ft_cell_parent_copy_fail(struct cds_ft_inode_flag *parent, const void *site)
 {
-	struct urcu_txn_record *r = ft_flip_proxy_ptr(parent);
+	struct ft_txn_parked *r = ft_flip_proxy_ptr(parent);
+	const struct ft_txn_decision *d = ft_txn_parked_decision(r);
 
 	fprintf(stderr, "FT CELL PARENT COPY: fresh cell built with a parked "
-		"proxy %p (record slot %p old %p new %p, desc %p status %lu) "
-		"by %p\n", (void *) parent, (void *) r->slot, r->old_ptr,
-		r->new_ptr, (void *) r->desc,
-		r->desc ? uatomic_load(&r->desc->status, CMM_RELAXED) : 99UL,
+		"proxy %p (old %p new %p, decision %p committed %d) "
+		"by %p\n", (void *) parent, ft_txn_parked_value(r, false),
+		ft_txn_parked_value(r, true), (const void *) d,
+		d ? (int) ft_txn_decision_committed(d) : -1,
 		site);
 	fflush(stderr);
 # ifdef FT_DEBUG_CELL_PARENT_COPY

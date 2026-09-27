@@ -591,7 +591,7 @@ struct cds_ft_node *ft_hlist_resolve(void *raw)
 	uintptr_t v = (uintptr_t) raw;
 
 	if (caa_unlikely(v & (FT_HLIST_TAG | FT_HLIST_MARK)))
-		return ft_hlist_unmark(urcu_txn_resolve(raw, FT_HLIST_TAG));
+		return ft_hlist_unmark(ft_txn_resolve(raw, FT_HLIST_TAG));
 	return (struct cds_ft_node *) raw;
 }
 

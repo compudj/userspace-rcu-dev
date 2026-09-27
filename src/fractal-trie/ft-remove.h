@@ -2702,7 +2702,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 					(const void *) iter_held.lock);
 				fprintf(stderr, "FT FREEZE STALE AFTER CHECK: leaf %p next raw %p (%s) len %u; this op holds %p (boundary %p meta %p)\n",
 					(void *) freeze_leaf, raw,
-					urcu_txn_is_proxy(raw, FT_HLIST_TAG) ?
+					ft_txn_is_proxy(raw, FT_HLIST_TAG) ?
 						"PARKED PROXY" : "plain",
 					freeze_len, (void *) iter_held.lock,
 					(void *) iter_node_flag,

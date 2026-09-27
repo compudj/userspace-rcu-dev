@@ -8882,7 +8882,7 @@ static void ft_sa_anchor_props(const struct ft_flip_txn *t,
 				FT_SA_RV_P_PARENT_SHARES, false);
 		}
 	}
-	st = (uintptr_t) urcu_txn_resolve((void *) CMM_LOAD_SHARED(
+	st = (uintptr_t) ft_txn_resolve((void *) CMM_LOAD_SHARED(
 		node->state), FT_STATE_PROXY);
 	if (st & FT_STATE_LOCK)
 		ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_P_WORD_LOCKED, false);
@@ -9505,7 +9505,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	unsigned int sa_i;
 
 	for (sa_i = 0; sa_i < t->sa_ntpend; sa_i++)
-		sa_tstate[sa_i] = (uintptr_t) urcu_txn_resolve((void *)
+		sa_tstate[sa_i] = (uintptr_t) ft_txn_resolve((void *)
 			CMM_LOAD_SHARED(t->sa_tpend[sa_i].owner->state),
 			FT_STATE_PROXY);
 
@@ -9637,7 +9637,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 				(void *) sp->owner, (int) sp->rv,
 				(int) sa_cv[sa_i], sp->nlocks, t->nr_locks,
 				sp->nhold, sa_nhold, anc, arec,
-				(unsigned long) urcu_txn_resolve((void *)
+				(unsigned long) ft_txn_resolve((void *)
 					CMM_LOAD_SHARED(sp->owner->state),
 					FT_STATE_PROXY));
 		}
@@ -12264,7 +12264,7 @@ bool ft_acq_guards_ok(const struct ft_acq_guard *g, int nr)
 	int i;
 
 	for (i = 0; i < nr; i++)
-		if (urcu_txn_read(g[i].slot, g[i].tag) != g[i].expected)
+		if (ft_txn_read(g[i].slot, g[i].tag) != g[i].expected)
 			return false;
 	return true;
 }
@@ -13366,7 +13366,7 @@ e2_closing:
 
 		if (!set[i].nf)
 			continue;
-		if (!((uintptr_t) urcu_txn_resolve((void *) CMM_LOAD_SHARED(
+		if (!((uintptr_t) ft_txn_resolve((void *) CMM_LOAD_SHARED(
 				set[i].node->state), FT_STATE_PROXY) &
 				FT_STATE_TOMBSTONE))
 			continue;
@@ -13589,7 +13589,7 @@ bool ft_trace_miswire_observe(struct cds_ft *ft,
 	uintptr_t state;
 	bool self_rt = false;
 
-	state = (uintptr_t) urcu_txn_read((void **) &meta->state,
+	state = (uintptr_t) ft_txn_read((void **) &meta->state,
 			FT_STATE_PROXY);
 	rt_parent = ft_parent_node_resolved(
 			rcu_dereference(meta->parent_word));
@@ -15557,8 +15557,8 @@ bool ft_cell_deleted(const struct ft_ord_cell *c)
 	void *raw = (void *) rcu_dereference(
 		ft_ord_cell_lnode((struct ft_ord_cell *) (uintptr_t) c)->next);
 
-	if (urcu_txn_is_proxy(raw, URCU_TXN_TAG))
-		raw = urcu_txn_resolve(raw, URCU_TXN_TAG);
+	if (ft_txn_is_proxy(raw, URCU_TXN_TAG))
+		raw = ft_txn_resolve(raw, URCU_TXN_TAG);
 	return urcu_txn_list_is_marked(raw);
 }
 

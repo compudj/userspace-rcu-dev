@@ -125,6 +125,7 @@
 #include <urcu/fair-mutex.h>	/* MW coarse lock-mode FT-wide writer lock */
 #include <urcu/rcu-txn.h>
 #include <urcu/rcu-txn-list.h>
+#include "ft-txn-engine.h"	/* FT's view of the parked-slot format */
 
 /*
  * A trie's ESCALATION LANE: the FIFO fair mutex a starving op queues on, so

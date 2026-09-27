@@ -6728,8 +6728,8 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			void *raw = CMM_LOAD_SHARED(old_node->next);
 
 			uatomic_inc(&ft_ls_checked);
-			if (urcu_txn_is_proxy(raw, FT_HLIST_TAG)) {
-				void *res = urcu_txn_resolve(raw, FT_HLIST_TAG);
+			if (ft_txn_is_proxy(raw, FT_HLIST_TAG)) {
+				void *res = ft_txn_resolve(raw, FT_HLIST_TAG);
 				unsigned long c = uatomic_add_return(
 					&ft_ls_proxy, 1);
 

@@ -1031,7 +1031,7 @@ unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m)
 static inline
 unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m)
 {
-	return (unsigned long) urcu_txn_read(
+	return (unsigned long) ft_txn_read(
 			(void **) (uintptr_t) &m->nr_keys,
 			FT_NR_KEYS_PROXY_TAG) >> 1;
 }
@@ -1065,7 +1065,7 @@ void ft_nr_keys_store(const struct cds_ft *ft, struct cds_ft_metadata *m,
 static inline
 unsigned int ft_meta_nr_child_load(const struct cds_ft_metadata *meta)
 {
-	return (unsigned int) (((uintptr_t) urcu_txn_read(
+	return (unsigned int) (((uintptr_t) ft_txn_read(
 			(void **) (uintptr_t) &meta->state,
 			FT_STATE_PROXY) >> FT_STATE_NR_CHILD_SHIFT)
 			& FT_STATE_NR_CHILD_VALMASK);
@@ -1086,7 +1086,7 @@ unsigned int ft_meta_nr_child_load(const struct cds_ft_metadata *meta)
 static inline
 unsigned int ft_meta_parent_slot_offset_load(const struct cds_ft_metadata *meta)
 {
-	return FT_PSO_DECODE(urcu_txn_read(
+	return FT_PSO_DECODE(ft_txn_read(
 			(void **) (uintptr_t) &meta->parent_slot_offset,
 			FT_STATE_PROXY));
 }
@@ -1353,9 +1353,9 @@ unsigned long ft_node_type(struct cds_ft_inode_flag *node)
  * ft_node_ptr(), so the tag-stripping helpers can assert against the tag. */
 
 static inline_lookup
-struct urcu_txn_record *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
+struct ft_txn_parked *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
 {
-	return (struct urcu_txn_record *) _ft_node_mask_ptr(node);
+	return (struct ft_txn_parked *) _ft_node_mask_ptr(node);
 }
 
 /*
@@ -1365,16 +1365,14 @@ struct urcu_txn_record *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
  * (ft_node_flip_proxy), and the parked-record deref is reached only during a
  * commit's brief install-to-settle window.  A parked record carries FT's own
  * 0xF tag (see URCU_TXN_PROXY_* in fractal-trie-internal.h), so this masks it
- * off and resolves the record through its MCAS status word.
+ * off and resolves the proxy through its commit's decision.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
 {
-	if (caa_unlikely(ft_node_flip_proxy(node))) {
-		struct urcu_txn_record *r = ft_flip_proxy_ptr(node);
-
-		return (struct cds_ft_inode_flag *) urcu_txn_resolve_record(r);
-	}
+	if (caa_unlikely(ft_node_flip_proxy(node)))
+		return (struct cds_ft_inode_flag *)
+			ft_txn_parked_resolve(ft_flip_proxy_ptr(node));
 	return node;
 }
 
@@ -2872,22 +2870,22 @@ struct cds_ft_inode_flag **ft_resolve_parent_slot(
 			 * re-read below.
 			 */
 			parent = praw;
-			state = urcu_txn_resolve(sraw, FT_STATE_PROXY);
+			state = ft_txn_resolve(sraw, FT_STATE_PROXY);
 		} else {
-			struct urcu_txn_record *rp = ft_flip_proxy_ptr(praw);
-			struct urcu_txn_desc *t = rp->desc;
-			unsigned long st = urcu_txn_desc_status(t);
+			struct ft_txn_parked *rp = ft_flip_proxy_ptr(praw);
+			const struct ft_txn_decision *t =
+				ft_txn_parked_decision(rp);
+			bool committed = ft_txn_decision_committed(t);
 
 			parent = (struct cds_ft_inode_flag *)
-				(st == URCU_TXN_DESC_SUCCEEDED ? rp->new_ptr : rp->old_ptr);
-			if (caa_likely(urcu_txn_is_proxy(sraw, FT_STATE_PROXY))) {
-				struct urcu_txn_record *rs =
-					urcu_txn_untag(sraw, FT_STATE_PROXY);
+				ft_txn_parked_value(rp, committed);
+			if (caa_likely(ft_txn_is_proxy(sraw, FT_STATE_PROXY))) {
+				struct ft_txn_parked *rs =
+					ft_txn_parked_of(sraw, FT_STATE_PROXY);
 
-				if (caa_unlikely(rs->desc != t))
+				if (caa_unlikely(ft_txn_parked_decision(rs) != t))
 					continue;	/* stale offset edge: re-snapshot */
-				state = st == URCU_TXN_DESC_SUCCEEDED ?
-						rs->new_ptr : rs->old_ptr;
+				state = ft_txn_parked_value(rs, committed);
 			} else {
 				/* Parent parked but offset already settled: re-snapshot. */
 				continue;
@@ -3272,7 +3270,7 @@ void ft_trace_pub_check(struct cds_ft *ft,
 		return;
 	cn = ft_compressed_node_ptr(nf);
 	meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
-	state = (uintptr_t) urcu_txn_read((void **) &meta->state,
+	state = (uintptr_t) ft_txn_read((void **) &meta->state,
 			FT_STATE_PROXY);
 	rt_parent = ft_parent_node_resolved(
 			rcu_dereference(meta->parent_word));
