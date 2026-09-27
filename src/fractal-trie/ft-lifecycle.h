@@ -341,117 +341,6 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 }
 
-/*
- * The lock-set granularity a group takes when the caller chose none:
- * CDS_FT_LOCK_SPACING env override ("per-node" / "exponential" / "root-only";
- * the last two only in a build carrying their own feature macro, else the knob
- * ABORTS), else per-node.  An explicit cds_ft_group_attr_set_lock_spacing always wins --
- * this moves the DEFAULT only, so a test run can sweep the granularity axis
- * across a whole suite without every group-create site growing a knob.
- *
- * The knob is its OWN feature, which either probe implies.  That separation is
- * what makes a probe's cost measurable against the granularity it measures: a
- * build carrying the knob alone runs the coarse arm with no instrumentation, so
- * "the coarse arm is slow" and "the probe is slow" are distinguishable claims.
- * Welded to the probes, a control build reads no env and reports the coarse arm
- * on per-node timings.
- */
-#if defined(FEATURE_FT_ANCHOR_VALIDATE) || defined(FEATURE_FT_HOLD_TRACE)
-# ifndef FEATURE_FT_LOCK_SPACING_ENV
-#  define FEATURE_FT_LOCK_SPACING_ENV
-# endif
-#endif
-
-static
-enum cds_ft_lock_spacing ft_lock_spacing_default(void)
-{
-#ifdef FEATURE_FT_LOCK_SPACING_ENV
-	const char *env = getenv("CDS_FT_LOCK_SPACING");
-
-	if (env) {
-		if (!strcmp(env, "exponential")) {
-#ifdef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
-			return CDS_FT_LOCK_SPACING_EXPONENTIAL;
-#else
-			/* LOUD, NOT SILENT: see root-only below. */
-			fprintf(stderr, "[Fatal] Fractal Trie: CDS_FT_LOCK_SPACING="
-				"exponential requested, but this build has no "
-				"-DFEATURE_FT_LOCK_SPACING_EXPONENTIAL (an "
-				"experimental axis)\n");
-			abort();
-#endif
-		}
-		if (!strcmp(env, "root-only")) {
-#ifdef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
-			return CDS_FT_LOCK_SPACING_ROOT_ONLY;
-#else
-			/*
-			 * ☠ LOUD, NOT SILENT.  A test leg that asks for root-only
-			 * on a build without the axis must not quietly run
-			 * per-node and read GREEN -- a trie CREATOR is a feature
-			 * gate, and a degraded creator is the wrong zero that
-			 * costs a whole gate round.  Refuse where it can be seen.
-			 */
-			fprintf(stderr, "[Fatal] Fractal Trie: CDS_FT_LOCK_SPACING="
-				"root-only requested, but this build has no "
-				"-DFEATURE_FT_LOCK_SPACING_ROOT_ONLY\n");
-			abort();
-#endif
-		}
-	}
-#endif
-	return CDS_FT_LOCK_SPACING_PER_NODE;
-}
-
-enum cds_ft_status cds_ft_group_attr_set_lock_spacing(
-		struct cds_ft_group_attr *attr,
-		enum cds_ft_lock_spacing spacing)
-{
-	switch (spacing) {
-	case CDS_FT_LOCK_SPACING_PER_NODE:
-		break;
-	case CDS_FT_LOCK_SPACING_ROOT_ONLY:
-		/*
-		 * A DEVELOPMENT AXIS, gated on its OWN macro -- not on the
-		 * anchor-validation one it used to share, so that turning the
-		 * validator on does not quietly make a non-setting settable.
-		 * See the enumerator's comment in the public header.
-		 */
-#ifndef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-#else
-		break;
-#endif
-	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
-		/*
-		 * ANCHORING IS ALL-OR-NOTHING: two ops that mutate one node must
-		 * acquire the SAME word, so a spacing coarser than per-node is
-		 * correct only once EVERY acquire site maps its members through
-		 * the anchor.  While any site still locks the node itself, a
-		 * coarser setting has converted sites anchoring on an ancestor
-		 * and unconverted ones on the node -- excluding nothing, and
-		 * quietly, since a mostly single-writer suite still passes.
-		 * Refuse it rather than ship a selectable config that is wrong.
-		 *
-		 * EXPERIMENTAL, gated on its OWN macro like root-only -- no longer
-		 * on FEATURE_FT_ANCHOR_VALIDATE, which used to make it settable as
-		 * a side effect.  It is not a shippable configuration; the gate's
-		 * spacing sweeps define the macro explicitly.  See the enumerator's
-		 * comment in the public header.
-		 */
-#ifndef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-#else
-		break;
-#endif
-	default:
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	}
-	attr->lock_spacing = spacing;
-	attr->lock_spacing_set = true;
-	return CDS_FT_STATUS_OK;
-}
-
 enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 {
 	struct cds_ft_attr *attr = calloc(1, sizeof(struct cds_ft_attr));
@@ -652,13 +541,6 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->writer_strategy = attr->writer_strategy_set ?
 			attr->writer_strategy : CDS_FT_WRITER_LOCK_FINE;
 		/*
-		 * calloc-zero is not a valid spacing (the enumerators start at
-		 * 1), hence @lock_spacing_set: unset resolves to per-node, the
-		 * granularity at which a writer locks exactly what it mutates.
-		 */
-		ft_group->lock_spacing = attr->lock_spacing_set ?
-			attr->lock_spacing : ft_lock_spacing_default();
-		/*
 		 * Order statistics maintain ONE global count on the root's nr_keys
 		 * word, which EVERY count-changing mutation walks up to and updates
 		 * (ft_flip_txn_record_count_parent to the root) -- so no two
@@ -705,7 +587,6 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->numa_policy = CDS_FT_NUMA_DEFAULT;
 		ft_group->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;
 		ft_group->writer_strategy = CDS_FT_WRITER_LOCK_FINE;	/* DLM default */
-		ft_group->lock_spacing = ft_lock_spacing_default();
 	}
 	*result_ft_group = ft_group;
 	FT_TP(group_create, (const void *) ft_group);
@@ -1054,20 +935,6 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 */
 	ft->external_sync = (ft_group->writer_strategy
 			== CDS_FT_WRITER_EXTERNAL_SYNC);
-	/*
-	 * Spacing is a FINE-mode property, and this is where it is made inert
-	 * everywhere else (every reader takes it from here, ft_descent_init
-	 * included).  A COARSE trie derives no lock-set at all (§10.5): its
-	 * remaining acquires are the F2 body-copy fences, taken one at a time
-	 * with no set to dedupe against, so a coarsened anchor there only
-	 * collapses an op's OWN marks onto one word -- the op then refuses
-	 * itself, and a self-refusal is the one -EAGAIN no peer will ever clear:
-	 * under a retry loop (every point op has one now, remove_all included)
-	 * that is not an error but a SPIN, which is why it is made inert here
-	 * rather than left to the ops to survive.
-	 */
-	ft->lock_spacing = ft->lock_fine ? ft_group->lock_spacing :
-			CDS_FT_LOCK_SPACING_PER_NODE;
 	cds_fair_mutex_init(&ft->writer_lock);
 	cds_fair_mutex_init(&ft->bulk_lock);
 	/* Move mode gate (struct cds_ft::move_active): movers only. */

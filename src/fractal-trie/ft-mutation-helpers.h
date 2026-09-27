@@ -59,24 +59,6 @@ void (*cds_ft_dbg_interleave_hook)(int point);
 #define FT_IL_SETTLE_LOCKS_LAST	3
 
 /*
- * One lock level's anchor, captured as the descent crosses it
- * (doc/design/ft-dlm-lock-coarseness.md §4).  @cover is the node whose
- * half-open byte span contains the level; @bound is the node starting at the
- * first node boundary at or after it, and @bound_start that boundary's byte.
- *
- * The two differ only inside a COMPRESSED node: a level strictly inside a span
- * has no node starting at it, so @cover is that compressed node and @bound is
- * its successor on the path (NULL until the descent reaches it).  Where a node
- * starts exactly at the level -- every level in a bushy trie -- @cover ==
- * @bound and @bound_start is the level itself.
- */
-struct ft_lock_anchor {
-	struct cds_ft_inode_flag *cover;
-	struct cds_ft_inode_flag *bound;
-	unsigned int bound_start;
-};
-
-/*
  * THE ANCESTOR LEDGER -- DEBUG-ONLY SINCE THE WIDENING WENT.
  *
  * It was built to feed G5.5's per-op lock-set widening; that widening is gone
@@ -98,10 +80,8 @@ struct ft_lock_anchor {
 /*
  * G5.5's ANCESTOR LEDGER: the descent path, root-first, for the widening.
  *
- * ☠ NOTHING ELSE IN THE TREE CAN ANSWER "every ancestor" at the SHIPPING
- * DEFAULT.  @anchor[] is never built at CDS_FT_LOCK_SPACING_PER_NODE
- * (ft_descent_enter_node returns before filling it -- "the zero-cost path the
- * default rests on"), the descent retains only a four-deep window
+ * ☠ NOTHING ELSE IN THE TREE CAN ANSWER "every ancestor".  The descent
+ * retains only a four-deep window
  * (nf/pnf/ppnf/pppnf), and the metadata->parent up-walk is refuted: it goes
  * transiently NULL while a detach or graft re-homes a node, and a NULL parent
  * reads as ROOT, so the walk truncates SILENTLY.  A widening built on any of
@@ -217,24 +197,6 @@ void ft_anc_ledger_push(struct cds_ft_inode_flag *nf, unsigned int depth)
  */
 struct ft_descent {
 	unsigned int depth;			/* Levels traversed (0 .. key_len). */
-	/*
-	 * Lock-level anchor table, one slot per ft_lock_level_index(), filled by
-	 * ft_descent_enter_node as the descent passes each level.  A lock-set
-	 * member's anchor is then an O(1) lookup (ft_descent_anchor) rather than
-	 * an up-walk: absolute byte-depth is unknown to a climb until it reaches
-	 * the root, so a climb cannot stop early and ends without the node it
-	 * walked past (doc/design/ft-dlm-lock-coarseness.md §5.3).
-	 *
-	 * Only slots the descent has CROSSED are readable, and a query at depth
-	 * @d touches ft_lock_level_index(@d) <= the deepest crossed slot, so
-	 * every reachable read is written first -- @anchor needs no init sweep on
-	 * the mutation hot path.  @anchor_crossed records the written set so a
-	 * debug build asserts that rather than trusting it.
-	 */
-	struct ft_lock_anchor anchor[FT_LOCK_LEVEL_MAX];
-	uint16_t anchor_pending;		/* Levels awaiting their boundary node. */
-	uint16_t anchor_crossed;		/* Levels written (debug validation). */
-	enum cds_ft_lock_spacing lock_spacing;	/* The trie's lock granularity. */
 	/*
 	 * Record the path into the per-thread ancestor ledger?  Sampled ONCE at
 	 * ft_descent_init from the packed bulk word, so the steady state pays one
@@ -378,160 +340,21 @@ struct ft_parent_hint {
 };
 
 /*
- * Record @nf, spanning key bytes [@start, @start + @len), into @d's anchor
- * table.  A node starts exactly where its predecessor ended, so entering one
- * resolves every level left pending by that predecessor; the node then covers
- * each lock level inside its own span.
+ * The descent entered @nf, spanning key bytes [@start, @start + @len).  Only the
+ * debug ancestor ledger records anything: per-node locking anchors every member
+ * on itself, so a descent builds no lock table.
  */
 static inline
 void ft_descent_enter_node(struct ft_descent *d, struct cds_ft_inode_flag *nf,
 		unsigned int start, unsigned int len)
 {
-	unsigned int lvl;
-
-	/*
-	 * BEFORE the per-node early return: the ledger is needed at EVERY
-	 * spacing, and per-node is the one where nothing else records the path.
-	 */
+	(void) len;
 #ifdef FT_ANC_LEDGER
 	if (caa_unlikely(d->anc_rec))
 		ft_anc_ledger_push(nf, start);
+#else
+	(void) d; (void) nf; (void) start;
 #endif
-	/*
-	 * Per-node granularity anchors every member on itself, so it reads no
-	 * table and builds none -- the zero-cost path the default rests on.
-	 * Root-only needs the FIRST node and nothing after it.
-	 */
-	if (d->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
-		return;
-	if (d->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
-		if (!d->anchor_crossed) {
-			d->anchor[0].cover = nf;
-			d->anchor[0].bound = nf;
-			d->anchor[0].bound_start = 0;
-			d->anchor_crossed = 1;
-		}
-		return;
-	}
-	/* This node IS the boundary the pending levels were waiting for. */
-	while (caa_unlikely(d->anchor_pending != 0)) {
-		unsigned int i = (unsigned int) __builtin_ctz(d->anchor_pending);
-
-		d->anchor[i].bound = nf;
-		d->anchor_pending &= (uint16_t) ~(1U << i);
-	}
-	/* Levels inside [@start, @start + @len) are covered by this node. */
-	lvl = ft_lock_level(start);
-	if (lvl < start)
-		lvl = lvl ? lvl << 1 : 1;
-	for (; lvl < start + len; lvl = lvl ? lvl << 1 : 1) {
-		unsigned int i = ft_lock_level_index(lvl);
-
-		d->anchor[i].cover = nf;
-		d->anchor_crossed |= (uint16_t) (1U << i);
-		if (lvl == start) {
-			d->anchor[i].bound = nf;
-			d->anchor[i].bound_start = start;
-		} else {
-			/* No node starts at @lvl: its boundary is this span's end. */
-			d->anchor[i].bound = NULL;
-			d->anchor[i].bound_start = start + len;
-			d->anchor_pending |= (uint16_t) (1U << i);
-		}
-	}
-}
-
-/*
- * The anchor for a node at byte-depth @depth: the node starting at the first
- * node boundary at or after ft_lock_level(@depth), or -- with no boundary in
- * [level, @depth] -- the node whose span contains that level
- * (doc/design/ft-dlm-lock-coarseness.md §2).  The clamp keeps the result an
- * ancestor-or-self of the queried node.
- *
- * @depth must be at most @d->depth: the table holds the levels the descent has
- * PASSED, and a member BELOW the cursor is resolved by its caller from the two
- * candidate boundaries it already holds (§7.1), not here.
- *
- * The cursor's own node is what the table cannot carry: it spans [@d->depth, ...)
- * and has not been entered.  It is nonetheless a boundary, in two ways -- the
- * level can fall exactly on it (@depth a power of two equal to @d->depth), and
- * it is the boundary a still-pending level is waiting for, since a level goes
- * pending only from the LAST entered node and that node ends at @d->depth.
- */
-/*
- * The node starting at the first node boundary at or after lock level @lvl,
- * taking no boundary later than @clamp; the coverer of @lvl if none qualifies.
- * @lvl must be a lock level the descent has crossed (or the cursor's own).
- *
- * @clamp is a separate argument because it is NOT always the depth that chose
- * the level: an immediate child of the cursor takes ITS level but clamps at its
- * OWN depth, which lies past the cursor.
- *
- * @self is the member starting at @clamp, or NULL when the query names none.
- *
- * ☞ A MEMBER STARTING AT A STILL-PENDING BOUNDARY IS THAT BOUNDARY.  A pending
- * level's boundary is the node starting at @bound_start, and the fallback names
- * it through the cursor on the premise that the cursor is the not-yet-entered
- * node at @d->depth.  ft_walk_extend breaks that premise: it leaves @d->nf on
- * the node it ENTERED and moves @d->depth to that node's END, so the fallback
- * answered the member's PARENT (doc/design/ft-lockset-inventory.md §2 row 7,
- * the E.2 oracle's live exclusion violation).  A cursor left SKIP-encoded
- * breaks it too: `anchor == nf` fails on the encoding and the skip word
- * resolves to the elided node above (row 8).  Neither is a fact about the
- * trie: whatever node starts at @bound_start on the member's path is the
- * member, so answer from the member.
- */
-static inline
-struct cds_ft_inode_flag *ft_descent_anchor_at_level(const struct ft_descent *d,
-		unsigned int lvl, unsigned int clamp, struct cds_ft_inode_flag *self)
-{
-	const struct ft_lock_anchor *a;
-	unsigned int i;
-
-	if (lvl == d->depth)
-		return d->nf;
-	i = ft_lock_level_index(lvl);
-	a = &d->anchor[i];
-	assert(d->anchor_crossed & (1U << i));
-	if (a->bound_start <= clamp) {
-		if (a->bound)
-			return a->bound;
-		if (self && a->bound_start == clamp)
-			return self;
-		return d->nf;
-	}
-	return a->cover;
-}
-
-static inline
-struct cds_ft_inode_flag *ft_descent_anchor(const struct ft_descent *d,
-		unsigned int depth)
-{
-	assert(depth <= d->depth);
-	return ft_descent_anchor_at_level(d, ft_lock_level(depth), depth, NULL);
-}
-
-/*
- * The anchor for @child_nf, the cursor's IMMEDIATE child, sitting at byte-depth
- * @child_depth -- the below-cursor case ft_descent_anchor refuses (§7.1).
- *
- * Only two boundaries lie in (@d->depth, @child_depth]: the cursor's own start
- * and the child's, because the cursor spans the whole gap -- one slot hop, or a
- * compressed run of cn->len bytes.  So the child anchors on ITSELF when its
- * level falls past the cursor, and otherwise on whatever the table already
- * holds for that level.  Callers with a deeper member must extend the descent
- * rather than reach further with this.
- */
-static inline
-struct cds_ft_inode_flag *ft_descent_anchor_child(const struct ft_descent *d,
-		struct cds_ft_inode_flag *child_nf, unsigned int child_depth)
-{
-	unsigned int lvl = ft_lock_level(child_depth);
-
-	assert(child_depth > d->depth);
-	if (lvl > d->depth)
-		return child_nf;
-	return ft_descent_anchor_at_level(d, lvl, child_depth, child_nf);
 }
 
 /*
@@ -567,24 +390,17 @@ bool ft_descent_depth_of(const struct ft_descent *d,
 	return true;
 }
 
-
 /*
- * Exercise the anchor LOOKUP from the descent itself, at exactly the depths an
- * acquire site queries -- the cursor and the three ancestors the window carries.
- * Until an acquire site consumes the table, ft_descent_enter_node is the only
- * part the suites reach; this gate makes the lookup reachable too, so a build
- * under CDS_FT_LOCK_SPACING=exponential covers both halves.
+ * Check the descent window's shape at the points an acquire site reads it.
  */
 #ifdef FEATURE_FT_ANCHOR_VALIDATE
 static inline
 void ft_descent_anchor_validate(const struct ft_descent *d)
 {
-	unsigned int back;
-
 	/*
 	 * Window depths are ordered and strictly shallower than the cursor: every
 	 * node spans at least one key byte, so a slot can never start where the
-	 * one below it does.  This holds under every granularity.
+	 * one below it does.
 	 */
 	if (d->pnf)
 		assert(d->pdepth < d->depth);
@@ -592,26 +408,6 @@ void ft_descent_anchor_validate(const struct ft_descent *d)
 		assert(d->ppdepth < d->pdepth);
 	if (d->pppnf)
 		assert(d->pppdepth < d->ppdepth);
-	if (d->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
-		return;
-	if (d->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
-		assert(d->anchor_crossed & 1U);
-		assert(d->anchor[0].cover != NULL);
-		return;
-	}
-	/*
-	 * A NULL cursor means the descent walked off the trie (an absent
-	 * child): there is no node at @d->depth to anchor, and the two arms
-	 * that resolve to the cursor would report its absence, not a gap in
-	 * the table.
-	 */
-	if (!d->nf)
-		return;
-	for (back = 0; back < 4; back++) {
-		if (back > d->depth)
-			break;
-		assert(ft_descent_anchor(d, d->depth - back) != NULL);
-	}
 }
 #else
 static inline
@@ -621,41 +417,17 @@ void ft_descent_anchor_validate(const struct ft_descent *d __attribute__((unused
 #endif
 
 /*
- * The lock-set anchor for @nf, a node at byte-depth @depth that the acquire
- * would otherwise lock directly.  This is the call-site-facing form: it applies
- * the trie's granularity, so an acquire site asks for an anchor uniformly and
- * per-node granularity hands back the node itself.
- *
- * Members mapping to ONE anchor must be acquired ONCE -- a second ft_dlm_lock on
- * a held node aborts -EAGAIN -- so a caller with several members dedupes on the
- * returned pointer (doc/design/ft-dlm-lock-coarseness.md §7.3).
- *
- * A member BELOW the cursor -- the chain-compress set's surviving child is the
- * canonical one (§7.1) -- resolves through ft_descent_anchor_child, which is
- * exact for ONE hop and no further: past that the descent skipped boundaries the
- * table never saw, and such a caller must extend the descent rather than reach
- * deeper from here.
- */
-/*
  * ft_descent_rename: @d was taken BEFORE this op's own commit, and that commit
  * replaced @old by its recompacted copy @new_flag at the same position (same
  * parent slot, same byte span).  Make @d describe the tree the commit left:
- * every anchor entry and path node naming @old names @new_flag.
- *
- * ☠ WITHOUT IT A POST-COMMIT SECOND FLIP ANCHORS ON A RETIRED NODE.  Under a
- * coarse spacing a member's lock is the anchor its descent recorded for the
- * member's level; after the commit that anchor is the retired @old, whose word
- * the op still counts as its own, so the second flip's acquire dedupes onto a
- * dead word and takes nothing.  A peer descending the live tree anchors the
- * same member on @new_flag and locks it: two ops, two words, one node -- they
- * exclude nothing.  See ft_detach_node's post-detach canonicalize.
+ * every path node naming @old names @new_flag, so a post-commit second flip
+ * plans against the live copy rather than the retired one (whose TOMBSTONE its
+ * acquire would refuse).  See ft_detach_node's post-detach canonicalize.
  */
 static inline
 void ft_descent_rename(struct ft_descent *d, const struct cds_ft_inode *old,
 		struct cds_ft_inode_flag *new_flag)
 {
-	unsigned int i;
-
 #define FT_DESCENT_RENAME(f)						\
 	do {								\
 		if ((f) && !ft_node_external(f) &&			\
@@ -663,10 +435,6 @@ void ft_descent_rename(struct ft_descent *d, const struct cds_ft_inode *old,
 		    (const struct cds_ft_inode *) ft_node_ptr(f) == old)	\
 			(f) = new_flag;					\
 	} while (0)
-	for (i = 0; i < FT_LOCK_LEVEL_MAX; i++) {
-		FT_DESCENT_RENAME(d->anchor[i].cover);
-		FT_DESCENT_RENAME(d->anchor[i].bound);
-	}
 	FT_DESCENT_RENAME(d->nf);
 	FT_DESCENT_RENAME(d->nf_raw);
 	FT_DESCENT_RENAME(d->pnf);
@@ -675,204 +443,18 @@ void ft_descent_rename(struct ft_descent *d, const struct cds_ft_inode *old,
 #undef FT_DESCENT_RENAME
 }
 
-static inline
-struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
-		struct cds_ft_inode_flag *nf, unsigned int depth)
-{
-	switch (d->lock_spacing) {
-	case CDS_FT_LOCK_SPACING_PER_NODE:
-		return nf;
-	case CDS_FT_LOCK_SPACING_ROOT_ONLY:
-		/*
-		 * The first node ANY descent enters is the trie's root, so
-		 * @anchor[0] normally holds it.  A descent that never ADVANCED
-		 * entered nothing -- both advance paths enter the node they
-		 * LEAVE, and a merge whose point IS the root descends an empty
-		 * key, so its loop never steps -- and then the cursor is still
-		 * that root.  Either way the anchor is the root.
-		 */
-		if (caa_unlikely(!(d->anchor_crossed & 1U))) {
-			assert(!d->depth);
-			return d->nf;
-		}
-		return d->anchor[0].cover;
-	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
-	default:
-		/*
-		 * A node starting ON a lock level never reaches here --
-		 * ft_anchor_meta settles it from the depth alone.  What is left
-		 * is the depths that genuinely need the table, and the table
-		 * describes the path the DESCENT took: for a node it never
-		 * passed (the detach's orphan walk leaves the key path, a
-		 * sibling reached by back-pointer was never on it) the arms
-		 * below answer from the wrong path -- the CURSOR's node, or
-		 * NULL where the descent walked off the trie.  Such a caller
-		 * must extend the descent rather than reach further from here.
-		 */
-		if (depth > d->depth)
-			return ft_descent_anchor_child(d, nf, depth);
-		assert(depth <= d->depth);
-		return ft_descent_anchor_at_level(d, ft_lock_level(depth),
-			depth, nf);
-	}
-}
-
 /*
- * THE ACQUIRE CHOKE POINT.  Every lock-set member resolves through here to the
- * metadata its acquire must actually take: the node's own under per-node
- * granularity, its anchor's under a coarser one.  Sites call this instead of
- * deriving metadata from the member flag directly, so the mapping lives in ONE
- * place -- agreement is a property of every site computing the SAME anchor for
- * a node, which is not something 40 independent derivations can be trusted to
- * preserve (doc/design/ft-dlm-lock-coarseness.md §1, §9).
- *
- * @d may be NULL where no descent ran; that is legal ONLY under per-node
- * granularity, where no depth is needed, and is asserted as such.
+ * THE ACQUIRE CHOKE POINT: the metadata a lock-set member's acquire takes.
+ * Per-node locking anchors every member on itself, so it is the member's own
+ * metadata; the descent and depth are no longer consulted.
  */
-#ifdef FT_DEBUG_CN_ANCHOR
-static unsigned long *ft_cna_n, *ft_cna_cn;
-
-static void ft_cn_anchor_register(unsigned long *n, unsigned long *cn)
-{
-	ft_cna_n = n;
-	ft_cna_cn = cn;
-}
-
-static __attribute__((destructor)) void ft_cn_anchor_report(void)
-{
-	fprintf(stderr, "FT CN ANCHOR: %lu of %lu table-anchored members anchored on a COMPRESSED ancestor\n",
-		ft_cna_cn ? *ft_cna_cn : 0UL, ft_cna_n ? *ft_cna_n : 0UL);
-}
-#endif
-
 static inline
 struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
 		const struct ft_descent *d, struct cds_ft_inode_flag *nf,
 		struct cds_ft_metadata *node, unsigned int depth)
 {
-	struct cds_ft_inode_flag *anchor;
-
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
-		return node;
-	/*
-	 * Byte-depth 0 is the ROOT, and the root is its own anchor under every
-	 * spacing: it covers lock level 0, and no boundary lies above it.  So a
-	 * root-level acquire needs no descent, which is what lets the
-	 * descent-less root fences anchor at all.
-	 *
-	 * ★ 0 IS A POSITION, NOT AN "UNKNOWN".  A caller that could not date its
-	 * member and leaves the depth at its initializer arrives here, and this
-	 * arm answers -- anchoring that node on ITSELF while every op that dates
-	 * it anchors on an ancestor, so the two exclude nothing (§1).  An undated
-	 * member is FT_DEPTH_FROM_DESCENT, which the acquire sites refuse.
-	 *
-	 * So CHECK the claim rather than trust it: depth 0 must mean this node
-	 * really has no parent.  The failure it catches is silent, coarse-only,
-	 * and reads as a lost update three layers away, so nothing downstream
-	 * will report it for you.
-	 *
-	 * STANDING as of the merge spine's absolute dating (1c288c07).  It was
-	 * opt-in behind FEATURE_FT_ANCHOR_VALIDATE for one reason -- "a member
-	 * dated RELATIVE to its op's own origin lands here too, and the merge
-	 * spine still does that below its first hop" -- and that reason died with
-	 * ft_merge_build's @dst_base_depth / @src_base_depth: every fence now
-	 * arrives dated from the trie root, not from the recursion.  An assert
-	 * with ONE opt-in config is an assert almost nobody runs, and this class
-	 * has already produced two hard defects (@becb4528, @1c288c07).
-	 */
-	if (!depth) {
-		assert(ft_node_flip_proxy(node->parent_word) ||
-			!ft_parent_node(node->parent_word));
-		return node;
-	}
-	/*
-	 * A node starting ON a lock level is the first boundary at that level,
-	 * so §2 settles its anchor from @depth alone -- the same rule the root
-	 * case above is, at level 0.  No descent is read, so a DESCENT-LESS
-	 * site is legal for it: the assert below guards only the depths that
-	 * genuinely need a table.
-	 */
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_EXPONENTIAL &&
-			ft_lock_level(depth) == depth)
-		return node;
-	/*
-	 * Root-only anchors every member on the trie's ROOT, which a
-	 * descent-less site can name directly -- ft_descent_init reads this
-	 * same slot the same way, so both routes answer with one node, which is
-	 * what §1's agreement asks.
-	 */
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY && !d)
-		return ft_flag_to_metadata(ft, ft_resolve_flip_proxy(
-			rcu_dereference(ft->root)));
-	assert(d);
-	anchor = ft_descent_anchor_of(d, nf, depth);
-#ifdef FT_DEBUG_CN_ANCHOR
-	/*
-	 * ARM YIELD for the skip-anchor shape (Mathieu): a member whose
-	 * anchor is a COMPRESSED ANCESTOR -- a node downward traversal skips
-	 * when its parent's slot is skip-encoded.  Zero means the workload
-	 * never builds the shape, and then no green run speaks for it.
-	 */
-	{
-		static unsigned long cna_n, cna_cn;
-		static int cna_reg;
-
-		uatomic_inc(&cna_n);
-		if (anchor && anchor != nf && ft_node_compressed(anchor))
-			uatomic_inc(&cna_cn);
-		if (!uatomic_xchg(&cna_reg, 1))
-			ft_cn_anchor_register(&cna_n, &cna_cn);
-	}
-#endif
-	/*
-	 * @node, never a re-derivation, whenever the anchor IS the member: a
-	 * flag reconstructed from a node pointer and a type index is wrong for
-	 * every node kind whose metadata is not at the internal-node offset (a
-	 * compressed node reached through a skip pointer, above all), and the
-	 * acquire would then fence a DIFFERENT word than the one the caller
-	 * retires.  Only a genuine ancestor -- a flag the descent stored, and so
-	 * well-formed -- is resolved here.
-	 */
-	return anchor == nf ? node : ft_flag_to_metadata(ft, anchor);
-}
-
-/*
- * The node ft_anchor_meta's answer for a member at byte-depth @depth DEPENDED
- * ON without locking it: the node whose span contains the lock level strictly
- * inside it.  NULL when the answer depended on no such node -- a member starting
- * on its level, a level some node starts on, or an anchor that IS the coverer
- * (its own acquire validates it).
- *
- * "The first boundary at or after L" is a fact about THIS node: a boundary can
- * appear in [L, anchor) only by splitting it, and one disappears at the anchor
- * only by fusing the anchor into it.  A compressed node's span never changes in
- * place, so both RETIRE it (doc/design/ft-lockset-inventory.md §5).
- */
-static inline
-struct cds_ft_inode_flag *ft_anchor_coverer(const struct cds_ft *ft,
-		const struct ft_descent *d, unsigned int depth)
-{
-	const struct ft_lock_anchor *a;
-	unsigned int lvl, i;
-
-	if (ft->lock_spacing != CDS_FT_LOCK_SPACING_EXPONENTIAL || !d ||
-			!depth)
-		return NULL;
-	lvl = ft_lock_level(depth);
-	if (lvl == depth)
-		return NULL;
-	/* ft_descent_anchor_child's own arm: the cursor spans the gap. */
-	if (depth > d->depth && lvl > d->depth)
-		return d->nf;
-	if (lvl == d->depth)
-		return NULL;
-	i = ft_lock_level_index(lvl);
-	if (!(d->anchor_crossed & (1U << i)))
-		return NULL;
-	a = &d->anchor[i];
-	if (a->bound_start <= lvl || a->bound_start > depth)
-		return NULL;
-	return a->cover;
+	(void) ft; (void) d; (void) nf; (void) depth;
+	return node;
 }
 
 /*
@@ -1050,9 +632,6 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	d->pdepth = 0;
 	d->ppdepth = 0;
 	d->pppdepth = 0;
-	d->anchor_pending = 0;
-	d->anchor_crossed = 0;
-	d->lock_spacing = ft->lock_spacing;
 #ifdef FT_ANC_LEDGER
 	d->anc_rec = caa_unlikely(ft_bulk_active(ft));
 	d->anc_gen = 0;
@@ -5737,24 +5316,6 @@ static void ft_ch_sa_score(struct ft_ch_site *s, const struct cds_ft *ft,
 		struct cds_ft_metadata *owner);
 #endif
 
-#ifdef FT_DEBUG_CHAIN_HOLD
-/*
- * Is a CHAIN HOLDER named by the op's OWN descent, or only reachable by a
- * back-pointer walk?  MATHIEU: one descent from root suffices to name ALL the
- * ancestors an op must lock, so this decides whether closing the chain gap
- * needs a re-descent at all, or merely an acquire nobody asked for.
- */
-unsigned long ft_chdate_ondescent, ft_chdate_derived, ft_chdate_noholder;
-static void ft_chdate_report(void) __attribute__((destructor));
-static void ft_chdate_report(void)
-{
-	fprintf(stderr, "FT CHAIN-DATE on_descent=%lu derived(off-path)=%lu no_holder=%lu\n",
-		uatomic_read(&ft_chdate_ondescent),
-		uatomic_read(&ft_chdate_derived),
-		uatomic_read(&ft_chdate_noholder));
-}
-#endif
-
 extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
 extern unsigned int ft_ch_site_n;
 extern unsigned long ft_ch_site_overflow;
@@ -6272,75 +5833,6 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 			return;
 		}
 	}
-	/*
-	 * ☠ AND ABOVE PER-NODE SPACING THE OWNER IS NOT THE WORD.  Under
-	 * exponential / root-only, ft_anchor_meta maps a lock-set member to an
-	 * ANCHOR ANCESTOR, so every witness above -- all of which match by EXACT
-	 * owner identity -- misses a word that IS excluded.  Scoring that as
-	 * UNHELD condemns those spacings wholesale: measured at 33,238 /
-	 * 99,839 / 66,740 "violations" on rows that are CLEAN at per-node.
-	 *
-	 * The audit cannot resolve the exact anchor here (ft_anchor_meta needs
-	 * the op's descent and the holder's BYTE-depth, and a chain holder is
-	 * reached by walking prev, which yields neither).  So ask the weaker
-	 * question that is sound in the direction that matters: is ANY ancestor
-	 * of the holder held?  The anchor, whatever it is, IS an ancestor -- so
-	 * "no ancestor held" means no anchor can be covering this word, and only
-	 * that is scored UNHELD.  A hit is bucketed separately (@anchored)
-	 * because it is weaker than the per-node verdict: it proves an ancestor
-	 * is held, not that it is THE anchor.
-	 */
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
-		/*
-		 * Root-only anchors EVERY member on the trie's root, which is
-		 * nameable directly -- the same slot, read the same way, as
-		 * ft_anchor_meta's own descent-less arm.  Exact here, and it
-		 * avoids walking parent words at all (see below).
-		 */
-		struct cds_ft_metadata *rm = ft_flag_to_metadata(ft,
-			ft_resolve_flip_proxy(rcu_dereference(ft->root)));
-		uintptr_t snap;
-		bool ratified;
-
-		if (rm && ((t && ft_flip_txn_owns(t, rm)) ||
-				ft_hold_trace_holds(rm) ||
-				(ctx && ft_lock_ctx_holds(ctx, rm, &snap,
-					&ratified)))) {
-			s->anchored++;
-			return;
-		}
-	} else if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
-		struct cds_ft_inode_flag *af = 
-			ft_parent_node_resolved(hm->parent_word);
-		unsigned int guard = 0;
-
-		/*
-		 * ☠ RESOLVE THE PROXY AND STOP AT AN EXTERNAL.  A parent word
-		 * can carry a peer's parked flip proxy, and ft_flag_to_metadata
-		 * on an EXTERNAL flag reads a metadata that is not there -- both
-		 * SEGV'd this walk before these two guards (measured: root-only
-		 * crashed 2 of 4 rows).  An instrument that faults is worse than
-		 * one that over-reports.
-		 */
-		while (af && guard++ < FT_MAX_DEPTH &&
-				!ft_node_external(af)) {
-			struct cds_ft_metadata *am =
-				ft_flag_to_metadata(ft, af);
-			uintptr_t snap;
-			bool ratified;
-
-			if (!am)
-				break;
-			if ((t && ft_flip_txn_owns(t, am)) ||
-					ft_hold_trace_holds(am) ||
-					(ctx && ft_lock_ctx_holds(ctx, am,
-						&snap, &ratified))) {
-				s->anchored++;
-				return;
-			}
-			af = ft_parent_node_resolved(am->parent_word);
-		}
-	}
 	s->unheld++;
 	if (ft->ordered_list)
 		s->un_liston++;
@@ -6512,38 +6004,6 @@ void ft_ch_audit_body_at(const char *fn, int line, const struct cds_ft *ft,
 					&ratified))) {
 			s->hw_locked_ok++;
 			return;
-		}
-		/*
-		 * ☠ ABOVE PER-NODE SPACING THE OWNER IS NOT THE WORD -- the same
-		 * caveat the chain arm carries.  Ask the weaker question that is
-		 * sound in the direction that matters: is ANY ancestor held?  The
-		 * anchor, whatever it is, IS an ancestor, so "no ancestor held"
-		 * means no anchor covers this node.  A hit is bucketed as
-		 * @anchored, never as a pass.  Resolve proxies and stop at an
-		 * external: both guards are load-bearing (they crashed this walk
-		 * before).
-		 */
-		if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
-			struct cds_ft_inode_flag *af = 
-				ft_parent_node_resolved(owner->parent_word);
-			unsigned int guard = 0;
-
-			while (af && guard++ < FT_MAX_DEPTH &&
-					!ft_node_external(af)) {
-				struct cds_ft_metadata *am =
-					ft_flag_to_metadata(ft, af);
-
-				if (!am)
-					break;
-				if ((t && ft_flip_txn_owns(t, am)) ||
-						ft_hold_trace_holds(am) ||
-						(ctx && ft_lock_ctx_holds(ctx,
-							am, &snap, &ratified))) {
-					s->anchored++;
-					return;
-				}
-				af = ft_parent_node_resolved(am->parent_word);
-			}
 		}
 		s->hw_locked_viol++;
 		return;
@@ -7570,17 +7030,8 @@ bool ft_flip_txn_holds(const struct ft_flip_txn *t,
  * "the registry cannot see this hold", never as "the op does not hold it", and
  * check which of the two before acting.
  *
- * NULL @owner is a MISS: see FT_OWNER_ASSERT_OWNED.
- *
- * ☠ EXACT AT PER-NODE SPACING, CONSERVATIVE ABOVE IT.  Coarser lock spacing
- * (CDS_FT_LOCK_SPACING=exponential / root-only) puts the word's lock on an
- * ANCHOR ANCESTOR, which the registry holds while @owner itself is absent --
- * so this reports a MISS for a word that IS excluded.  Per-node is the
- * default, which is the mode the readiness numbers are taken in; at any other
- * spacing read the counter as a LOWER BOUND on ownership, and note that the
- * assert stays SAFE either way (it only ever refuses a park, never permits
- * one).  Resolving the anchor here would need the op's descent, which a
- * record helper does not have.
+ * NULL @owner is a MISS: see FT_OWNER_ASSERT_OWNED.  Per-node locking makes a
+ * node's lock its own word, so the answer is exact.
  */
 static inline
 bool ft_flip_txn_owns(const struct ft_flip_txn *t,
@@ -7588,30 +7039,7 @@ bool ft_flip_txn_owns(const struct ft_flip_txn *t,
 {
 	if (!owner)
 		return false;
-	if (ft_flip_txn_holds(t, owner))
-		return true;
-	/*
-	 * ROOT-ONLY: the anchor of EVERY node is the trie's root
-	 * (ft_anchor_meta's own arm for a descent-less resolution), so a txn
-	 * holding the root's word excludes every writer of every word in that
-	 * trie -- including nodes this op never named as lock-set members.
-	 * MEASURED: without this, a remove_all lane that held the root aborted
-	 * the record-time owner assert on an in-place remove's forward slot
-	 * (core, inv_concurrent_remove_all_prefix at root-only).
-	 *
-	 * ☞ EXPONENTIAL gets no such shortcut: there the anchor comes from the
-	 * op's DESCENT, which a record helper does not have, so the answer
-	 * stays the exact-or-member one and is conservative beyond it.
-	 */
-	if (t->ft && t->ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
-		struct cds_ft_inode_flag *r = ft_resolve_flip_proxy(
-			rcu_dereference(t->ft->root));
-
-		return r && !ft_node_external(r) &&
-			ft_flip_txn_holds(t, ft_flag_to_metadata(
-				(struct cds_ft *) t->ft, r));
-	}
-	return false;
+	return ft_flip_txn_holds(t, owner);
 }
 
 /*
@@ -7639,28 +7067,12 @@ bool ft_flip_txn_excludes_all(const struct ft_flip_txn *t,
 
 /*
  * May a record on @meta's STATE WORD be parked SW -- i.e. does this commit hold
- * THAT WORD, not merely @meta's lock?
- *
- * A state word is two things: @meta's content (nr_child, TOMBSTONE), which the
- * holder of @meta's lock writes, and a LOCK BIT, which any op whose member
- * ANCHORS on @meta takes by CAS.  An SW park is a plain store, sound only when
- * every writer of the word is excluded -- so where the two exclusion domains
- * differ, holding @meta's lock is not enough: a peer that took the word for a
- * member anchored on @meta is not excluded by it, and the park erases that
- * peer's LOCK bit (its release then asserts on a word no writer accounts for).
- * The anchored retire already asks this question
- * (ft_flip_txn_record_retire_anchored_arms); the count records did not.
- *
- *   PER-NODE: a node's lock IS its word -- ft_flip_txn_owns is exact.
- *   ROOT-ONLY: only the root's word is ever taken, so no other state word
- *     carries a LOCK bit to erase -- ft_flip_txn_owns, root shortcut included.
- *   EXPONENTIAL: @meta's lock may be an ANCESTOR's word while @meta's own word
- *     is an anchor for deeper members -- or, dated differently by a peer's
- *     descent, @meta's own lock -- so only the exact word held counts.
- *     MEASURED (insert tier, exponential, inv_prefix_shape_zoo, FT_DEBUG_SLOT_
- *     HIST): an in-place insert holding the anchor parked {0x4 -> 0x8} on a
- *     word a peer had just taken; the peer's release found 0x8 -- FT BAD
- *     RELEASE, 5/6 runs.
+ * THAT WORD?  A state word is @meta's content (nr_child, TOMBSTONE) plus its
+ * LOCK bit; per-node locking makes @meta's lock that very word, so holding the
+ * lock is holding the word and ft_flip_txn_owns is exact.  (Kept as its own
+ * question: it is the one a coarser lock mapping would have to answer
+ * differently -- a peer anchoring a deeper member on @meta takes the LOCK bit
+ * without being excluded by @meta's lock, and a park would erase it.)
  *
  * A miss makes the record MW: the live value is its expected old, so a peer
  * holding the word fails the install and the op re-derives.
@@ -7669,16 +7081,7 @@ static inline
 bool ft_flip_txn_owns_state_word(const struct ft_flip_txn *t,
 		const struct cds_ft_metadata *meta)
 {
-	unsigned int i;
-
-	if (!t->ft || t->ft->lock_spacing != CDS_FT_LOCK_SPACING_EXPONENTIAL)
-		return ft_flip_txn_owns(t, meta);
-	if (!meta)
-		return false;
-	for (i = 0; i < t->nr_locks; i++)
-		if (t->locks[i].meta == meta)
-			return true;
-	return false;
+	return ft_flip_txn_owns(t, meta);
 }
 
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -8103,10 +7506,9 @@ void ft_lock_ctx_init(struct ft_lock_ctx *ctx, const struct ft_descent *d,
  * BACK-POINTER (ft_resolve_parent_slot and friends) rather than by descending
  * to it -- the shape most lock-sets take for their P and GP members.
  *
- * FALSE means the descent does not describe @nf, so this op has no depth for it
- * and must RE-PLAN.  Per-node granularity always succeeds with an unused depth:
- * a member anchors on itself there, so no descent is required and none of these
- * sites pay for the lookup.
+ * Per-node locking anchors every member on itself, so no depth is needed: it
+ * always succeeds, with an unused depth.  (The FALSE / re-plan contract its
+ * callers still honour belonged to the coarser spacings, now removed.)
  */
 static inline
 bool ft_lock_ctx_depth_of_at(const char *fn, int line,
@@ -8114,43 +7516,13 @@ bool ft_lock_ctx_depth_of_at(const char *fn, int line,
 		const struct ft_lock_ctx *ctx,
 		const struct cds_ft_inode_flag *nf, unsigned int *depth)
 {
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
-		*depth = 0;
-		return true;
-	}
-	/*
-	 * Root-only anchors EVERY member on the root, so like per-node it never
-	 * reads the depth -- only the exponential schedule selects a level from
-	 * it.  Answering here is what keeps a member the descent never passed
-	 * (a chain head's holder below an empty-key merge point) from bailing to
-	 * a re-descend that must fail the same way forever.  Non-zero, so
-	 * ft_anchor_meta's "depth 0 IS the root" early-out does not mistake a
-	 * deep member for the root; both roads lead to the root regardless.
-	 */
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
-		*depth = 1;
-		return true;
-	}
-	if (caa_likely(ft_descent_depth_of(ft_lock_ctx_descent(ctx), nf, depth)))
-		return true;
-#ifdef FEATURE_FT_HOLD_TRACE
-	if (ft_hold_trace_report_ok()) {
-		const struct ft_descent *d = ft_lock_ctx_descent(ctx);
-
-		fprintf(stderr,
-			"FT UNDATABLE MEMBER: %s:%d nf=%p descent=%p\n",
-			fn, line, (const void *) nf, (const void *) d);
-		if (d)
-			fprintf(stderr,
-				"  window nf=%p@%u pnf=%p@%u ppnf=%p@%u pppnf=%p@%u\n",
-				(void *) d->nf, d->depth,
-				(void *) d->pnf, d->pdepth,
-				(void *) d->ppnf, d->ppdepth,
-				(void *) d->pppnf, d->pppdepth);
-	}
-#endif
-	(void) fn; (void) line;
-	return false;
+	(void) fn;
+	(void) line;
+	(void) ft;
+	(void) ctx;
+	(void) nf;
+	*depth = 0;
+	return true;
 }
 
 #define ft_lock_ctx_depth_of(ft, ctx, nf, depth)			\
@@ -8174,37 +7546,8 @@ unsigned int ft_node_span(const struct cds_ft *ft,
 }
 
 /*
- * Date @parent_nf -- a member reached ONE HOP UP from a node whose byte-depth
- * @child_depth is already known -- for the sets the descent's window cannot
- * cover.
- *
- * A {C, P, GP} lock-set names three CONSECUTIVE ancestors, and the window holds
- * the last four nodes the descent passed, not the last four a set names: with C
- * already at the third slot, GP falls off the end.  Stepping one hop up from a
- * DATED node is legal where a climb is not (§5.3 -- a climb starts undated, and
- * byte-depth is absolute): a node's span is a property of the node itself, so
- * the parent of a node at @child_depth sits at @child_depth - span(parent).
- *
- * FALSE when the span exceeds @child_depth: @parent_nf is then not the parent of
- * anything at that depth, so the plan is stale and the op re-descends.
- */
-static inline
-bool ft_parent_depth_of(const struct cds_ft *ft,
-		const struct cds_ft_inode_flag *parent_nf,
-		unsigned int child_depth, unsigned int *depth)
-{
-	unsigned int span = ft_node_span(ft, parent_nf);
-
-	if (span > child_depth)
-		return false;
-	*depth = child_depth - span;
-	return true;
-}
-
-/*
- * ft_lock_ctx_depth_of for a member the site reached as the PARENT of a node it
- * has already dated: the descent's window answers when it describes @parent_nf,
- * and the one-hop derivation covers the rest.
+ * ft_lock_ctx_depth_of for a member reached as the PARENT of a dated node.
+ * Per-node locking needs no depth: always succeeds, with an unused depth.
  */
 static inline
 bool ft_lock_ctx_depth_of_parent(const struct cds_ft *ft,
@@ -8212,42 +7555,17 @@ bool ft_lock_ctx_depth_of_parent(const struct cds_ft *ft,
 		const struct cds_ft_inode_flag *parent_nf,
 		unsigned int child_depth, unsigned int *depth)
 {
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
-		*depth = 0;
-		return true;
-	}
-	if (ft_descent_depth_of(ft_lock_ctx_descent(ctx), parent_nf, depth))
-		return true;
-	if (caa_likely(ft_parent_depth_of(ft, parent_nf, child_depth, depth)))
-		return true;
-#ifdef FEATURE_FT_HOLD_TRACE
-	if (ft_hold_trace_report_ok())
-		fprintf(stderr,
-			"FT UNDATABLE PARENT: nf=%p span=%u child_depth=%u\n",
-			(const void *) parent_nf, ft_node_span(ft, parent_nf),
-			child_depth);
-#endif
-	return false;
+	(void) ft;
+	(void) ctx;
+	(void) parent_nf;
+	(void) child_depth;
+	*depth = 0;
+	return true;
 }
 
 /*
- * ft_lock_ctx_depth_of for a member the site reached as a CHILD of the node the
- * descent stopped on -- the shape a BUILD's re-parent targets take, since a
- * build works below the descent's cursor and the window names only nodes the
- * descent ENTERED.
- *
- * @child_parent is @child_nf's LIVE parent, resolved from its back-pointer: the
- * anchor must describe where the node is NOW, which for a node about to be
- * MOVED is its old path, not the one it is being built into (§3).
- *
- * Exact for ONE hop and refused beyond it, which is the same bound
- * ft_descent_anchor_child carries and for the same reason: the cursor spans the
- * whole gap [d->depth, child_depth), so the child's own start is the only node
- * boundary inside it.  A member two hops down has a boundary between it and the
- * cursor that the table never saw.
- *
- * FALSE is a RE-PLAN, not an error -- the op has no depth for the node, and
- * anchoring it with another node's depth is the disagreement §1 forbids.
+ * ft_lock_ctx_depth_of for a member one hop BELOW the descent's cursor.
+ * Per-node locking needs no depth: always succeeds, with an unused depth.
  */
 static inline
 bool ft_lock_ctx_depth_of_cursor_child(const struct cds_ft *ft,
@@ -8255,111 +7573,28 @@ bool ft_lock_ctx_depth_of_cursor_child(const struct cds_ft *ft,
 		const struct cds_ft_inode_flag *child_parent,
 		unsigned int *depth)
 {
-	const struct ft_descent *d = ft_lock_ctx_descent(ctx);
-
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
-		*depth = 0;
-		return true;
-	}
-	/*
-	 * NO parent at all: the node is not reachable from the trie, either
-	 * because it sits at a ROOT position -- depth 0 by definition -- or
-	 * because this op BUILT it and has not published it yet.  The second is
-	 * the fold's COW copy: ft_rekey_cow_stop's @stop_prime is not in the
-	 * glue's @built array, because a DIFFERENT step of the op built it, so
-	 * the glue's own fresh test cannot see it and it arrives here looking
-	 * live.
-	 *
-	 * Depth 0 is right for both.  The root IS its own anchor under every
-	 * spacing (§2), and an unpublished node has no peer to agree WITH --
-	 * §1's agreement binds only nodes two ops can both reach.
-	 */
-	if (!child_parent) {
-		*depth = 0;
-		return true;
-	}
-	if (!d || !d->nf || child_parent != d->nf)
-		return false;
-	*depth = d->depth + ft_node_span(ft, d->nf);
+	(void) ft;
+	(void) ctx;
+	(void) child_parent;
+	*depth = 0;
 	return true;
 }
 
 /*
- * Date @nf -- an INTERNAL or COMPRESSED node the op reached below the descent's
- * cursor and more than one hop down -- by climbing its LIVE parent chain to the
- * first ancestor the descent DOES date, summing the node-local spans on the way
- * back down.  FALSE means no dated ancestor was found within the trie's depth
- * bound, and the caller must re-plan.
- *
- * WHY THIS EXISTS.  ft_lock_ctx_depth_of_cursor_child is exact for ONE hop and
- * refuses beyond it, on the argument that the cursor spans the whole gap so the
- * child's own start is the only boundary inside it.  That argument describes the
- * one-hop case; it is not a reason the two-hop case is underivable.  An occupied
- * -destination rekey_merge re-parents children of the MERGE POINT, which sits
- * inside the destination subtree -- below where a descent to the destination KEY
- * stops.  Measured: `insert "bbaca","abba"; rekey_merge(dst "b", src "a")` under
- * exponential spacing re-parents a child exactly two hops under the dst cursor,
- * the one-hop rule refuses it, and the refusal is reported as -EAGAIN -- so the
- * op re-descends, builds the identical plan, and refuses again, FOREVER.  It is
- * a self-refusal: single-threaded, with no peer that a retry could outlast.
- *
- * WHY IT IS NOT THE UP-WALK §5.3 FORBIDS.  That one walks up to FIND the anchor,
- * making the anchor a RELATIVE offset (C's H-th ancestor and P's H-th ancestor
- * are different nodes, so the collapse breaks).  This walk finds an absolute
- * BYTE DEPTH and then anchors from the schedule exactly as every other member
- * does, so two ops that reach @nf still agree (§1).  It is the same licence
- * ft_lock_ctx_depth_of_parent already carries -- "a node's span is a property of
- * the node itself" -- applied transitively instead of for a single hop, and it
- * terminates at a node the descent DATED rather than starting undated.
+ * ft_lock_ctx_depth_of for a member reached by CLIMBING back-pointers from a
+ * node off the descent.  Per-node locking needs no depth: always succeeds,
+ * with an unused depth.
  */
 static inline
 bool ft_lock_ctx_depth_of_climb(const struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag *nf, unsigned int *depth)
 {
-	const struct ft_descent *d = ft_lock_ctx_descent(ctx);
-	unsigned int acc = 0, hops;
-
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
-		*depth = 0;
-		return true;
-	}
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
-		*depth = 1;		/* as ft_lock_ctx_depth_of_at: never read */
-		return true;
-	}
-	for (hops = 0; hops <= FT_MAX_DEPTH; hops++) {
-		struct cds_ft_inode_flag *parent = NULL;
-		struct cds_ft_metadata *meta;
-		unsigned int dd;
-
-		if (!nf || ft_node_flip_proxy(nf) || ft_node_external(nf))
-			return false;
-		if (ft_descent_depth_of(d, nf, &dd)) {
-			*depth = dd + acc;
-			return true;
-		}
-		meta = ft_node_compressed(nf) ?
-			cds_ft_item_to_metadata((struct cds_ft_inode *)
-				ft_compressed_node_ptr(nf)) :
-			cds_ft_item_to_metadata(ft_node_ptr(
-				ft_resolve_skip_compressed(ft, nf)));
-		if (!meta)
-			return false;
-		(void) ft_resolve_parent_slot(meta, ft, &parent);
-		/*
-		 * No parent: @nf is the ROOT, which sits at depth 0 under every
-		 * spacing (§2) -- the same answer ft_lock_ctx_depth_of_cursor_child
-		 * gives a parentless member.
-		 */
-		if (!parent) {
-			*depth = acc;
-			return true;
-		}
-		acc += ft_node_span(ft, parent);
-		nf = parent;
-	}
-	return false;
+	(void) ft;
+	(void) ctx;
+	(void) nf;
+	*depth = 0;
+	return true;
 }
 
 /*
@@ -8426,7 +7661,8 @@ void ft_anchor_descend(struct cds_ft *ft, struct ft_descent *d,
 static inline
 unsigned int ft_freeze_reserve(const struct cds_ft *ft, unsigned int n)
 {
-	return ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE ? n : 2 * n;
+	(void) ft;
+	return n;
 }
 
 /*
@@ -8440,7 +7676,8 @@ unsigned int ft_freeze_reserve(const struct cds_ft *ft, unsigned int n)
 static inline
 unsigned int ft_glue_split_cn_reserve(const struct cds_ft *ft)
 {
-	return ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE ? 0 : 1;
+	(void) ft;
+	return 0;
 }
 
 /*
@@ -8739,13 +7976,9 @@ static unsigned int ft_sa_climb(const struct cds_ft *ft,
 }
 
 /*
- * The anchor §2 assigns @node on the trie AS IT STANDS: the node with the
- * smallest start at or after L(depth(@node)) on @node's root path.  FALSE when
- * the climb cannot date it (see ft_sa_climb).
- */
-/*
- * RED CONTROL (env FT_SA_RED=root): answer the ROOT for every owner, whatever
- * the spacing.  The ops are untouched -- only the question changes -- so an op
+ * The structural anchor of @node: @node itself under per-node locking.
+ *
+ * RED CONTROL (env FT_SA_RED=root): answer the ROOT for every owner.  The ops are untouched -- only the question changes -- so an op
  * that holds its real anchor and not the root must read UNHELD / SELF_ONLY.
  * A run whose UNHELD stays zero under this knob has a witness that cannot say
  * no, and its green is worth nothing.
@@ -8758,33 +7991,22 @@ static bool ft_sa_struct_anchor(const struct cds_ft *ft,
 	struct cds_ft_metadata *path[FT_SA_PATH_MAX];
 	struct cds_ft_inode_flag *pflag[FT_SA_PATH_MAX];
 	unsigned int start[FT_SA_PATH_MAX];
-	unsigned int n, k, lvl;
+	unsigned int n;
 
 	if (caa_unlikely(ft_sa_red < 0)) {
 		const char *e = getenv("FT_SA_RED");
 
 		ft_sa_red = e && !strcmp(e, "root");
 	}
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE && !ft_sa_red) {
+	if (!ft_sa_red) {
 		*anchor = node;
 		return true;
 	}
 	n = ft_sa_climb(ft, node, path, pflag, start);
 	if (!n)
 		return false;
-	if (ft_sa_red ||
-			ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
-		*anchor = path[n - 1];
-		return true;
-	}
-	lvl = ft_lock_level(start[0]);
-	for (k = n; k-- > 0;) {
-		if (start[k] >= lvl) {
-			*anchor = path[k];
-			return true;
-		}
-	}
-	return false;
+	*anchor = path[n - 1];
+	return true;
 }
 
 /*
@@ -9023,12 +8245,6 @@ static void ft_sa_hoist_exit_count(int hoist, int ex)
 		uatomic_inc(&ft_sa_hoist_exits[hoist][ex]);
 }
 
-/*
- * The post-acquire COVERER check (ft_dlm_acquire_set_at): members whose anchor
- * depended on a coverer / refused on a retired coverer / refused on a
- * skip-encoded coverer the check cannot resolve exactly.
- */
-static unsigned long ft_sa_cover_exits[3];
 /* DEAD-OWNER WRITE samples printed; owner words asked at a landed commit. */
 static unsigned long ft_sa_tdead_reports, ft_sa_tdead_asked;
 /*
@@ -9042,10 +8258,6 @@ void ft_sa_hoist_report(void)
 {
 	int h;
 
-	if (ft_sa_cover_exits[0])
-		fprintf(stderr, "FT_SA_COVER checked=%lu retired=%lu skip=%lu\n",
-			ft_sa_cover_exits[0], ft_sa_cover_exits[1],
-			ft_sa_cover_exits[2]);
 	fprintf(stderr, "FT_SA_MEMBER_DEAD taken=%lu shared=%lu "
 		"shared_coarsened=%lu coarsened_taken=%lu | owner words asked "
 		"at a landed commit=%lu%s\n",
@@ -9307,10 +8519,10 @@ static void ft_sa_anchor_props(const struct ft_flip_txn *t,
 		ft_sa_off(pc0, o0, sizeof(o0));
 		ft_sa_off(pc1, o1, sizeof(o1));
 		fprintf(stderr, "FT SA ANCHOR-PROPS %s%s%s pc0=%s pc1=%s node %p "
-			"start %u L %u | trie anchor %p | op lock %p | parent "
+			"start %u | trie anchor %p | op lock %p | parent "
 			"anchor %p | state %#lx\n", held ? "" : "NOT_HELD ",
 			self ? "SELF_ANCHORED " : "", pdiff ? "PARENT_DIFFERS" : "",
-			o0, o1, (void *) node, start[0], ft_lock_level(start[0]),
+			o0, o1, (void *) node, start[0],
 			(void *) a, (void *) lock, (void *) pa,
 			(unsigned long) st);
 	}
@@ -11600,11 +10812,8 @@ void ft_flip_txn_arm_per_op_at(const struct cds_ft *ft, struct ft_flip_txn *t,
  * branch missed the arm entirely.  See ft_reparent_record_meta's @child_marked.
  *
  * So: take the sanctioned per-op arm when it will have it, and otherwise say SW
- * explicitly.  ☠ THE SECOND LINE IS PHASE E's DEBT -- the per-op helper refuses
- * any spacing but per-node, and those spacings are dev-only
- * (cds_ft_group_attr_set_lock_spacing refuses them without
- * FEATURE_FT_ANCHOR_VALIDATE) -- but it is a POLICY branch behind ONE entry
- * point, not a second door.
+ * explicitly.  It is a POLICY branch behind ONE entry point, not a second
+ * door.
  *
  * ☞ CALL IT AT TXN CREATION.  There @nr_locks is 0, so the per-op arm always
  * declines and the fallback carries correctness -- which is the point: creation
@@ -12509,7 +11718,7 @@ struct ft_wo_site {
 	int line;
 	unsigned long live, txn_top, txn_chain, txn_none;
 	unsigned long led_ok, led_bad;
-	unsigned long fine, spacing;	/* the trie this site was seen on */
+	unsigned long fine;	/* the trie this site was seen on */
 };
 extern struct ft_wo_site ft_wo_site_tbl[FT_WO_SITES];
 extern unsigned long ft_wo_site_overflow;
@@ -12722,7 +11931,6 @@ void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
 		uatomic_inc(&site->live);
 		uatomic_inc(led_ok ? &site->led_ok : &site->led_bad);
 		uatomic_store(&site->fine, ft->lock_fine, CMM_RELAXED);
-		uatomic_store(&site->spacing, ft->lock_spacing, CMM_RELAXED);
 	}
 	if (ctx && ctx->held.txn) {
 		uatomic_inc(&ft_wo_txn_top);
@@ -12740,205 +11948,6 @@ void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
 }
 #endif /* FT_DEBUG_WIDEN_OWNER */
 
-#ifdef FT_DEBUG_STRUCT_ANCHOR
-/*
- * -DFT_DEBUG_STRUCT_ANCHOR: DOES THE ACQUIRE'S ANCHOR AGREE WITH THE TRIE?
- *
- * §1's agreement is a property of a FUNCTION -- every op that reaches node X
- * must lock the same word -- and every acquire site computes that function from
- * its OWN descent table.  So the only independent answer is the one the table is
- * supposed to encode: climb X's parent words to the root, sum the spans to get
- * X's byte-depth, and take §2's rule (the node starting at the first boundary at
- * or after L(depth)) over that path.  A disagreement between the two is either a
- * derivation defect (the table answers for the wrong node) or a structure that
- * changed under the op (a peer's restructure between its descent and the take).
- * Single-threaded, only the first is possible, so an ft_unit mismatch is a
- * defect by construction.
- *
- * ☠ The climb is §5.3's rejected up-walk -- here as an ORACLE, never a
- * navigation aid, and debug-only.  It reads live parent words unlocked: a
- * parked proxy, a NULL (transient re-home) or an external bails as UNDATED
- * rather than guessing.
- */
-struct ft_sa_site {
-	const char *fn;
-	int line;
-	unsigned long total, match, mismatch, undated, depth_diff;
-	/* where the op's anchor sits relative to the structural one */
-	unsigned long mis_above, mis_below, mis_offpath;
-	unsigned long mis_cursor_is_parent;	/* d->nf is X's parent, not X */
-	unsigned long mis_anchor_dead;	/* op anchor or member TOMBSTONED now */
-	unsigned long reports[3];	/* sample budget per class: above/below/offpath */
-};
-
-#define FT_SA_MAX_SITES	128
-static struct ft_sa_site ft_sa_sites[FT_SA_MAX_SITES];
-static int ft_sa_nr_sites;
-static pthread_mutex_t ft_sa_lock = PTHREAD_MUTEX_INITIALIZER;
-static unsigned long ft_sa_reports;
-
-static struct ft_sa_site *ft_sa_site_of(const char *fn, int line)
-{
-	struct ft_sa_site *s = NULL;
-	int i;
-
-	for (i = 0; i < uatomic_load(&ft_sa_nr_sites, CMM_RELAXED); i++)
-		if (ft_sa_sites[i].fn == fn && ft_sa_sites[i].line == line)
-			return &ft_sa_sites[i];
-	pthread_mutex_lock(&ft_sa_lock);
-	for (i = 0; i < ft_sa_nr_sites; i++)
-		if (ft_sa_sites[i].fn == fn && ft_sa_sites[i].line == line) {
-			s = &ft_sa_sites[i];
-			goto out;
-		}
-	if (ft_sa_nr_sites < FT_SA_MAX_SITES) {
-		s = &ft_sa_sites[ft_sa_nr_sites];
-		s->fn = fn;
-		s->line = line;
-		uatomic_store(&ft_sa_nr_sites, ft_sa_nr_sites + 1, CMM_RELAXED);
-	}
-out:
-	pthread_mutex_unlock(&ft_sa_lock);
-	return s;
-}
-
-static __attribute__((destructor))
-void ft_sa_report(void)
-{
-	int i;
-
-	if (!ft_sa_nr_sites)
-		return;
-	fprintf(stderr, "\n=== FT_STRUCT_ANCHOR: acquire anchor vs the trie's own "
-		"anchor (up-walk), per acquire SITE ===\n"
-		"%-44s %9s %9s %9s %8s %8s %8s %8s %8s %9s %8s\n",
-		"site", "total", "match", "MISMATCH", "undated", "depthΔ",
-		"above", "below", "offpath", "cur=par", "dead");
-	for (i = 0; i < ft_sa_nr_sites; i++) {
-		struct ft_sa_site *s = &ft_sa_sites[i];
-		char where[64];
-
-		snprintf(where, sizeof(where), "%s:%d", s->fn, s->line);
-		fprintf(stderr, "%-44s %9lu %9lu %9lu %8lu %8lu %8lu %8lu %8lu %9lu %8lu\n",
-			where, s->total, s->match, s->mismatch, s->undated,
-			s->depth_diff, s->mis_above, s->mis_below,
-			s->mis_offpath, s->mis_cursor_is_parent,
-			s->mis_anchor_dead);
-	}
-	fprintf(stderr, "    total == match + MISMATCH + undated.  above/below: "
-		"the op's anchor is a strict ancestor / descendant of the "
-		"structural one.\n");
-}
-
-static inline
-void ft_sa_check(const char *fn, int line, const struct cds_ft *ft,
-		const struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *nf,
-		struct cds_ft_metadata *node, unsigned int op_depth,
-		struct cds_ft_metadata *op_anchor)
-{
-	struct cds_ft_metadata *path[FT_SA_PATH_MAX];
-	struct cds_ft_inode_flag *pflag[FT_SA_PATH_MAX];
-	unsigned int start[FT_SA_PATH_MAX];
-	struct ft_sa_site *s;
-	struct cds_ft_metadata *sa = NULL;
-	unsigned int n, k, depth, lvl, sa_k = 0, op_k = 0;
-	bool op_on_path = false;
-	const struct ft_descent *d;
-
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE || !ft->lock_fine)
-		return;
-	s = ft_sa_site_of(fn, line);
-	if (!s)
-		return;
-	uatomic_inc(&s->total);
-	n = ft_sa_climb(ft, node, path, pflag, start);
-	if (!n) {
-		uatomic_inc(&s->undated);
-		return;
-	}
-	depth = start[0];
-	if (depth != op_depth)
-		uatomic_inc(&s->depth_diff);
-	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
-		sa = path[n - 1];
-		sa_k = n - 1;
-	} else {
-		lvl = ft_lock_level(depth);
-		/* the node with the SMALLEST start >= lvl: walk from the root */
-		for (k = n; k-- > 0;) {
-			if (start[k] >= lvl) {
-				sa = path[k];
-				sa_k = k;
-				break;
-			}
-		}
-	}
-	if (sa == op_anchor) {
-		uatomic_inc(&s->match);
-		return;
-	}
-	uatomic_inc(&s->mismatch);
-	for (k = 0; k < n; k++)
-		if (path[k] == op_anchor) {
-			op_on_path = true;
-			op_k = k;
-			break;
-		}
-	if (!op_on_path)
-		uatomic_inc(&s->mis_offpath);
-	else if (op_k > sa_k)
-		uatomic_inc(&s->mis_above);
-	else
-		uatomic_inc(&s->mis_below);
-	d = ft_lock_ctx_descent(ctx);
-	if (d && n > 1 && d->nf == pflag[1])
-		uatomic_inc(&s->mis_cursor_is_parent);
-	if ((CMM_LOAD_SHARED(op_anchor->state) & FT_STATE_TOMBSTONE) ||
-			(CMM_LOAD_SHARED(node->state) & FT_STATE_TOMBSTONE))
-		uatomic_inc(&s->mis_anchor_dead);
-	(void) ft_sa_reports;
-	if (uatomic_add_return(&s->reports[!op_on_path ? 2 :
-			(op_k > sa_k ? 0 : 1)], 1) <= 4)
-	{
-		unsigned int li = ft_lock_level_index(ft_lock_level(op_depth));
-		const struct ft_lock_anchor *la = (d && li < FT_LOCK_LEVEL_MAX) ?
-			&d->anchor[li] : NULL;
-		bool crossed = d && (d->anchor_crossed & (1U << li));
-		/* Raw, and resolved: a SUCCEEDED proxy's raw word has no TOMBSTONE. */
-		unsigned long cover_raw = crossed && la->cover &&
-			!ft_node_external(la->cover) ?
-			(unsigned long) CMM_LOAD_SHARED(
-				ft_flag_to_metadata(ft, la->cover)->state) : 0UL;
-		unsigned long cover_state = (unsigned long) urcu_txn_resolve(
-			(void *) cover_raw, FT_STATE_PROXY);
-
-		fprintf(stderr, "FT STRUCT-ANCHOR MISMATCH at %s:%d: node %p "
-			"nf %p depth(op)=%u depth(trie)=%u L=%u path_len=%u | op "
-			"anchor %p (%s k=%u start=%u) trie anchor %p (k=%u "
-			"start=%u)%s | cursor nf %p depth %u %s | tbl[L] "
-			"crossed=%d pending=%d cover=%p bound=%p bound_start=%u | "
-			"trie path flags k1=%p k2=%p | cover state %#lx%s\n",
-			fn, line, (void *) node, (void *) nf, op_depth, depth,
-			ft_lock_level(depth), n, (void *) op_anchor,
-			op_on_path ? "on path" : "OFF PATH", op_k,
-			op_on_path ? start[op_k] : 0, (void *) sa, sa_k,
-			start[sa_k], sa == node ? "=SELF" : "",
-			d ? (void *) d->nf : NULL, d ? d->depth : 0,
-			d && d->nf == nf ? "(cursor IS the member)" :
-			(d && n > 1 && d->nf == pflag[1] ?
-				"(cursor is the member's PARENT)" : ""),
-			(int) crossed,
-			d ? !!(d->anchor_pending & (1U << li)) : -1,
-			crossed ? (void *) la->cover : NULL,
-			crossed ? (void *) la->bound : NULL,
-			crossed ? la->bound_start : 0,
-			n > 1 ? (void *) pflag[1] : NULL,
-			n > 2 ? (void *) pflag[2] : NULL,
-			cover_raw, (cover_state & FT_STATE_TOMBSTONE) ?
-				" = TOMBSTONED" : "");
-	}
-}
-#endif /* FT_DEBUG_STRUCT_ANCHOR */
 
 #ifdef FT_DEBUG_BULK_ACQ
 /*
@@ -13289,10 +12298,6 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		 * so needs no total order) resolves here.
 		 */
 		lock = lock_anchor[i];
-#ifdef FT_DEBUG_STRUCT_ANCHOR
-		ft_sa_check(fn, line, ft, ctx, set[i].nf, node, set[i].depth,
-			lock);
-#endif
 		coarsened = lock != node;
 		/*
 		 * A coarsened member's OWN word is not the one being CAS'd, so
@@ -13579,69 +12584,11 @@ take:
 		return -EAGAIN;
 	}
 	/*
-	 * ☞ A LOCK ON A STALE ANCHOR IS NO LOCK (doc/design/ft-lockset-inventory.md
-	 * §5).  At exponential spacing a member's anchor was derived from a
-	 * COVERER the acquire does not lock (ft_anchor_coverer).  A split of the
-	 * coverer moves the member's anchor to a fresh boundary, and a plan made
-	 * before it still names the old one: that word is free, so the take
-	 * succeeds, and the member's post-split writers lock the NEW anchor.
-	 *
-	 * So validate that the coverer is not retired, now that the locks are
-	 * held.  The retire is the change: a coverer's span never changes in
-	 * place, and TOMBSTONE never clears, so a load after this commit answers
-	 * for the commit -- read LOGICALLY.  A split's commit settles its guard on
-	 * the old anchor BEFORE the tombstone on the coverer (a registered lock
-	 * word settles last), so between the two the anchor is takeable while the
-	 * coverer still carries the split's SUCCEEDED proxy, whose raw word has no
-	 * TOMBSTONE bit.  Resolve it: SUCCEEDED answers new, anything else old,
-	 * and an undecided restructure cannot succeed past the guard the lock
-	 * just taken fails.  Moving a boundary after it re-homes or retires the
-	 * old anchor -- the coverer's child -- and the re-home guards that
-	 * node's clean state word (ft_reparent_record_meta), which the lock just
-	 * taken fails.  So the answer holds for as long as the lock is held.
-	 */
-	for (i = 0; i < nr; i++) {
-		struct cds_ft_inode_flag *cover;
-		bool stale;
-
-		if (!set[i].nf)
-			continue;
-		cover = ft_anchor_coverer(ft, ft_lock_ctx_descent(ctx),
-			set[i].depth);
-		if (!cover || ft_node_external(cover))
-			continue;
-#ifdef FT_DEBUG_STRUCT_ANCHOR
-		uatomic_inc(&ft_sa_cover_exits[0]);
-#endif
-		/*
-		 * A skip word names its node only through the child's back
-		 * pointer, which the very split this guards against re-homes:
-		 * no exact answer, so re-plan.
-		 */
-		stale = ft_node_skip_compressed(cover) ||
-			((uintptr_t) urcu_txn_resolve((void *) CMM_LOAD_SHARED(
-				ft_flag_to_metadata(ft, cover)->state),
-				FT_STATE_PROXY) & FT_STATE_TOMBSTONE);
-		if (caa_likely(!stale))
-			continue;
-#ifdef FT_DEBUG_STRUCT_ANCHOR
-		uatomic_inc(&ft_sa_cover_exits[
-			ft_node_skip_compressed(cover) ? 2 : 1]);
-#endif
-		while (nr_taken)
-			ft_meta_lock_release(taken[--nr_taken]);
-		free(taken_heap);
-		if (ctx && ctx->op)
-			ft_acq_contended++;
-		return -EAGAIN;		/* released: nothing acquired */
-	}
-	/*
 	 * EVERY MEMBER IS NOW HELD.  Tell the commit's registry which nodes
 	 * this op took a lock FOR, including the ones whose word deduped onto
 	 * another member's and so file no entry of their own (@covered).  This
 	 * is the one place that knows both sides -- the member and the word
-	 * ft_anchor_meta resolved it to -- and it is what lets the record-time
-	 * ownership question be exact at a coarse spacing.
+	 * ft_anchor_meta resolved it to.
 	 */
 	if (ctx && ctx->held.txn)
 		for (i = 0; i < nr; i++)
@@ -16639,32 +15586,12 @@ struct ft_born_spine_node {
 };
 
 /*
- * The byte depth whose COVERING node holds the lock word of a node starting at
- * @depth (ft_anchor_meta): the node itself under per-node, the root under
- * root-only, the node covering its lock level under exponential.
- */
-static inline
-unsigned int ft_lock_word_level(const struct cds_ft *ft, unsigned int depth)
-{
-	switch (ft->lock_spacing) {
-	case CDS_FT_LOCK_SPACING_PER_NODE:
-		return depth;
-	case CDS_FT_LOCK_SPACING_ROOT_ONLY:
-		return 0;
-	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
-	default:
-		return ft_lock_level(depth);
-	}
-}
-
-/*
  * ft_flip_txn_lock_born for a FRESH SPINE: @sp[0 .. n) runs from the cluster top
  * down to the fresh parent @sp[n - 1] a live child is re-homed under, in one
  * commit (a split, an attach, a fuse).  Two live words that commit parks need
  * their lock held until it settles: the child's back edge, owned by the fresh
  * parent, and the child's own state word, which carries its slot offset.  Their
- * lock words are the nodes COVERING ft_lock_word_level() of the parent's and of
- * the child's start depth.  A fresh spine node covering either is published
+ * lock words are the nodes COVERING the parent's and the child's start depth.  A fresh spine node covering either is published
  * locked; a level above the spine belongs to an existing ancestor the re-homer
  * already holds (the cluster occupies the span of the node it replaces, or hangs
  * below the node it publishes into, so that level is the one those nodes' own
@@ -16681,8 +15608,9 @@ void ft_flip_txn_lock_born_spine(struct cds_ft *ft, struct ft_flip_txn *t,
 
 	if (!t || !n)
 		return;
-	lv[0] = ft_lock_word_level(ft, sp[n - 1].start);
-	lv[1] = ft_lock_word_level(ft, sp[n - 1].start + sp[n - 1].span);
+	(void) ft;
+	lv[0] = sp[n - 1].start;
+	lv[1] = sp[n - 1].start + sp[n - 1].span;
 	for (i = 0; i < n; i++) {
 		for (j = 0; j < 2; j++) {
 			if (sp[i].start <= lv[j] &&
@@ -16973,26 +15901,10 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	ft_sa_anchor_props(t, ctx, node, h->lock);
 #endif
-	/*
-	 * ☞ ...EXCEPT AT ROOT-ONLY, where there is no second path to date.
-	 * Every member anchors on the root's word, so no op locks @node's own
-	 * word at all and every writer of it holds the root: the MW snapshot
-	 * defended against a peer the lock already excludes, the MW-CAS era's
-	 * detect-and-abort with nothing left to detect.  Offered SW; the
-	 * per-record gate still grants it only when this txn holds the root's
-	 * word (ft_flip_txn_owns' root arm), and MEASURED 4.68M such retires
-	 * per ft_inv FT_INV_MW=1 run at root-only.
-	 */
-	int sw_ok = 0;
-
-#ifndef FT_DEBUG_ANCHORED_RETIRE_MW
-	sw_ok = t->ft &&
-		t->ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY;
-#endif
 	ft_flip_txn_record_state_kind_ctx(t, ctx, node,
 			(void *) h->node_snap,
 			(void *) (h->node_snap | FT_STATE_TOMBSTONE),
-			sw_ok);
+			/*sw_ok=*/ 0);
 }
 
 /*
@@ -18061,15 +16973,9 @@ void ft_flip_txn_hold_or_lock_parent_at(const char *fn, int line,
 		 * caller-construction property today (every setter assigns the
 		 * holder and the parent in the same breath); assert it so it stays
 		 * one.
-		 *
-		 * Coarsening makes the held word @parent_nf's ANCHOR rather than
-		 * its own metadata, so the identity is exact only at per-node
-		 * granularity.  Otherwise it is checked at the acquire site, which
-		 * is the only place holding both the member and its byte-depth.
 		 */
 		assert(parent_nf);
-		assert(ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE ||
-			held_holder == ft_flag_to_metadata(ft, parent_nf));
+		assert(held_holder == ft_flag_to_metadata(ft, parent_nf));
 		/*
 		 * ★ ONE WORD TAKES ONE TERMINAL, AND A RETIRE OUTRANKS A RELEASE
 		 * -- the rule ft_flip_txn_record_anchor_release states, and the

@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 356 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 355 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (407 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (406 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (356 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (355 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -3487,177 +3487,6 @@ static int test_lifecycle_group_create_flavor(void)
 		return -1;
 	}
 	return drain_and_destroy(ft, group);
-}
-
-/*
- * cds_ft_group_attr_set_lock_spacing: the granularity knob validates its
- * argument, and a trie built at every setting inserts, finds and removes the
- * same keys.  The deep/compressed keys matter: they are what drives lock levels
- * strictly INSIDE a compressed node's span, the shape the anchor rule rounds up
- * past (doc/design/ft-dlm-lock-coarseness.md §2.1).
- */
-static int test_lifecycle_lock_spacing(void)
-{
-	static const enum cds_ft_lock_spacing spacings[] = {
-		CDS_FT_LOCK_SPACING_PER_NODE,
-		/*
-		 * A coarser spacing is only CORRECT once every acquire site maps
-		 * through the anchor, so exercising one before then asserts a
-		 * property the tree does not yet have.  FEATURE_FT_ANCHOR_VALIDATE
-		 * still makes them SELECTABLE -- that is what keeps the anchor table
-		 * reachable during the conversion -- but only
-		 * FEATURE_FT_ANCHOR_COMPLETE claims they WORK.
-		 */
-#ifdef FEATURE_FT_ANCHOR_COMPLETE
-# ifdef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
-		CDS_FT_LOCK_SPACING_EXPONENTIAL,
-# endif
-# ifdef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
-		CDS_FT_LOCK_SPACING_ROOT_ONLY,
-# endif
-#endif
-	};
-	static const char *const keys[] = {
-		"a", "ab", "abc",
-		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX",	/* deep, compressed */
-		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaY",	/* diverges at 40 */
-		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-	};
-	unsigned int si, ki;
-
-	{
-		struct cds_ft_group_attr *attr;
-
-		if (cds_ft_group_attr_create(&attr) != CDS_FT_STATUS_OK)
-			return -1;
-		if (cds_ft_group_attr_set_lock_spacing(attr,
-				(enum cds_ft_lock_spacing) 0)
-					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR ||
-		    cds_ft_group_attr_set_lock_spacing(attr,
-				(enum cds_ft_lock_spacing) 99)
-					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
-			fprintf(stderr, "lock spacing accepted an invalid value\n");
-			cds_ft_group_attr_destroy(attr);
-			return -1;
-		}
-#ifndef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
-		/*
-		 * Root-only is a DEVELOPMENT AXIS, not public API: without its
-		 * build gate the enumerator does not exist, so the test that it
-		 * is refused has to name the reserved VALUE -- which is exactly
-		 * the "not public" property being asserted.
-		 */
-		if (cds_ft_group_attr_set_lock_spacing(attr,
-				(enum cds_ft_lock_spacing) 3)
-					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
-			fprintf(stderr, "root-only spacing was accepted by a build "
-				"without -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY\n");
-			cds_ft_group_attr_destroy(attr);
-			return -1;
-		}
-#endif
-#ifndef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
-		/*
-		 * Exponential is EXPERIMENTAL: without its build gate the
-		 * enumerator does not exist either, so this names the reserved
-		 * VALUE, as the root-only check above does.
-		 */
-		if (cds_ft_group_attr_set_lock_spacing(attr,
-				(enum cds_ft_lock_spacing) 2)
-					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
-			fprintf(stderr, "exponential spacing was accepted by a build "
-				"without -DFEATURE_FT_LOCK_SPACING_EXPONENTIAL\n");
-			cds_ft_group_attr_destroy(attr);
-			return -1;
-		}
-#endif
-		cds_ft_group_attr_destroy(attr);
-	}
-
-	for (si = 0; si < CAA_ARRAY_SIZE(spacings); si++) {
-		struct ft_test_node *nodes[CAA_ARRAY_SIZE(keys)] = { NULL };
-		struct cds_ft_group_attr *attr;
-		struct cds_ft_group *group;
-		struct cds_ft_iter *iter;
-		struct cds_ft *ft;
-		int ret = -1;
-
-		if (cds_ft_group_attr_create(&attr) != CDS_FT_STATUS_OK)
-			return -1;
-		if (cds_ft_group_attr_set_lock_spacing(attr, spacings[si])
-				!= CDS_FT_STATUS_OK) {
-			fprintf(stderr, "lock spacing %d rejected\n",
-				(int) spacings[si]);
-			cds_ft_group_attr_destroy(attr);
-			return -1;
-		}
-		if (cds_ft_group_create(attr, &group) != CDS_FT_STATUS_OK) {
-			cds_ft_group_attr_destroy(attr);
-			return -1;
-		}
-		cds_ft_group_attr_destroy(attr);
-		if (cds_ft_create(group, NULL, &ft) < 0) {
-			cds_ft_group_destroy(group);
-			return -1;
-		}
-		if (cds_ft_iter_create(ft, &iter) < 0) {
-			cds_ft_destroy(ft);
-			cds_ft_group_destroy(group);
-			return -1;
-		}
-		rcu_read_lock();
-		for (ki = 0; ki < CAA_ARRAY_SIZE(keys); ki++) {
-			enum cds_ft_status s;
-
-			nodes[ki] = node_alloc(ki);
-			s = cds_ft_insert(ft, (const uint8_t *) keys[ki],
-					strlen(keys[ki]), &nodes[ki]->node);
-			if (s != CDS_FT_STATUS_OK) {
-				fprintf(stderr, "spacing %d: insert %s: %s\n",
-					(int) spacings[si], keys[ki],
-					cds_ft_status_to_string(s));
-				goto unlock;
-			}
-		}
-		for (ki = 0; ki < CAA_ARRAY_SIZE(keys); ki++) {
-			enum cds_ft_status s;
-
-			cds_ft_iter_set_key(iter, (const uint8_t *) keys[ki],
-					strlen(keys[ki]));
-			s = cds_ft_lookup(ft, iter);
-			if (s != CDS_FT_STATUS_OK) {
-				fprintf(stderr, "spacing %d: lookup %s: %s\n",
-					(int) spacings[si], keys[ki],
-					cds_ft_status_to_string(s));
-				goto unlock;
-			}
-			s = cds_ft_remove(ft, iter, &nodes[ki]->node);
-			if (s != CDS_FT_STATUS_OK) {
-				fprintf(stderr, "spacing %d: remove %s: %s\n",
-					(int) spacings[si], keys[ki],
-					cds_ft_status_to_string(s));
-				goto unlock;
-			}
-		}
-		ret = 0;
-unlock:
-		rcu_read_unlock();
-		if (!ret && !cds_ft_empty(ft)) {
-			fprintf(stderr, "spacing %d: trie not empty after removes\n",
-				(int) spacings[si]);
-			ret = -1;
-		}
-		for (ki = 0; ki < CAA_ARRAY_SIZE(keys); ki++)
-			if (nodes[ki])
-				node_free_rcu(nodes[ki]);
-		cds_ft_iter_destroy(iter);
-		rcu_barrier();
-		cds_ft_destroy(ft);
-		cds_ft_group_destroy(group);
-		if (ret)
-			return -1;
-	}
-	return 0;
 }
 
 /*
@@ -16381,20 +16210,9 @@ static int test_rekey_promote_skipx_dual_coherent(void)
 }
 
 /*
- * ☠ PER-NODE SPACING, PINNED, and not because the shape needs a knob.
- *
- * The two pins below assert a property of the PER-NODE lock spacing, and both
- * their shapes LIVELOCK at a coarser one -- MEASURED, on the parent commit AND
- * on this one, identically: 192 of the 4328 enumerated shapes of this family
- * hang under CDS_FT_LOCK_SPACING=exponential, these among them, and the
- * per-shape diff between the two commits there is EMPTY.  That is a
- * pre-existing coarse-spacing defect this change does not touch.
- *
- * create_varlen_ft() would inherit the ENV knob (ft_lock_spacing_default), so a
- * gate leg that sets it would not fail these tests -- it would HANG THE SUITE
- * inside them, and a libtap plan absorbs a hang no better than a TODO does.
- * Pin the attribute instead of skipping, so the assertion still runs on every
- * configuration rather than silently evaporating on the one leg that sets it.
+ * A varlen trie on its own group with the rekey opt-in (the in-trie MOVE tests
+ * need it).  Named for the per-node lock spacing it used to pin; per-node is
+ * now the only spacing.
  */
 static struct cds_ft *create_varlen_pernode_ft(struct cds_ft_group **group_out)
 {
@@ -16403,9 +16221,6 @@ static struct cds_ft *create_varlen_pernode_ft(struct cds_ft_group **group_out)
 	struct cds_ft *ft;
 
 	if (cds_ft_group_attr_create(&attr) < 0)
-		abort();
-	if (cds_ft_group_attr_set_lock_spacing(attr,
-			CDS_FT_LOCK_SPACING_PER_NODE) != CDS_FT_STATUS_OK)
 		abort();
 	/*
 	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
@@ -40945,7 +40760,6 @@ int main(int argc, char **argv)
 	diag("Lifecycle & attribute tests");
 	RUN_TEST(test_lifecycle_defaults);
 	RUN_TEST(test_lifecycle_group_create_flavor);
-	RUN_TEST(test_lifecycle_lock_spacing);
 	RUN_TEST(test_lifecycle_fixed_key_lengths);
 	RUN_TEST(test_lifecycle_nil_only_trie);
 	RUN_TEST(test_lifecycle_max_key_len);

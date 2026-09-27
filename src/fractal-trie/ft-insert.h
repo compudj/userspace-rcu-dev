@@ -1074,24 +1074,6 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	/* PLAN (read-only, racy): resolve CN's parent P. */
 	(void) ft_resolve_parent_slot(cn_meta, ft, &pf_p);
 
-	/*
-	 * ANCHOR both members.  Under per-node granularity these are CN and P
-	 * themselves and nothing below changes; under a coarser one they are the
-	 * ancestors that carry their lock, and the two may COINCIDE -- CN and P
-	 * share an anchor whenever they fall in one lock band.  Dedupe then, or
-	 * the second ft_dlm_lock aborts -EAGAIN on the op's own hold (§7.3).
-	 *
-	 * P's depth comes from the DESCENT's window, not from @pf_p: the plan
-	 * resolves P through CN's back-pointer, which yields a node with no depth
-	 * at all.  Where the two disagree the descent is not describing this P,
-	 * so there is no depth to anchor it by -- re-plan rather than anchor it
-	 * with a depth that belongs to another node.
-	 */
-	if (pf_p && ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
-		if (!d || pf_p != d->pnf)
-			return -EAGAIN;
-		p_depth = d->pdepth;
-	}
 	set[0] = (struct ft_dlm_member){ .nf = cn_flag, .node = cn_meta,
 		.depth = cn_depth,
 		/*
@@ -1241,9 +1223,6 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * + 1 for the live re-parent's paired state edge (ft_reparent_record_meta
 	 * records parent AND slot-offset, two records, when the parked live child
 	 * bears metadata);
-	 * + 1 once coarsening splits the split-retire terminal in two, the retired
-	 * cn's tombstone no longer being the same word as the release of the lock
-	 * that protected it (ft_flip_txn_record_retire_anchored);
 	 * + 1 for the SKIP_X dual's GP release terminal (§9.3's GP member: a publish
 	 * under a COMPRESSED parent re-encodes a dual slot living in GP's body, so
 	 * the op acquires GP -- ft_insert_lock_skip_dual_gp -- and its release rides
@@ -1254,9 +1233,6 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * live re-home's new parent and of the child itself, at most two nodes
 	 * (ft_flip_txn_lock_born_spine).
 	 */
-	unsigned int anchored = ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE ?
-			0 : 1;
-
 	/*
 	 * The content txn is STANDALONE.  Binding it to the op handle
 	 * (ft_flip_txn_create_bounded_on) shares the op's descriptor and its
@@ -1265,7 +1241,7 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * still carries @ic->op for enrolment; what it must not do is commit
 	 * through it.
 	 */
-	ic->txn = ft_flip_txn_create_bounded(ft, 15 + anchored + count_edges
+	ic->txn = ft_flip_txn_create_bounded(ft, 15 + count_edges
 			+ FT_ROOT_LOCK_MAX_RECORDS + 2);
 	if (!ic->txn)
 		return -ENOMEM;
@@ -6405,46 +6381,16 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  * arbitration; under lock-before-write it is owed only where the op's lock
  * does NOT reach the word.
  *
- *  - the exact word (@hm IS @parent_nf's metadata): per-node, and any spacing
- *    whose anchor for @parent_nf is itself.  Planting the guard there would
- *    abort every commit (its clean-LIVE expectation masks the LOCK this op
- *    set) -- the measured livelock this predicate first existed to stop.
- *  - ROOT-ONLY, when {L} was taken FOR @parent_nf (@hh->member).  The
- *    coarsened acquire sampled the member's OWN state word, refused a
- *    TOMBSTONE / PROXY / LOCK there, and validated that sample inside the
- *    acquire's own commit (ft_held_anchor_guard_node): the validation AT THE
- *    LOCK INSTANT, so "already retired" cannot pass.  From that instant the
- *    root's lock -- every word in the trie anchors on it -- excludes every
- *    writer of @parent_nf's word, so "retired during the window" cannot
- *    either.  {L} outlives this txn's commit (ft_replace_exit releases it
- *    only after the flip returned).  A @parent_nf that is NOT the member was
- *    never asked about, so it keeps the guard.  MEASURED: 328k validates
- *    per ft_inv FT_INV_MW=1 run at root-only came from these two replace
- *    arms and nowhere else.
- *  - EXPONENTIAL keeps the guard.  There the anchor comes from the plan's
- *    DATING, and a plan dated before a move can lock the old path's
- *    ancestor while a peer locks the new one (the second-path note at
- *    ft_flip_txn_record_retire_anchored_arms); the clean-LIVE validate is
- *    that gap's only defence until a revalidation under the lock replaces it.
+ * With per-node locking {L} is the holder's own word, so it covers exactly the
+ * holder: planting the guard there would abort every commit (its clean-LIVE
+ * expectation masks the LOCK this op set) -- the measured livelock this
+ * predicate first existed to stop.
  */
 static inline
 bool ft_replace_hold_covers(struct cds_ft *ft, const struct cds_ft_metadata *hm,
-		const struct ft_held_anchor *hh,
 		struct cds_ft_inode_flag *parent_nf)
 {
-	struct cds_ft_metadata *pm;
-
-	if (!hm)
-		return false;
-	pm = ft_flag_to_metadata(ft, parent_nf);
-	if (pm == hm)
-		return true;
-#ifdef FT_DEBUG_REPLACE_GUARD_ROOT_ONLY
-	return false;
-#else
-	return ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY &&
-		pm == hh->member;
-#endif
+	return hm && ft_flag_to_metadata(ft, parent_nf) == hm;
 }
 
 /*
@@ -6557,7 +6503,6 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	 *    acquire below predicted: "should this path ever gain a registry ...
 	 *    @shared must then become the 'held, owing no release' arm".)
 	 */
-	struct ft_descent hd;
 	struct ft_lock_ctx hctx;
 	struct ft_held_anchor hh;
 	bool have_hctx = false;
@@ -6683,8 +6628,6 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	 * arbitrated (see the enum cds_ft_writer_strategy TODO).
 	 */
 	if (ft->lock_fine) {
-		unsigned int hdep = 0;
-		bool have_hd = false, descended = false;
 
 		/*
 		 * The PLAN's only job is to name a word to lock.  Walk prev to
@@ -6708,27 +6651,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
 			return ft_replace_exit(&hm, s);
 		}
-		/*
-		 * ANCHORED LOCK-SETS need a byte-depth, and this path derives its
-		 * holder from a back-pointer.  Descend for it under the same
-		 * opt-in the remove side takes (§5.3): per-node anchors the holder
-		 * on itself and keeps replace handle-derived.
-		 */
-		if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
-			const uint8_t *ik = iter_key;
-
-			ft_anchor_descend(ft, &hd, iter_key, key_len, &ik);
-			descended = true;
-			if (hd.nf == lock_nf) {
-				hdep = hd.depth;
-				have_hd = true;
-			} else if (hd.pnf == lock_nf) {
-				hdep = hd.pdepth;
-				have_hd = true;
-			}
-		} else
-			have_hd = true;
-		ft_lock_ctx_init(&hctx, descended ? &hd : NULL, NULL, op);
+		ft_lock_ctx_init(&hctx, NULL, NULL, op);
 		/*
 		 * @hh.shared is DEAD here, not defensive: this context is built
 		 * with a NULL txn and fills in no extra / glue / outer, so its
@@ -6738,10 +6661,9 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		 * is elsewhere in this file, and @shared must then become the
 		 * "held, owing no release" arm the two dup-chain acquires take.
 		 */
-		if (!have_hd ||
-				ft_acquire_member(ft, &hctx, lock_nf,
+		if (ft_acquire_member(ft, &hctx, lock_nf,
 					ft_flag_to_metadata(ft, lock_nf),
-					hdep, &hh) ||
+					0, &hh) ||
 				hh.shared) {
 			FT_DBG_RETRY_SITE();
 			*need_retry = true;
@@ -7119,7 +7041,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * so @hm names a different word -- and whether it still
 			 * covers this one is ft_replace_hold_covers' question.
 			 */
-			if (!ft_replace_hold_covers(ft, hm, &hh, parent_nf))
+			if (!ft_replace_hold_covers(ft, hm, parent_nf))
 				ft_flip_txn_guard_parent_ctx(ft, txn, parent_nf,
 					&hctx);
 			/*
@@ -7252,7 +7174,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * so @hm names a different word -- and whether it still
 			 * covers this one is ft_replace_hold_covers' question.
 			 */
-			if (!ft_replace_hold_covers(ft, hm, &hh, parent_nf))
+			if (!ft_replace_hold_covers(ft, hm, parent_nf))
 				ft_flip_txn_guard_parent_ctx(ft, txn, parent_nf,
 					&hctx);
 			/*

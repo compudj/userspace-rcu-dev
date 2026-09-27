@@ -465,9 +465,8 @@ static void ft_wo_dump(void)
 		if (!s->fn || !s->live)
 			continue;
 		fprintf(stderr, "  SITE %-34s:%-5d live=%-10lu led_ok=%-10lu "
-			"fine=%lu spacing=%lu\n",
-			s->fn, s->line, s->live, s->led_ok, s->fine,
-			s->spacing);
+			"fine=%lu\n",
+			s->fn, s->line, s->live, s->led_ok, s->fine);
 	}
 }
 #endif

@@ -132,21 +132,6 @@
 #include <urcu/uatomic.h>
 #include <urcu/fractal-trie.h>
 
-/*
- * The public header declares CDS_FT_LOCK_SPACING_ROOT_ONLY only in a build that
- * asks for the development axis (-DFEATURE_FT_LOCK_SPACING_ROOT_ONLY).  The
- * library's own spacing dispatch still has to NAME the reserved value -- a
- * dozen sites branch on it -- so give it an internal spelling here.  Without
- * the gate nothing can SET the spacing (the attr setter and the environment
- * knob both refuse it), so those branches are unreachable rather than wrong.
- */
-#ifndef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
-# define CDS_FT_LOCK_SPACING_ROOT_ONLY	((enum cds_ft_lock_spacing) 3)
-#endif
-/* ...and the same for the experimental exponential axis (the value 2). */
-#ifndef FEATURE_FT_LOCK_SPACING_EXPONENTIAL
-# define CDS_FT_LOCK_SPACING_EXPONENTIAL	((enum cds_ft_lock_spacing) 2)
-#endif	/* enum cds_ft_numa_policy, cds_ft_optimize */
 #include <assert.h>
 
 /*
@@ -339,45 +324,6 @@
 #define FT_ENTRY_PER_NODE	256
 #define FT_MAX_KEY_LEN	256			/* Maximum key length supported. */
 #define FT_MAX_DEPTH	(FT_MAX_KEY_LEN + 1)	/* Maximum depth, including root. */
-
-/*
- * DLM lock coarseness (doc/design/ft-dlm-lock-coarseness.md).  Lock levels sit
- * at key-byte depths 0, 1, 2, 4, 8, ... -- dense near the root, sparse deeper.
- * A structural writer anchors its lock-set on an ancestor at one of these
- * levels instead of on every node it mutates, so members sharing a level
- * collapse onto ONE lock word.  Key BYTES, not node hops: a lock's reach is
- * bounded by the key space below it, and a compressed node advances several
- * byte levels at the cost of one lock.
- *
- * Levels 0,1,2,4,...,256 for FT_MAX_KEY_LEN 256, so a per-descent table indexed
- * by ft_lock_level_index() needs FT_LOCK_LEVEL_MAX slots.
- */
-#define FT_LOCK_LEVEL_MAX	10
-
-/*
- * The deepest lock level at or above @depth: all but the top set bit cleared.
- */
-static inline
-unsigned int ft_lock_level(unsigned int depth)
-{
-	if (!depth)
-		return 0;
-	return 1U << ((sizeof(unsigned int) * CHAR_BIT - 1) -
-			(unsigned int) __builtin_clz(depth));
-}
-
-/*
- * @depth's slot in a lock-level table: level 0 at index 0, level (1 << (i - 1))
- * at index i.  Every depth sharing a level shares a slot.
- */
-static inline
-unsigned int ft_lock_level_index(unsigned int depth)
-{
-	if (!depth)
-		return 0;
-	return (sizeof(unsigned int) * CHAR_BIT) -
-		(unsigned int) __builtin_clz(depth);
-}
 
 /*
  * Number of bytes of safe over-read past a caller's key_len that the
@@ -2184,15 +2130,6 @@ struct cds_ft_group {
 	 * group create from @writer_strategy_set.
 	 */
 	enum cds_ft_writer_strategy writer_strategy;
-	/*
-	 * Granularity of the per-node lock-sets a FINE trie takes: how far up
-	 * the descent a writer anchors each lock-set member
-	 * (doc/design/ft-dlm-lock-coarseness.md).  Copied to each trie at
-	 * create; resolved at group create from @lock_spacing_set, default
-	 * CDS_FT_LOCK_SPACING_PER_NODE.  Inert under COARSE, which derives no
-	 * lock-set.
-	 */
-	enum cds_ft_lock_spacing lock_spacing;
 	/* Allocation arenas. */
 	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1];
 	/*
@@ -2740,13 +2677,6 @@ struct cds_ft {
 	 * there is no fine locking in this mode (nor in COARSE) to promote.
 	 */
 	bool external_sync;
-
-	/*
-	 * Hot-path copy of the group's lock-set granularity, read by the
-	 * mutation descent (ft_descent_init) to decide how far up it anchors
-	 * each lock-set member.  Inert unless @lock_fine.
-	 */
-	enum cds_ft_lock_spacing lock_spacing;
 
 
 	/*
@@ -6071,14 +6001,6 @@ struct cds_ft_group_attr {
 	 * cds_ft_group_attr_set_writer_strategy.
 	 */
 	enum cds_ft_writer_strategy writer_strategy;
-	/*
-	 * Granularity of the per-node lock-sets under CDS_FT_WRITER_LOCK_FINE.
-	 * Meaningful only when @lock_spacing_set; otherwise the group takes the
-	 * CDS_FT_LOCK_SPACING_PER_NODE default.  See
-	 * cds_ft_group_attr_set_lock_spacing.
-	 */
-	enum cds_ft_lock_spacing lock_spacing;
-	bool lock_spacing_set;
 };
 
 struct cds_ft_attr {

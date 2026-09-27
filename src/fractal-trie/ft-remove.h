@@ -5803,38 +5803,6 @@ int ft_detach_node(struct cds_ft *ft,
 			if (!boundary_fused && freeze_leaf && pub && commit_txn) {
 #ifdef FT_DEBUG_CHAIN_HOLD
 				/*
-				 * ☞ IS THE CHAIN'S HOLDER ALREADY NAMED BY THIS
-				 * OP'S OWN DESCENT?  One descent from root names
-				 * every ancestor the op needs, so if the holder
-				 * is on it the anchor is soundly resolvable here
-				 * and nothing has to re-descend -- the acquire
-				 * was simply never asked for.  If it is NOT, this
-				 * member was reached by a back-pointer walk and
-				 * ft_descent_anchor_of would answer from the
-				 * WRONG path (the cursor's node, or NULL), which
-				 * is the silent anchor disagreement.
-				 *
-				 * ☠ Only EXPONENTIAL exercises this: per-node
-				 * short-circuits the date to 0 and root-only to
-				 * 1, so a green reading at those spacings proves
-				 * nothing about the window.
-				 */
-				{
-					struct cds_ft_inode_flag *hnf =
-						ft_chain_head_holder(ft, freeze_leaf);
-					unsigned int hd;
-
-					if (!hnf)
-						uatomic_inc(&ft_chdate_noholder);
-					else if (ft_lock_ctx_depth_of(ft, &lctx,
-							hnf, &hd))
-						uatomic_inc(&ft_chdate_ondescent);
-					else
-						uatomic_inc(&ft_chdate_derived);
-				}
-#endif
-#ifdef FT_DEBUG_CHAIN_HOLD
-				/*
 				 * THE HEAD-WORD CONTROL: the removed leaf is a LIVE
 				 * head until this commit, so ft_ch_head_reachable must
 				 * read it reachable -- else its HIDDEN zeros are blind.
@@ -8638,82 +8606,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		holder_flag = fwd;
 		holder_depth = fwd_depth;
 		have_descent = true;
-	} else if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
-		/*
-		 * ANCHORED LOCK-SETS need a byte-depth per member, and this path has
-		 * none: it derives the holder from @node's back-pointer and never
-		 * walks.  Only the leaf's depth is free (== @key_len, what
-		 * ft_detach_node already takes as its detach_depth); the holder and
-		 * everything above it have none, and a climb cannot recover them --
-		 * absolute depth is unknown to it until the root, so it can neither
-		 * stop early nor hand back the node it walked past
-		 * (doc/design/ft-dlm-lock-coarseness.md §5.3).
-		 *
-		 * Descend for them.  The walk is the recovery arm's, and the cost is
-		 * OPT-IN WITH THE COARSENESS: per-node granularity anchors every member
-		 * on itself, needs no depth, and keeps this path handle-derived.
-		 */
-		const uint8_t *ik = iter_key;
-
-		ft_anchor_descend(ft, &d, iter_key, key_len, &ik);
-		/*
-		 * Locate the holder ON the descent and take ITS byte-depth -- that
-		 * depth, not the leaf's, is what selects the holder's anchor.  The
-		 * descent stops in one of two places:
-		 *
-		 *  - UNDER the leaf: it broke on an external @d.nf, so the holder is
-		 *    @d.pnf at @d.pdepth.
-		 *  - ON the holder: the key ended at an internal node and the leaf
-		 *    hangs off its external_nodes (a prefix key), so the holder is
-		 *    @d.nf at @d.depth.
-		 *
-		 * Neither matches for an EXTERNAL holder: ft_node_holder resolves a
-		 * non-head duplicate's prev to its PREDECESSOR rather than to the trie
-		 * parent (the distinction the ft_node_external(holder_flag) arm below
-		 * turns on), so that chain's trie holder comes from
-		 * ft_chain_head_holder and is anchored with it, not from here.
-		 */
-		have_descent = true;
-		/*
-		 * A holder the descent does NOT pass is one @node->prev names
-		 * STALELY: a peer republished the holder and the back-edge still
-		 * carries the old copy, which the tombstone test above misses
-		 * whenever the peer's retire has not landed yet.  Take the
-		 * FORWARD path's holder, the same authority the arm above
-		 * applies -- the two positions are the two bullets listed there.
-		 *
-		 * Keeping the back-pointer's node instead leaves it UNDATED, and
-		 * a byte-depth of 0 does not READ as undated: it is THE ROOT, so
-		 * ft_anchor_meta anchors that holder on ITSELF while every op
-		 * that dates it anchors on an ancestor.  The two then exclude
-		 * nothing, which is the §1 disagreement -- measured as a LOST
-		 * UPDATE, a chain-head promote publishing in place into a holder
-		 * a peer was COW-recompacting (inv_writer_progress_chainmerge).
-		 */
-		if (d.nf == holder_flag) {
-			holder_depth = d.depth;
-		} else if (d.pnf == holder_flag) {
-			holder_depth = d.pdepth;
-		} else if (!ft_node_external(holder_flag)) {
-			bool prefix = d.nf && !ft_node_external(d.nf) &&
-				d.depth == key_len;
-			struct cds_ft_inode_flag *fwd = prefix ? d.nf : d.pnf;
-
-			if (!fwd || ft_flag_tombstoned(ft, fwd)) {
-				/*
-				 * The forward holder is dead too: nothing is
-				 * reserved or published yet, so re-derive the
-				 * whole position against the settled tree --
-				 * the retry the tail takes for a peer-won
-				 * commit, reached before any of the work.
-				 */
-				FT_DBG_RETRY_SITE();
-				*need_retry = true;
-				return CDS_FT_STATUS_OK;
-			}
-			holder_flag = fwd;
-			holder_depth = prefix ? d.depth : d.pdepth;
-		}
 	}
 
 	/*
@@ -8795,7 +8687,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	bool rm_hold = false;
 
 	if (ft->lock_fine &&
-	    ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE &&
 	    holder_flag && !ft_node_external(holder_flag)) {
 		for (;;) {
 			struct cds_ft_inode_flag *fresh;
@@ -8959,7 +8850,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	bool rm_hold = false;
 
 	if (ft->lock_fine &&
-	    ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE &&
 	    holder_flag && !ft_node_external(holder_flag)) {
 		if (ft_acquire_member(ft, &lctx, holder_flag,
 				ft_flag_to_metadata(ft, holder_flag),
@@ -10291,92 +10181,13 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	*result_node = chain_head;
 
 	/*
-	 * ANCHORED LOCK-SETS need a byte-depth per member, and locating the chain
-	 * head gives none: the holder comes from the cached node's back-pointer.
-	 * Descend for the depths, exactly as _cds_ft_remove_locked does and under
-	 * the same opt-in -- per-node granularity anchors every member on itself,
-	 * needs no depth, and leaves this path handle-derived
-	 * (doc/design/ft-dlm-lock-coarseness.md §5.3).
+	 * The holder comes from the cached node's back-pointer; per-node locking
+	 * anchors every member on itself, so no descent (and no depth) is needed.
 	 */
-	struct ft_descent d;
 	struct ft_lock_ctx lctx;
 	unsigned int holder_depth = 0;
-	bool have_descent = false;
 
-	if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
-		const uint8_t *ik = iter_key;
-
-		ft_anchor_descend(ft, &d, iter_key, key_len, &ik);
-		/*
-		 * The holder is where the walk stopped: ON it for a prefix key
-		 * (the key ended at an internal node carrying external_nodes),
-		 * one level UP where the walk broke on the external leaf.
-		 */
-		if (d.nf == holder_flag) {
-			holder_depth = d.depth;
-			have_descent = true;
-		} else if (d.pnf == holder_flag) {
-			holder_depth = d.pdepth;
-			have_descent = true;
-		}
-	}
-#ifdef FT_DEBUG_WIDEN_OWNER
-	if (!have_descent && ft_bulk_active(ft))
-		uatomic_inc(&ft_wo_nod_chain_head);
-#endif
-	/*
-	 * ☠ THE TWO DERIVATIONS DISAGREED, and under EXPONENTIAL spacing that is
-	 * not survivable.  @holder_flag comes from the chain head's BACK POINTER
-	 * (ft_locate_chain_head); the descent just above re-derives the same
-	 * position TOP-DOWN by @iter_key.  @have_descent false means the walk by
-	 * the key did not arrive at the holder the back pointer named -- i.e. the
-	 * position moved between the two reads, so the plan is STALE.
-	 *
-	 * Under exclusion the two could not disagree and this was simply never
-	 * false; converting the op makes it reachable, and what it reached was an
-	 * ABORT: an exponential lock-set needs a byte-depth per member, and a
-	 * member whose depth is not itself a lock level has no anchor without the
-	 * descent table -- ft_anchor_meta asserts `d` for exactly that case.
-	 * (Measured: ft_inv is 148/148 at per-node and root-only, and aborts here
-	 * at exponential.)
-	 *
-	 * ☠ ROOT-ONLY NEEDS THE DATE TOO.  "Root-only names the trie root
-	 * directly" is true of every member dated below the root -- and FALSE of
-	 * depth 0, which is the ROOT CLAIM: ft_anchor_meta anchors a depth-0
-	 * member on ITSELF, and asserts it has no parent (standing since
-	 * 1c288c07).  Left undated, @holder_depth is its initializer 0, so a
-	 * stale plan arrives claiming its holder is the root: the assert fires
-	 * under a debug build, and a release build anchors the holder on itself
-	 * while every other op anchors it on the root -- the two exclude
-	 * nothing.  MEASURED: inv_prefix_shape_zoo's full mix at root-only, 5 of
-	 * 6 runs on that assert, from this call's lock take.  Only per-node,
-	 * which takes no descent, has no date to lose.
-	 *
-	 * Bail RETRIABLY: nothing is reserved yet and nothing is published, and
-	 * the cache is dropped so the next attempt re-seeds through a fresh
-	 * lookup rather than re-deriving from the same stale @iter->node.
-	 */
-	if (!have_descent &&
-#ifdef FT_DEBUG_RA_ROOT_ONLY_UNDATED
-	    ft->lock_spacing == CDS_FT_LOCK_SPACING_EXPONENTIAL) {
-#else
-	    ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
-#endif
-		/*
-		 * ☠ MATERIALIZE BEFORE DROPPING.  The next attempt re-seeds
-		 * "through a fresh lookup" -- from @iter's KEY -- and on a
-		 * keycopy trie that key lives in the LEAF, reachable only while
-		 * @cache_valid holds (ft_iter_key_referenced).  Clearing the
-		 * flag first leaves the re-seed searching for key 0.
-		 */
-		ft_iter_drop_position_keep_key(iter);
-		*result_node = NULL;
-		FT_DBG_RA_STALE_DESCENT();
-		FT_DBG_RETRY_SITE();
-		*need_retry = true;
-		return CDS_FT_STATUS_OK;	/* discarded by the retry loop */
-	}
-	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL, op);
+	ft_lock_ctx_init(&lctx, NULL, NULL, op);
 
 	/*
 	 * Ordered list on: the whole key leaves the trie, so its head's cell is

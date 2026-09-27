@@ -179,7 +179,7 @@ int ft_rekey_cow_lock_child(const struct cds_ft *ft,
  * FT_STATE_INPLACE_WAIT_MASK, and the park CLOBBERS its count.  A coarsened
  * member therefore keeps the MW guard and lets the peer abort the commit.
  *
- * ☞ Under CDS_FT_LOCK_SPACING_PER_NODE anchor and node are ONE word, so this is
+ * ☞ Under per-node locking anchor and node are ONE word, so this is
  * true whenever a mark was taken and the arms below are byte-identical to the
  * unconditional form they replace.
  */
@@ -6624,8 +6624,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * (skip-)compressed child's run into the one it lays and
 			 * retires it, and leaves a PLAIN or EXTERNAL survivor
 			 * alone (no free-list entry, nothing to fence).  Its depth
-			 * is one span below the resting node, which is what
-			 * ft_parent_depth_of states backwards.
+			 * is one span below the resting node.
 			 *
 			 * The anchor goes to @glue: the absorb is mid-build, past
 			 * every clean bail, so it cannot take this itself -- see
