@@ -3642,6 +3642,36 @@ bool ft_txn_content_sw_ok(const struct cds_ft *ft)
 }
 
 /*
+ * A BULK WINDOW: this thread holds the FT-wide writer lock of a FINE trie.  Point ops are drained before the lock is recorded
+ * (the bulk gate) and serialize behind it while the bulk op is live, and bulk
+ * ops take it in turn, so no writer of the trie can race a park.  The lock is
+ * only dropped at a grace-period seam BETWEEN two commits (ft_writer_lock_
+ * gp_wait), so a txn created under it commits under it.
+ *
+ * MEASURED before (FT_DEBUG_MW_KEPT, ft_inv MW per run): 364k records
+ * committed as CAS inside bulk windows (MW_STRUCT 279k, CELL 85k), each
+ * arbitrating against nobody.  -DFT_DEBUG_WLOCK_MW restores them.
+ * ft_flip_txn_excludes_all() already answers yes there.
+ *
+ * ☠ IT ARMS @trie_wide_sw ONLY, NEVER @structural_sw.  The structural arm
+ * means more than a record kind -- an ARMED fine committer takes the glue's
+ * re-parent marks and must be @record_only (ft_glue_acquire_reparent_marks)
+ * -- and bulk-window glue commits were never that.  Its structural records
+ * park through the per-record gate instead (@held_sw), which asks the same
+ * trie-wide claim.
+ */
+static inline
+bool ft_txn_bulk_window(const struct cds_ft *ft)
+{
+#ifndef FT_DEBUG_WLOCK_MW
+	return ft && ft->lock_fine && !ft->exclusive && ft_wlock_held == ft;
+#else
+	(void) ft;
+	return false;
+#endif
+}
+
+/*
  * A CONTENT flip-txn: the lane that rewrites the STRUCTURE -- forward publishes,
  * re-parents, retires, lock releases.  It takes @ft because arming is decided
  * from the trie (ft_txn_content_sw_ok); that argument is also what makes the
@@ -3740,6 +3770,8 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	if (ft_txn_content_sw_ok(ft)) {
 		t->trie_wide_sw = true;
 		ft_flip_txn_set_structural_sw(t, true);
+	} else if (ft_txn_bulk_window(ft)) {
+		t->trie_wide_sw = true;
 	}
 	return t;
 }
@@ -4016,6 +4048,8 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	if (ft_txn_content_sw_ok(ft)) {
 		t->trie_wide_sw = true;
 		ft_flip_txn_set_structural_sw(t, true);
+	} else if (ft_txn_bulk_window(ft)) {
+		t->trie_wide_sw = true;
 	}
 	return t;
 }
@@ -4125,6 +4159,8 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	if (ft_txn_content_sw_ok(ft)) {
 		t->trie_wide_sw = true;
 		ft_flip_txn_set_structural_sw(t, true);
+	} else if (ft_txn_bulk_window(ft)) {
+		t->trie_wide_sw = true;
 	}
 	return t;
 }
@@ -8761,8 +8797,9 @@ void ft_mk_note(const struct ft_flip_txn *t, const struct cds_ft *ft)
 
 	if (!d || d == URCU_TXN_ENOMEM || !d->nr)
 		return;
-	mode = t->trie_wide_sw ? FT_MK_TRIE_WIDE :
-		(ft && ft_wlock_held == ft) ? FT_MK_FINE_WLOCK : FT_MK_FINE_OP;
+	mode = (ft && ft->lock_fine && !ft->exclusive &&
+			ft_wlock_held == ft) ? FT_MK_FINE_WLOCK :
+		t->trie_wide_sw ? FT_MK_TRIE_WIDE : FT_MK_FINE_OP;
 	uatomic_inc(&ft_mk_txn[mode]);
 	for (i = 0; i < d->nr; i++) {
 		const struct urcu_txn_record *r = &d->recs[i];
@@ -9518,7 +9555,7 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 * until it did).
 	 */
 	held_sw = !t->structural_sw && t->ft && t->ft->lock_fine &&
-		ft_flip_txn_owns(t, owner);
+		(ft_flip_txn_owns(t, owner) || t->trie_wide_sw);
 	if (!FT_TK_TXN_IS_TAKE(t) && !held_sw) {
 		/*
 		 * COUNTED ONLY WHERE THE QUESTION IS OPEN, so that OWN_HELD +
@@ -10153,6 +10190,29 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 		}
 		if (!owner_ft->lock_fine || owner_ft->exclusive) {
 			FT_COW_ROOT_EXEMPT();	/* one lock for the whole trie */
+#ifndef FT_DEBUG_ROOT_EXEMPT_MW
+			/*
+			 * ☞ AND SO IT PARKS.  This root's TRIE excludes every
+			 * writer (the FT-wide mutex, or the caller's single-
+			 * writer contract): no peer CAS exists for a park to
+			 * race.  The question is asked of @owner_ft, the trie
+			 * the SLOT belongs to -- which is what the pin exists
+			 * for: door 1 answers for @t->ft only, and a cross-trie
+			 * dual writes a second root.  A validate (old == new)
+			 * stays MW: a park cannot fail.
+			 */
+			if (old_ptr != new_ptr) {
+				int ret;
+
+				FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
+				FT_LL_REC(t, slot, old_ptr, new_ptr, true);
+				ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr,
+					new_ptr, FT_FLIP_PROXY_TAG);
+				assert(!ret);
+				(void) ret;
+				return;
+			}
+#endif
 			goto pinned;
 		}
 		FT_COW_ROOT_NOTHELD();
