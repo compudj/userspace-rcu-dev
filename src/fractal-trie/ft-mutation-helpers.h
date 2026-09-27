@@ -8840,8 +8840,100 @@ static void ft_mk_report(void)
 	}
 }
 # define FT_MK_NOTE(t, ft)	ft_mk_note((t), (ft))
+
+/*
+ * WHO records them: a backtrace sampled where a record is decided MW (the
+ * first 32 per thread and class, then 1 in 512), module+offset, for
+ * addr2line -f -i against the module.  A class says what a word is; the
+ * producer says what to change.
+ */
+#include <execinfo.h>
+#include <dlfcn.h>
+# define FT_MK_STACKS	512
+# define FT_MK_DEPTH	12
+struct ft_mk_stack {
+	unsigned int cls;
+	int depth;
+	unsigned long n;
+	void *pc[FT_MK_DEPTH];
+};
+static struct ft_mk_stack ft_mk_stacks[FT_MK_STACKS];
+static unsigned int ft_mk_nstacks;
+static unsigned long ft_mk_overflow;
+static pthread_mutex_t ft_mk_mutex = PTHREAD_MUTEX_INITIALIZER;
+static __thread unsigned long ft_mk_tcount[FT_AB_CLS_NR + 1];
+
+static __attribute__((noinline))
+void ft_mk_sample(unsigned int cls)
+{
+	void *pc[FT_MK_DEPTH + 1];
+	int depth;
+	unsigned int i;
+
+	if (cls > FT_AB_CLS_NR)
+		cls = FT_AB_UNSET;
+	if (ft_mk_tcount[cls]++ >= 32 && (ft_mk_tcount[cls] & 511))
+		return;
+	depth = backtrace(pc, FT_MK_DEPTH + 1) - 1;
+	if (depth < 0)
+		depth = 0;
+	pthread_mutex_lock(&ft_mk_mutex);
+	for (i = 0; i < ft_mk_nstacks; i++) {
+		struct ft_mk_stack *st = &ft_mk_stacks[i];
+
+		if (st->cls == cls && st->depth == depth &&
+				!memcmp(st->pc, pc + 1, depth * sizeof(void *))) {
+			st->n++;
+			goto out;
+		}
+	}
+	if (ft_mk_nstacks < FT_MK_STACKS) {
+		struct ft_mk_stack *st = &ft_mk_stacks[ft_mk_nstacks++];
+
+		st->cls = cls;
+		st->depth = depth;
+		st->n = 1;
+		memcpy(st->pc, pc + 1, depth * sizeof(void *));
+	} else {
+		ft_mk_overflow++;
+	}
+out:
+	pthread_mutex_unlock(&ft_mk_mutex);
+}
+
+static void ft_mk_stack_report(void) __attribute__((destructor));
+static void ft_mk_stack_report(void)
+{
+	unsigned int i, j;
+
+	fprintf(stderr, "  MW record stacks: %u (overflow %lu)\n",
+		ft_mk_nstacks, ft_mk_overflow);
+	for (i = 0; i < ft_mk_nstacks; i++) {
+		const struct ft_mk_stack *st = &ft_mk_stacks[i];
+
+		fprintf(stderr, "FT_MK_STACK n=%lu %s :", st->n,
+			st->cls == FT_AB_CLS_NR ? "MIXED" :
+			ft_ab_cls_name(st->cls));
+		for (j = 0; j < (unsigned int) st->depth; j++) {
+			Dl_info di;
+
+			if (dladdr(st->pc[j], &di) && di.dli_fname)
+				fprintf(stderr, " %s+%#lx",
+					strrchr(di.dli_fname, '/') ?
+					strrchr(di.dli_fname, '/') + 1 :
+					di.dli_fname,
+					(unsigned long) ((char *) st->pc[j] -
+						(char *) di.dli_fbase));
+			else
+				fprintf(stderr, " %p", st->pc[j]);
+		}
+		fprintf(stderr, "\n");
+	}
+}
+# define FT_MK_SAMPLE(cls)	ft_mk_sample(cls)
 #else
 # define FT_MK_NOTE(t, ft)	do { } while (0)
+# define FT_MK_SAMPLE(cls)	do { } while (0)
 #endif
 
 /*
@@ -9771,6 +9863,7 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 				(ft_hold_trace_holds(owner) ? FT_AB_OWN_LEDGER :
 					FT_AB_OWN_MISS));
 		FT_LL_REC(t, slot, old_ptr, new_ptr, false);
+		FT_MK_SAMPLE(FT_AB_MW_STRUCT);
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	}
 	assert(!ret);
@@ -10011,6 +10104,7 @@ void __ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 			FT_MWA_DOOR1_ROOT_SLOT();
 		FT_MWA_DOOR1_KEPT(t, old_ptr == new_ptr);
 		FT_LL_REC(t, slot, old_ptr, new_ptr, false);
+		FT_MK_SAMPLE(FT_AB_MWA_BASE + dbg_mwa);
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	}
 	assert(!ret);
