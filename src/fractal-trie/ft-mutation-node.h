@@ -1580,6 +1580,9 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * sizing, tombstone expected-old) derives from.
 	 */
 	struct ft_held_anchor c_held = { 0 };
+	/* The prefix head's back edge, recorded at skip_copy (see there). */
+	void **bc_rec_slot = NULL;
+	struct cds_ft_inode_flag *bc_rec_old = NULL;
 	bool fenced = false;
 	/*
 	 * §9.3 LOCK_FINE lock-set, RELEASE half: the members this recompact locks
@@ -2162,12 +2165,24 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * the recorded twin of the plain-store arm's
 				 * ft_publish_external_nodes_prev below.
 				 */
+#ifndef FT_DEBUG_RECOMPACT_BC_EARLY
+				/*
+				 * RECORDED AT skip_copy, where C is covered: the
+				 * word is C's (FT-SLOT-3) and C is fenced, so it
+				 * cannot move from this read to the commit, and the
+				 * check above stays here.  Recorded now it was an
+				 * MW record (C not yet owned by @retire_txn).
+				 */
+				bc_rec_slot = bc_slot;
+				bc_rec_old = bc_old;
+#else
 				ft_flip_txn_record_head_back_edge_owned(retire_txn,
 					bc_slot, bc_old,
 					ft_head_parent_word(new_node_flag,
 						/*prefix=*/ true),
 					ft_back_edge_owner(bc_old)
 					FT_BE_SITE(FT_BE_RECOMPACT, ctx));
+#endif
 			} else {
 				/*
 				 * Build-invisible / legacy no-txn arm: the
@@ -2676,6 +2691,17 @@ skip_copy:
 	if (fenced && retire_txn && !c_held.shared)
 		ft_flip_txn_cover_member(retire_txn, c_held.lock);
 #endif
+	/*
+	 * The external prefix head's back edge, read and checked when the copy
+	 * took @external_nodes above: recorded here, after the last bail and
+	 * with C covered, so it parks like the sweep's records.
+	 */
+	if (bc_rec_slot)
+		ft_flip_txn_record_head_back_edge_owned(retire_txn,
+			bc_rec_slot, bc_rec_old,
+			ft_head_parent_word(new_node_flag, /*prefix=*/ true),
+			ft_back_edge_owner(bc_rec_old)
+			FT_BE_SITE(FT_BE_RECOMPACT, ctx));
 
 #ifdef FT_DEBUG_DEL_TOMB
 	ft_dt_check_node("rc-after-copy", 0, new_type, new_node, new_metadata,
