@@ -543,7 +543,8 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 					ft_rekey_cow_desc(txn, true);
 
 				if (!held_earlier && (!now || !urcu_txn_find(now,
-						(void **) &cm->state))) {
+						(void **) &cm->state)) &&
+						!ft_flip_txn_releases_after(txn, cm)) {
 					uintptr_t live = (uintptr_t) urcu_txn_load(
 						txn->mtxn, (void **) &cm->state,
 						FT_STATE_PROXY) &

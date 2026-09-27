@@ -2933,6 +2933,24 @@ struct ft_flip_txn {
 	struct cds_ft_metadata *covered[FT_FLIP_TXN_FLOOR_LOCKS];
 	unsigned int nr_covered;
 	/*
+	 * ☞ THE LOCKS RELEASED AFTER THE TXN (Mathieu 09-26: "split out the lock
+	 * release after the TXN").  A lock whose release used to ride this txn
+	 * as a terminal record ({LOCK|s -> s}, or a retire {LOCK|s -> s|T}) is
+	 * listed here instead: its state word keeps LOCK through the commit AND
+	 * its settle, and ft_flip_txn_commit clears it only after a COMMITTED
+	 * commit returns, when every record it protects is plain.  So the
+	 * handover is release-after-settle by construction, and no txn carries
+	 * a lock word's release and its content edits as two records on one
+	 * slot -- the pair the SW engine's blind append cannot take.
+	 *
+	 * On every other terminal nothing was applied, and the word's owner
+	 * releases it exactly as when the terminal was a record: the registry
+	 * (ft_flip_txn_lock_release_all), or the frame / glue sweep that asked
+	 * ft_lock_terminal_query.  Full, a release falls back to the record.
+	 */
+	struct cds_ft_metadata *rel_after[FT_FLIP_TXN_FLOOR_LOCKS];
+	unsigned int nr_rel_after;
+	/*
 	 * Set when a per-node lock acquire MISSED (see
 	 * ft_flip_txn_lock_or_guard_parent).  The op then structurally writes a
 	 * slot whose owner it does not hold, so the commit must ABORT rather
@@ -3665,6 +3683,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->locks = t->locks_floor;
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
+	t->nr_rel_after = 0;
 	t->sw_body = false;
 	/*
 	 * ☠ AND @sw_per_op, WHICH NOTHING USED TO SET.  Its only other writer is
@@ -3940,6 +3959,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->locks = t->locks_floor;
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
+	t->nr_rel_after = 0;
 	t->sw_body = false;
 	/*
 	 * ☠ AND @sw_per_op, WHICH NOTHING USED TO SET.  Its only other writer is
@@ -4048,6 +4068,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->locks = t->locks_floor;
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
+	t->nr_rel_after = 0;
 	t->sw_body = false;
 	/*
 	 * ☠ AND @sw_per_op, WHICH NOTHING USED TO SET.  Its only other writer is
@@ -6231,6 +6252,12 @@ static inline void ft_born_forget(const struct cds_ft_metadata *m)
 		if (ft_born_ring[i] == m)
 			ft_born_ring[i] = NULL;
 }
+/*
+ * Set around ft_flip_txn_commit's post-commit releases: a born lock's release
+ * is staged after the txn now (@rel_after), so that strict release IS its
+ * terminal and is not the defect this probe reports.
+ */
+static __thread bool ft_born_rel_after;
 static inline bool ft_born_seen(const struct cds_ft_metadata *m)
 {
 	unsigned int i, n = ft_born_ring_n < FT_BORN_RING ?
@@ -6390,7 +6417,7 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 			return;
 #endif
 #ifdef FT_DEBUG_BORN_RELEASE
-		if (caa_unlikely(ft_born_seen(meta))) {
+		if (caa_unlikely(!ft_born_rel_after && ft_born_seen(meta))) {
 			if (uatomic_add_return(&ft_born_rel_hits, 1) <= 8) {
 				Dl_info di__;
 				const void *ra__ = __builtin_return_address(0);
@@ -6676,6 +6703,62 @@ void ft_flip_txn_cover_member(struct ft_flip_txn *t,
 		t->covered[t->nr_covered++] = member;
 }
 
+/* Is @meta's release staged after this txn (see @rel_after)? */
+static inline
+bool ft_flip_txn_releases_after(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *meta)
+{
+	unsigned int i;
+
+	if (!t || !meta)
+		return false;
+	for (i = 0; i < t->nr_rel_after; i++)
+		if (t->rel_after[i] == meta)
+			return true;
+	return false;
+}
+
+#ifdef FT_DEBUG_REL_AFTER_STATS
+static unsigned long ft_rel_after_n[3];	/* staged, deduped, overflow */
+static void ft_rel_after_report(void) __attribute__((destructor));
+static void ft_rel_after_report(void)
+{
+	fprintf(stderr, "FT REL AFTER: staged %lu deduped %lu overflow %lu\n",
+		ft_rel_after_n[0], ft_rel_after_n[1], ft_rel_after_n[2]);
+}
+# define FT_REL_AFTER_COUNT(i)	uatomic_inc(&ft_rel_after_n[i])
+#else
+# define FT_REL_AFTER_COUNT(i)	do { } while (0)
+#endif
+
+/*
+ * Stage @meta's release after the txn.  False when it cannot be staged -- the
+ * list is full, or the -DFT_DEBUG_RELEASE_IN_TXN control -- and the caller
+ * then records the release terminal as before.
+ */
+static inline
+bool ft_flip_txn_release_after_add(struct ft_flip_txn *t,
+		struct cds_ft_metadata *meta)
+{
+#ifdef FT_DEBUG_RELEASE_IN_TXN
+	(void) t;
+	(void) meta;
+	return false;
+#else
+	if (ft_flip_txn_releases_after(t, meta)) {
+		FT_REL_AFTER_COUNT(1);
+		return true;
+	}
+	if (t->nr_rel_after == CAA_ARRAY_SIZE(t->rel_after)) {
+		FT_REL_AFTER_COUNT(2);
+		return false;
+	}
+	t->rel_after[t->nr_rel_after++] = meta;
+	FT_REL_AFTER_COUNT(0);
+	return true;
+#endif
+}
+
 /* A word registered on the caller's own account: it IS the node (see @member). */
 static inline
 void ft_flip_txn_lock_register(struct ft_flip_txn *t,
@@ -6842,6 +6925,18 @@ enum ft_lock_terminal_state ft_lock_terminal_query(const struct ft_flip_txn *t,
 	if (!t || !t->mtxn || !lock)
 		return FT_LOCK_TERMINAL_NONE;
 	d = t->mtxn->desc;
+	/*
+	 * A release STAGED after the txn (@rel_after) is this word's terminal
+	 * too, with no record to find: the txn owes it until it decides, gives
+	 * it back after a committed commit, and applied nothing otherwise.
+	 */
+	if (ft_flip_txn_releases_after(t, lock)) {
+		if (!d || d == URCU_TXN_ENOMEM ||
+				urcu_txn_desc_status(d) == URCU_TXN_DESC_UNDECIDED)
+			return FT_LOCK_TERMINAL_PENDING;
+		return urcu_txn_desc_status(d) == URCU_TXN_DESC_SUCCEEDED ?
+			FT_LOCK_TERMINAL_CONSUMED : FT_LOCK_TERMINAL_KEPT;
+	}
 	/* The ENOMEM sentinel is (void *) -1, not a descriptor: never deref. */
 	if (!d || d == URCU_TXN_ENOMEM)
 		return FT_LOCK_TERMINAL_NONE;
@@ -6879,6 +6974,13 @@ bool ft_lock_terminal_drops_lock(const struct ft_flip_txn *t,
 {
 	struct urcu_txn_record *r = NULL;
 
+	/*
+	 * A release staged after the txn (@rel_after) drops the lock too, with
+	 * no record to show it: ft_flip_txn_commit gives the word back after a
+	 * committed commit, so the caller must not release it again.
+	 */
+	if (ft_flip_txn_releases_after(t, lock))
+		return true;
 	(void) ft_lock_terminal_query(t, lock, &r);
 	return r && (((uintptr_t) r->old_ptr & FT_STATE_LOCK) &&
 			!((uintptr_t) r->new_ptr & FT_STATE_LOCK));
@@ -9120,7 +9222,25 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		ft_flip_txn_scrub_owned(t, false);
 		for (bs_i = 0; bs_i < t->nr_locks; bs_i++)
 			ft_hold_trace_drop_tolerant(t->locks[bs_i].meta);
+		/*
+		 * ☞ THE RELEASES, AFTER THE TXN.  The commit has returned, so
+		 * every record it applied is SETTLED -- no parked proxy is left
+		 * on any word these locks protect -- and only now does each
+		 * staged lock go back.  A peer that takes one finds its words
+		 * plain, which the late-last settle only approximated.  Last in
+		 * this function on purpose: once a word is clean a peer takes
+		 * it at once, so the scrub and the ledger drops come first.
+		 */
+#ifdef FT_DEBUG_BORN_RELEASE
+		ft_born_rel_after = true;
+#endif
+		for (bs_i = 0; bs_i < t->nr_rel_after; bs_i++)
+			ft_meta_lock_release(t->rel_after[bs_i]);
+#ifdef FT_DEBUG_BORN_RELEASE
+		ft_born_rel_after = false;
+#endif
 	}
+	t->nr_rel_after = 0;
 	ft_flip_txn_free(t);
 	return st;
 }
@@ -10961,6 +11081,42 @@ void ft_flip_txn_record_state_kind_ctx(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta, void *old_ptr, void *new_ptr,
 		int sw_ok)
 {
+	uintptr_t o = (uintptr_t) old_ptr, n = (uintptr_t) new_ptr;
+
+	/*
+	 * ☞ EVERY STATE RECORD PASSES HERE, so this is where the lock release
+	 * leaves the txn (see @rel_after).
+	 *
+	 * A TERMINAL -- an expected-old carrying LOCK and a new value without it
+	 * (the plain release, a retire, an anchor handback) -- keeps LOCK in
+	 * its new value and stages the release instead.  What is left of it is
+	 * the word's CONTENT edit; a pure release has none and records nothing.
+	 *
+	 * An EDIT on a word whose release is staged was written against the
+	 * value the release used to leave pending: LOCK stripped.  The word
+	 * still carries our LOCK now, so give it back to both values -- but
+	 * only when the pending word is EXACTLY that stripped value plus LOCK.
+	 * Anything else is a word this op did not put there, and the record
+	 * keeps its stale expected-old so the commit refuses it as before.
+	 */
+	if ((o & FT_STATE_LOCK) && !(n & FT_STATE_LOCK)) {
+		if (ft_flip_txn_release_after_add(t, meta)) {
+			n |= FT_STATE_LOCK;
+			if (n == o)
+				return;		/* a pure release: nothing to record */
+		}
+	} else if (!(o & FT_STATE_LOCK) && ft_flip_txn_releases_after(t, meta)) {
+		uintptr_t pend = (uintptr_t) urcu_txn_load(t->mtxn,
+				(void **) &meta->state, FT_STATE_PROXY);
+
+		if ((pend & FT_STATE_LOCK) &&
+				(pend & ~(uintptr_t) FT_STATE_LOCK) == o) {
+			o |= FT_STATE_LOCK;
+			n |= FT_STATE_LOCK;
+		}
+	}
+	old_ptr = (void *) o;
+	new_ptr = (void *) n;
 	if (sw_ok)
 		__ft_flip_txn_record_tag_ctx(t, dbg_ctx, /*owner=*/ meta,
 			(void **) &meta->state,
@@ -11599,6 +11755,8 @@ bool ft_dlm_covering_release_recorded(const struct ft_lock_ctx *ctx,
 		struct urcu_txn_desc *d = hs->txn ? hs->txn->mtxn->desc : NULL;
 		const struct urcu_txn_record *r;
 
+		if (hs->txn && ft_flip_txn_releases_after(hs->txn, lock))
+			return true;
 		if (!d || d == URCU_TXN_ENOMEM)
 			continue;
 		/*
@@ -12504,6 +12662,10 @@ take:
 						hs__->txn->mtxn->desc : NULL;
 					const struct urcu_txn_record *r__;
 
+					if (hs__->txn &&
+						ft_flip_txn_releases_after(
+							hs__->txn, lock))
+						goto e2_closing;
 					if (!d__ || d__ == URCU_TXN_ENOMEM)
 						continue;
 					r__ = urcu_txn_find(d__, (void **)
@@ -12514,6 +12676,7 @@ take:
 						(((uintptr_t) r__->new_ptr) &
 							FT_STATE_LOCK))
 						continue;
+e2_closing:
 					if (ft_hold_trace_report_ok())
 						fprintf(stderr,
 							"FT E2: dedupe onto CLOSING hold at %s:%d, not filed\n",
@@ -15795,8 +15958,9 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 		bool ratified;
 
 		if (caa_unlikely(pending == (h->node_snap | FT_STATE_LOCK) &&
-				ft_lock_ctx_holds(ctx, node, &held_snap,
-					&ratified))) {
+				(ft_flip_txn_releases_after(t, node) ||
+				 ft_lock_ctx_holds(ctx, node, &held_snap,
+					&ratified)))) {
 			ft_flip_txn_record_state_ctx(t, ctx, node,
 				(void *) pending,
 				(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
@@ -17724,6 +17888,8 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 		if (desc && desc != URCU_TXN_ENOMEM &&
 				urcu_txn_find(desc, (void **) &meta->state))
 			return;
+		if (ft_flip_txn_releases_after(t, meta))
+			return;		/* the staged release's word: held */
 	}
 	if (!ft_flip_txn_reserve_extra(t, 1)) {
 		return;

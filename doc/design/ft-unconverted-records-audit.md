@@ -192,3 +192,45 @@ plain load resolve should work."*
   preemption: each run pinned to 2 CPUs, `76801d6d` 220/240 and `e6f893e0`
   227/240; unpinned, 0/480 each. Pre-existing remove starvation, not a
   conversion regression.
+
+## Toward the SW engine: one record per word, locks released after the txn
+
+Status 2026-09-26. The SW engine (`<urcu/rcu-txn-sw.h>`) appends records
+blindly and leaves pairwise-distinct slots to the caller; the MW front end
+fuses a second record on a slot (read-your-own-writes chain at age 1+,
+escalation at age 0), so the `DEBUG_RCU` duplicate scan at commit never sees
+one. `-DFT_DEBUG_SAME_SLOT` (221e5b7f) counts them instead.
+
+First census, per run: `ft_inv` MW 12.4M same-slot pairs, `ft_unit` 1.38M.
+Every `ft_inv` pair, and all but 2.5k of `ft_unit`'s, was a lock RELEASE record
+`{LOCK|s -> s}` on a node's state word followed by a content edit chained onto
+it (the tombstone of a retire, a recompact's edits).
+
+**Locks are released after the txn** (Mathieu: "combine the state updates in
+the caller, and split out the lock release after the TXN"). Every state record
+passes `ft_flip_txn_record_state_kind_ctx`; there a terminal (an expected-old
+with LOCK, a new value without it) keeps LOCK and is staged on the txn's
+`rel_after` list, and a pure release records nothing. `ft_flip_txn_commit`
+clears each staged word with `ft_meta_lock_release` after a committed commit
+returns, so every record the lock protects is settled first. On every other
+terminal nothing was applied and the owner releases the lock as before (the
+registry, or the frame's sweep). The questions that used to find the release
+record in the descriptor ask `ft_flip_txn_releases_after` as well:
+`ft_lock_terminal_query`, `ft_lock_terminal_drops_lock`,
+`ft_dlm_covering_release_recorded`, the E2 closing-hold dedupe, the anchored
+retire's held arm, and the §4.B installed-child and rekey re-home guards.
+
+An edit on a staged word that was written against the stripped value the
+release used to leave pending gets LOCK back in both of its values, only when
+the pending word is exactly that value plus LOCK. Without it, the edit's SW
+park settles the stripped value, releases the lock early, and the post-commit
+release then fails `ft_meta_lock_release`'s LOCK assert (measured: the
+normalization ablated, `ft_unit` aborts).
+
+Result: `ft_inv` MW 23k same-slot pairs, `ft_unit` 3.8k, every remaining one an
+edit chained under the lock (plus 914 RANK in `ft_unit`). Those are the
+"combine in the caller" half, still open. `-DFT_DEBUG_RELEASE_IN_TXN` restores
+the recorded release (the A/B control).
+
+Found on the way: `ft_rekey_cow_stop` cached the descriptor ahead of a
+reservation that can move it (6f774617).
