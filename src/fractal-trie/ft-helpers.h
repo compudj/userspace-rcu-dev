@@ -2829,10 +2829,10 @@ static void ft_dt_glue_report(void)
  * SEPARATE status load can tear across the commit's status flip -- read parent ->
  * OLD, flip, read offset -> NEW -> a slot address computed off the wrong parent
  * body -> ft_slot_to_byte OOB.  So the two edges must be driven from a SINGLE
- * status snapshot: when @meta->parent carries the proxy, take its txn @t, read
- * urcu_txn_desc_status(t) ONCE, and resolve BOTH edges through it.  A re-home
- * that begins mid-snapshot is caught by the coherence re-read of @meta->parent
- * and retried.
+ * status snapshot: when @meta->parent carries the proxy, take its commit's
+ * decision @t, read it ONCE (ft_txn_decision_committed), and resolve BOTH edges
+ * through it.  A re-home that begins mid-snapshot is caught by the coherence
+ * re-read of @meta->parent and retried.
  *
  * The §8.3 split SHARPENED this: the offset now has its own word, written ONLY
  * by a re-home, so a proxy parked there is unambiguously @t's.  While the offset
@@ -2942,10 +2942,17 @@ struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta
  * slot -- and when the re-parent came from a recompaction, that slot sits
  * inside the copy this very commit retires.
  *
- * So read both words READ-YOUR-OWN-WRITES.  The (parent, offset) pair needs no
- * coherence re-read here: a re-parent records them together, so the txn returns
- * one op's view of both, and any word without a pending edge falls through to
- * the same waiting load ft_resolve_parent_slot performs.
+ * So when the txn recorded either word, read both READ-YOUR-OWN-WRITES.  The
+ * (parent, offset) pair then needs no coherence re-read: a re-parent records
+ * them together, and the op that recorded one holds the lock that keeps a peer
+ * off the other.
+ *
+ * When it recorded neither, the pair is a PEER's to change, and a peer's
+ * re-home may be parked on both words right now.  Two independent loads can
+ * then tear: the MCAS engine waits each one out until that commit decides,
+ * but an SW proxy flips at any instant, so the parent could resolve old and
+ * the offset new.  So take the reader's snapshot, which resolves both through
+ * one decision and re-reads the parent word (ft_resolve_parent_slot).
  *
  * @mtxn NULL answers exactly as ft_get_parent_slot does.
  */
@@ -2959,8 +2966,23 @@ struct cds_ft_inode_flag **ft_txn_parent_slot_at(const struct cds_ft_metadata *m
 
 	if (parent_out)
 		*parent_out = NULL;
-	if (!mtxn)
+	if (!mtxn
+#ifndef FT_DEBUG_PARENT_SLOT_TWO_LOADS
+	    || (!ft_txn_recorded(mtxn,
+			(void **) (uintptr_t) &meta->parent_word) &&
+		!ft_txn_recorded(mtxn,
+			(void **) (uintptr_t) &meta->parent_slot_offset))
+#endif
+	   ) {
+#ifdef FT_DEBUG_FOREIGN_PARKED
+		if (mtxn)
+			uatomic_inc(&ft_fp_ps_snapshot);
+#endif
 		return ft_resolve_parent_slot(meta, ft, parent_out);
+	}
+#ifdef FT_DEBUG_FOREIGN_PARKED
+	uatomic_inc(&ft_fp_ps_ryw);
+#endif
 	parent = ft_txn_load(mtxn,
 		(void **) (uintptr_t) &meta->parent_word, FT_FLIP_PROXY_TAG);
 	state = ft_txn_load(mtxn,

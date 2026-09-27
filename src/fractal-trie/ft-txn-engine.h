@@ -97,6 +97,14 @@ void *ft_txn_read(void **slot, uintptr_t tag)
 	return urcu_txn_read(slot, tag);
 }
 
+/* Has the txn behind @h recorded an edge on @slot? */
+FT_TXN_INLINE
+bool ft_txn_recorded(struct urcu_txn *h, void **slot)
+{
+	return h->desc && h->desc != URCU_TXN_ENOMEM &&
+		urcu_txn_find(h->desc, slot) != NULL;
+}
+
 /*
  * LOADS INSIDE A TXN.  ft_txn_load() returns @slot as the txn behind @h will
  * leave it: its own pending value when it recorded @slot, else the slot's
@@ -123,6 +131,8 @@ struct ft_fp_site {
 # define FT_FP_SITES	128
 static struct ft_fp_site ft_fp_sites[FT_FP_SITES];
 static unsigned long ft_fp_loads, ft_fp_parked, ft_fp_dropped;
+/* ft_txn_parent_slot_at with a txn: snapshot vs read-your-own-writes path */
+static unsigned long ft_fp_ps_snapshot, ft_fp_ps_ryw;
 
 static inline
 void ft_fp_note(struct urcu_txn *h, void **slot, uintptr_t tag,
@@ -135,8 +145,7 @@ void ft_fp_note(struct urcu_txn *h, void **slot, uintptr_t tag,
 	uatomic_inc(&ft_fp_loads);
 	if (!urcu_txn_is_proxy(raw, tag))
 		return;
-	if (h->desc && h->desc != URCU_TXN_ENOMEM &&
-			urcu_txn_find(h->desc, slot))
+	if (ft_txn_recorded(h, slot))
 		return;			/* recorded: the load returns our own value */
 	uatomic_inc(&ft_fp_parked);
 	key = ((uint64_t) (uintptr_t) file << 12) ^ ((uint64_t) line << 44) ^
@@ -170,6 +179,8 @@ static void ft_fp_report(void)
 	fprintf(stderr, "FT FOREIGN PARKED: %lu txn loads, %lu found another "
 		"commit's proxy on a slot they did not record (%lu unsited)\n",
 		ft_fp_loads, ft_fp_parked, ft_fp_dropped);
+	fprintf(stderr, "  parent-slot derivations in a txn: %lu snapshot, "
+		"%lu read-your-own-writes\n", ft_fp_ps_snapshot, ft_fp_ps_ryw);
 	for (i = 0; i < FT_FP_SITES; i++)
 		if (ft_fp_sites[i].n)
 			fprintf(stderr, "  %12lu  tag 0x%lx  %s:%d\n",
