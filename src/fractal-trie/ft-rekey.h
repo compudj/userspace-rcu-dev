@@ -261,6 +261,33 @@ bool ft_rekey_cow_fresh_has(const struct ft_rekey_cow_fresh *fresh,
 	return false;
 }
 
+/*
+ * THE DESCRIPTOR, READ AT EACH USE -- never cached across a record or a
+ * reservation.  Either can GROW it, and a grow MOVES it (urcu_txn_grow): a
+ * pointer taken before then names the old block, where a lookup no longer
+ * finds this commit's records.  ft_rekey_cow_stop cached it ahead of its own
+ * ft_flip_txn_reserve_extra, so when that reserve grew the descriptor, the
+ * copy read a slot the detach had just republished (the collapse's run in
+ * place of the junction it retires) as its LIVE old value, re-homed the
+ * retiring junction into the copy, and committed a tombstoned node still
+ * reachable (ft_unit test_rekey_same_path_atomic_or_refused, root_frame
+ * geometry 6 with rank stats and the ordered list).  It only needs the grow
+ * to land there, which the number of records ahead of the copy decides --
+ * found when moving the lock releases out of the txn changed that number.
+ * NULL when the copy must not see this commit (@ryw off) or the txn is out of
+ * memory.
+ */
+static inline
+struct urcu_txn_desc *ft_rekey_cow_desc(const struct ft_flip_txn *txn, bool ryw)
+{
+	struct urcu_txn_desc *d;
+
+	if (!ryw || !txn->mtxn)
+		return NULL;
+	d = txn->mtxn->desc;
+	return d == URCU_TXN_ENOMEM ? NULL : d;
+}
+
 static inline
 bool ft_rekey_cow_slot_value(struct ft_flip_txn *txn,
 		struct urcu_txn_desc *desc,
@@ -508,8 +535,15 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 				 * §4.B validate every re-home of an unheld child
 				 * records.
 				 */
-				if (!held_earlier && !urcu_txn_find(desc,
-						(void **) &cm->state)) {
+				/*
+				 * Re-read: the records just above can have
+				 * grown (moved) the descriptor.
+				 */
+				struct urcu_txn_desc *now =
+					ft_rekey_cow_desc(txn, true);
+
+				if (!held_earlier && (!now || !urcu_txn_find(now,
+						(void **) &cm->state))) {
 					uintptr_t live = (uintptr_t) urcu_txn_load(
 						txn->mtxn, (void **) &cm->state,
 						FT_STATE_PROXY) &
@@ -627,13 +661,13 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	 * is still growing it.
 	 */
 	struct ft_lock_ctx cctx;
-	/* This commit's own records, when the copy must show them (@ryw). */
-	struct urcu_txn_desc *desc = NULL;
+	/*
+	 * This commit's own records, when the copy must show them (@ryw), are
+	 * read through ft_rekey_cow_desc at each use: see its header.
+	 */
 
 	*stop_prime_ret = NULL;
 	*nr_marks = 0;
-	if (ryw && txn->mtxn && txn->mtxn->desc != URCU_TXN_ENOMEM)
-		desc = txn->mtxn->desc;
 	/*
 	 * @structural_sw is the claim that matters: this body parks SW.  The
 	 * EXCLUSION behind it is mode-dependent -- the per-node DLM locks under
@@ -789,7 +823,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	}
 	new_flag = ft_node_flag(new_node, ti);
 	child_depth = stop_depth + 1;	/* a bitmap node spans ONE key byte */
-	ft_nr_keys_store(ft, new_meta, ft_rekey_cow_nr_keys(stop_meta, desc),
+	ft_nr_keys_store(ft, new_meta, ft_rekey_cow_nr_keys(stop_meta,
+		ft_rekey_cow_desc(txn, ryw)),
 		CMM_RELAXED);
 
 	/*
@@ -816,7 +851,9 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			if (!iter)
 				continue;
 			ft_node_get_nth_skip(stop_flag, &src_slot, v, FT_PF_NONE);
-			if (!ft_rekey_cow_slot_value(txn, desc, src_slot, &iter)) {
+			if (!ft_rekey_cow_slot_value(txn,
+					ft_rekey_cow_desc(txn, ryw), src_slot,
+					&iter)) {
 				ret = -EAGAIN;
 				goto abandon;
 			}
@@ -844,7 +881,9 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				continue;
 			ft_node_get_nth_skip(stop_flag, &src_slot, (uint8_t) i,
 					FT_PF_NONE);
-			if (!ft_rekey_cow_slot_value(txn, desc, src_slot, &iter)) {
+			if (!ft_rekey_cow_slot_value(txn,
+					ft_rekey_cow_desc(txn, ryw), src_slot,
+					&iter)) {
 				ret = -EAGAIN;
 				goto abandon;
 			}
@@ -908,7 +947,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				continue;
 			ft_node_get_nth_skip(new_flag, &slot, v, FT_PF_NONE);
 			ft_node_get_nth_skip(stop_flag, &src_slot, v, FT_PF_NONE);
-			ret = ft_rekey_cow_reparent_child(ft, ctx, &cctx, txn, desc,
+			ret = ft_rekey_cow_reparent_child(ft, ctx, &cctx, txn,
+				ft_rekey_cow_desc(txn, ryw),
 				iter, new_flag, slot, src_slot, child_depth, fresh,
 				marks, &nm, nr_marks);
 			if (ret)
@@ -924,7 +964,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			ft_node_get_nth_skip(new_flag, &slot, (uint8_t) i, FT_PF_NONE);
 			ft_node_get_nth_skip(stop_flag, &src_slot, (uint8_t) i,
 					FT_PF_NONE);
-			ret = ft_rekey_cow_reparent_child(ft, ctx, &cctx, txn, desc,
+			ret = ft_rekey_cow_reparent_child(ft, ctx, &cctx, txn,
+				ft_rekey_cow_desc(txn, ryw),
 				iter, new_flag, slot, src_slot, child_depth, fresh,
 				marks, &nm, nr_marks);
 			if (ret)
