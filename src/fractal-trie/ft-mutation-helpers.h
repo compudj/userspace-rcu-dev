@@ -9575,6 +9575,40 @@ bool ft_flip_txn_record_is_noop(const struct ft_flip_txn *t, void **slot,
 }
 
 /*
+ * ☞ A NAMED OWNER THE OP DOES NOT HOLD ENDS THE ATTEMPT.
+ *
+ * A structural write whose producer NAMED the lock covering the word, and
+ * does not hold it, used to be recorded MW and let the install CAS arbitrate.
+ * That CAS was the safety net for a stale plan: the SKIP_X dual into a
+ * grandparent is the case measured (the op reads the grandparent's slot once
+ * to decide whether to take it, and again to build the edge -- a peer that
+ * re-encodes the slot into skip form in between leaves a dual edge on a
+ * grandparent the op never took; caught by the DEBUG_RCU gate sweep's no-MW
+ * trap on bulkfence, no-in-place-delete and excl).  The SW engine has no CAS,
+ * so the attempt ends here instead, exactly like a missed take: @acquire_miss
+ * dooms the txn, the MW funnel drops the record, the commit returns ABORT and
+ * the retry re-plans against the slot as it now is -- and takes the owner.
+ *
+ * Narrow on purpose: a WRITE (a validate is not a stale write), a NAMED owner
+ * (an unnamed one is plumbing, not a missed take -- dooming it could loop),
+ * and no trie-wide exclusion (door 1 parks it legitimately there).  What is
+ * left still reaches the funnel, and the DEBUG_RCU trap.
+ * -DFT_DEBUG_UNHELD_EDGE_MW records it MW as before.
+ */
+static inline
+void ft_flip_txn_doom_unheld_edge(struct ft_flip_txn *t,
+		const struct cds_ft_metadata *owner, const void *old_ptr,
+		const void *new_ptr)
+{
+#ifndef FT_DEBUG_UNHELD_EDGE_MW
+	if (owner && old_ptr != new_ptr && !t->trie_wide_sw)
+		t->acquire_miss = true;
+#else
+	(void) t; (void) owner; (void) old_ptr; (void) new_ptr;
+#endif
+}
+
+/*
  * Record one structural edge (FT's type-7 / 0xF proxy tag) directly into the
  * txn.  Used by the GLUE flip-txn fold and the single-commit ops, whose txn was
  * pre-reserved to its bounded edge count (create_bounded / ft_flip_txn_reserve),
@@ -11391,6 +11425,9 @@ void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
 			 * (the branch above takes it), so DUAL_ROOT is not a
 			 * possible answer at this site.
 			 */
+		{
+			ft_flip_txn_doom_unheld_edge(t, rec->owner[i],
+				rec->old_val[i], rec->new_val[i]);
 			ft_flip_txn_record_tag_mw(t, (void **) rec->slot[i],
 				(void *) rec->old_val[i],
 				(void *) rec->new_val[i],
@@ -11398,6 +11435,7 @@ void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
 				FT_TK_MWA(rec->owner[i] ?
 					FT_TK_MWA_DUAL_NAMED :
 					FT_TK_MWA_DUAL_UNNAMED));
+		}
 		else
 			ft_flip_txn_record_reserved(t, rec->owner[i],
 				(void **) rec->slot[i],
@@ -18109,7 +18147,12 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target, tag);
-			else
+			else {
+			if (tag == FT_FLIP_PROXY_TAG &&
+					(void *) edges[i].slot != (void *) &ft->root)
+				ft_flip_txn_doom_unheld_edge(t, edges[i].owner,
+					edges[i].old_target,
+					edges[i].new_target);
 			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
 				(void *) edges[i].old_target,
 				(void *) edges[i].new_target, tag
@@ -18121,6 +18164,7 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 					edges[i].owner ?
 					FT_TK_MWA_DUAL_NAMED :
 					FT_TK_MWA_DUAL_UNNAMED));
+			}
 	}
 	return ft_flip_txn_commit(ft, t);
 }
@@ -18288,6 +18332,10 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 				 * acquired): MW, whatever the txn's mode.
 				 */
 				/* NAMED vs UNNAMED; the root branch is above. */
+			{
+				ft_flip_txn_doom_unheld_edge(t, edges[i].owner,
+					edges[i].old_target,
+					edges[i].new_target);
 				ft_flip_txn_record_tag_mw(t,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
@@ -18296,6 +18344,7 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 					FT_TK_MWA(edges[i].owner ?
 						FT_TK_MWA_DUAL_NAMED :
 						FT_TK_MWA_DUAL_UNNAMED));
+			}
 			else
 				ft_flip_txn_record_tag(t, edges[i].owner,
 					(void **) edges[i].slot,
