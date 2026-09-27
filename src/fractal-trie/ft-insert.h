@@ -5249,6 +5249,21 @@ restart_replace_attempt:
 					}
 					ft_replace_fault_arm_abort(txn);
 					/*
+					 * ☞ NAME THE HOLDER.  The edge writes the holder's own
+					 * external_nodes, the holder is the word this arm just
+					 * took, and the displaced head -- the edge's expected-old
+					 * -- is re-checked under that lock below.  Left unnamed,
+					 * the edge replay recorded it as an ownerless dual, MW:
+					 * FT_DEBUG_MW_KEPT's largest producer left on fine tries
+					 * (DUAL_UNNAMED, ~233k per ft_inv MW run).  Named and held,
+					 * the per-record gate parks it.  -DFT_DEBUG_IR_PREFIX_UNNAMED
+					 * leaves it unnamed.
+					 */
+#ifndef FT_DEBUG_IR_PREFIX_UNNAMED
+					sedge.owner = metadata;
+					sedge.owner_held = ft_flip_txn_owns(txn, metadata);
+#endif
+					/*
 					 * On a peer-conflict ABORT the commit installs
 					 * NOTHING: the old chain and its cell stay LIVE.
 					 * Dropping the status here reported the replace as
@@ -5490,6 +5505,21 @@ restart_replace_attempt:
 						goto insert_replace_done;
 					}
 					ft_replace_fault_arm_abort(txn);
+					/*
+					 * ☞ NAME THE HOLDER.  The edge writes the holder's own
+					 * external_nodes, the holder is the word this arm just
+					 * took, and the displaced head -- the edge's expected-old
+					 * -- is re-checked under that lock below.  Left unnamed,
+					 * the edge replay recorded it as an ownerless dual, MW:
+					 * FT_DEBUG_MW_KEPT's largest producer left on fine tries
+					 * (DUAL_UNNAMED, ~233k per ft_inv MW run).  Named and held,
+					 * the per-record gate parks it.  -DFT_DEBUG_IR_PREFIX_UNNAMED
+					 * leaves it unnamed.
+					 */
+#ifndef FT_DEBUG_IR_PREFIX_UNNAMED
+					sedge.owner = metadata;
+					sedge.owner_held = ft_flip_txn_owns(txn, metadata);
+#endif
 					/* Installs nothing on either failure, as the
 					 * head arm: ABORT -> -EAGAIN (retry),
 					 * MEMORY_ERROR -> -ENOMEM (do not). */
