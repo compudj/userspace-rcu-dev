@@ -39,7 +39,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 	struct cds_ft *detached;
 	struct cds_ft_inode_flag *child;
 	enum cds_ft_status status;
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 
 	*result_ft = NULL;
 
@@ -435,7 +435,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 * no ft_writer_lock_gp_wait anywhere in ft-remove.h -- so
 				 * a bracket around exactly it is provably clear of one.
 				 */
-				urcu_txn_begin(&optxn);
+				ft_op_begin(&optxn);
 				ft_lock_ctx_init(&lctx, &d, NULL, &optxn);
 				ret = ft_detach_node(ft, &lctx, d.nfp, d.pnfp, d.depth,
 						false, NULL, pubp, runp, NULL, NULL, 0,
@@ -443,7 +443,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 						NULL, NULL,
 						/* bulk: exclusive-only tier */
 						ft_in_place_delete_excl_ok(ft));
-				urcu_txn_end(&optxn);
+				ft_op_end(&optxn);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*

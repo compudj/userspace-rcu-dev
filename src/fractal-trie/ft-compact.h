@@ -825,7 +825,7 @@ void ft_compact_cell_at(struct cds_ft *ft, struct cds_ft_node *cell_head,
 static
 void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len, struct cds_ft_node *cell_head,
-		unsigned long *relocated, int *bail, struct urcu_txn *op)
+		unsigned long *relocated, int *bail, struct ft_op *op)
 {
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 	struct cds_ft_inode_flag **holder = &ft->root;
@@ -1031,7 +1031,7 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 	unsigned long relocated = 0;
 	bool resume_inclusive;
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 
 	ft_txn_op_init(ft, &optxn);
 	if (st->done)
@@ -1109,11 +1109,11 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 			st->done = true;
 			break;
 		}
-		urcu_txn_begin(&optxn);
+		ft_op_begin(&optxn);
 		ft_compact_descend(ft, key, key_len,
 				ft->group->ordered_list_set ? st->iter->node : NULL,
 				&relocated, &st->bail, &optxn);
-		urcu_txn_end(&optxn);
+		ft_op_end(&optxn);
 		/*
 		 * ☞ THE CELL IS NOW RELOCATED INSIDE THE WALK (ft_compact_descend),
 		 * the frame that has the chain's HOLDER and its depth, which is what

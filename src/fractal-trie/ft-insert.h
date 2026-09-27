@@ -72,7 +72,7 @@ struct ft_insert_commit {
 	 * persistent handle (_cds_ft_insert_replace) -- the arm then creates a
 	 * standalone per-attempt txn as before.
 	 */
-	struct urcu_txn *op;
+	struct ft_op *op;
 	struct cds_ft_inode_flag **slot;	/* forward-publish sentinel (one-commit
 						 * parked) -- the txn settles the edges */
 	/*
@@ -3785,7 +3785,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	 * because the txn is armed part-way through.
 	 */
 	struct ft_lock_ctx actx;
-	struct urcu_txn optxn;		/* persistent handle spanning the retry loop */
+	struct ft_op optxn;		/* persistent handle spanning the retry loop */
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
@@ -3841,7 +3841,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 restart_attempt:
 	FT_SH_STALL_TICK(ft, "_cds_ft_insert");
-	urcu_txn_begin(&optxn);
+	ft_op_begin(&optxn);
 	/*
 	 * Per-attempt setup, re-entered on a concurrent-writer conflict (a
 	 * pre-commit -EAGAIN or a commit ABORT): the failed attempt published
@@ -4516,7 +4516,7 @@ insert_done:
 	 */
 	if (cst == URCU_TXN_STATUS_ABORT) {
 		/* The commit already aged the handle (retry++, keep the turn). */
-		urcu_txn_end(&optxn);
+		ft_op_end(&optxn);
 		goto restart_attempt;
 	}
 	if (caa_unlikely(cst == URCU_TXN_STATUS_MEMORY_ERROR && ret == 0)) {
@@ -4538,7 +4538,7 @@ insert_done:
 	 * Terminal outcome (success or error): close this attempt's read-side
 	 * section and release the escalation turn if held.
 	 */
-	urcu_txn_end(&optxn);
+	ft_op_end(&optxn);
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
@@ -4928,7 +4928,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	int ret = 0;
 	struct ft_ord_cell *precell;
 	void *cell = NULL;		/* @precell's carrier; reused across retries */
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 	/*
 	 * ★ THE LOOP BELOW WAS UNINSTRUMENTED, and that is why nothing has ever
 	 * reported a livelock in it.  restart_replace_attempt carried no
@@ -5007,7 +5007,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 restart_replace_attempt:
 	ft_op_retry_tick(ft, &op_retry, ret);
-	urcu_txn_begin(&optxn);
+	ft_op_begin(&optxn);
 	/*
 	 * Per-attempt state.  A bailed attempt published nothing and its fresh
 	 * cluster was already rolled back, so re-arm @node's linkage and the
@@ -6360,7 +6360,7 @@ insert_replace_done:
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 	}
 
-	urcu_txn_end(&optxn);
+	ft_op_end(&optxn);
 	return ret;
 }
 
@@ -6507,7 +6507,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		struct cds_ft_node *old_node,
 		struct cds_ft_node *new_node,
 		bool *need_retry,
-		struct urcu_txn *op)
+		struct ft_op *op)
 {
 	struct cds_ft_inode_flag *holder_flag;
 	struct cds_ft_inode_flag **pub_slot;
@@ -7299,7 +7299,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		struct cds_ft_node *old_node,
 		struct cds_ft_node *new_node)
 {
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 	enum cds_ft_status s;
 	bool need_retry;
 	struct ft_op_retry retry;
@@ -7316,7 +7316,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	for (;;) {
 		need_retry = false;
 		ft_op_retry_tick(ft, &retry, 0);
-		urcu_txn_begin(&optxn);
+		ft_op_begin(&optxn);
 		s = _cds_ft_replace_locked(ft, iter, old_node, new_node,
 				&need_retry, &optxn);
 		if (!need_retry)
@@ -7324,6 +7324,6 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		/* Age the conflict, keep the FIFO turn, close the attempt. */
 		ft_txn_attempt_bail(&optxn, true);
 	}
-	urcu_txn_end(&optxn);
+	ft_op_end(&optxn);
 	return s;
 }

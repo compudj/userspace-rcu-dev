@@ -1555,7 +1555,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		unsigned long cnt_dst, unsigned int off_dst,
 		size_t dst_key_len,
 		struct ft_flip_txn **pre_txn, bool *contended,
-		struct urcu_txn *op)
+		struct ft_op *op)
 {
 	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
@@ -2752,14 +2752,14 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * nothing for an escalation turn to win.
 	 */
 	const bool rm_bracket = dst_ft->lock_fine;
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 	bool rm_open = false;
 
 	if (rm_bracket)
 		ft_txn_op_init(dst_ft, &optxn);
 retry_merge:
 	if (rm_bracket) {
-		urcu_txn_begin(&optxn);
+		ft_op_begin(&optxn);
 		rm_open = true;
 	}
 	RSPIN_ENTER_X(0, rm_depth, 0, rm_bracket);
@@ -3409,7 +3409,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * contract that syncs nowhere, and it is where every one of those
 	 * 585250 declines was measured (livesrc=0).
 	 */
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 
 	MRG_SPIN_PROBE(0);
 	ft_txn_op_init(dst_ft, &optxn);
@@ -3450,7 +3450,7 @@ merge_spine_retry:
 		 * exclusive dst).  RCU read sections nest; @md_rlock now marks
 		 * both, and every site that releases it closes the txn too.
 		 */
-		urcu_txn_begin(&optxn);
+		ft_op_begin(&optxn);
 		dst_ft->group->flavor->read_lock();
 		md_rlock = true;
 	}
@@ -3546,7 +3546,7 @@ merge_spine_retry:
 		}
 		if (md_rlock) {
 			dst_ft->group->flavor->read_unlock();
-			urcu_txn_end(&optxn);
+			ft_op_end(&optxn);
 			md_rlock = false;
 		}
 		FT_TP(merge_exit, (int) status);
@@ -3561,7 +3561,7 @@ merge_spine_retry:
 	 */
 	if (md_rlock) {
 		dst_ft->group->flavor->read_unlock();
-		urcu_txn_end(&optxn);
+		ft_op_end(&optxn);
 		md_rlock = false;
 	}
 

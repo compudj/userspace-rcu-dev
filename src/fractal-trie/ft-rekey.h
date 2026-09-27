@@ -2555,7 +2555,7 @@ int ft_rekey_merge_cow_after_decide(struct cds_ft *ft,
 static
 int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 		struct ft_descent *d_dst, struct ft_flip_txn *txn,
-		struct urcu_txn *optxn, struct ft_glue *glue,
+		struct ft_op *optxn, struct ft_glue *glue,
 		struct cds_ft_inode_flag *merged_pub,
 		const uint8_t *src_ord, size_t src_len, const uint8_t *dst_ord,
 		struct cds_ft_inode_flag *src_pnf,
@@ -2969,7 +2969,7 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 static
 int ft_rekey_merge_cow_after_detach(struct cds_ft *ft,
 		struct ft_descent *d_dst, struct ft_flip_txn *txn,
-		struct urcu_txn *optxn, struct ft_glue *glue,
+		struct ft_op *optxn, struct ft_glue *glue,
 		const struct ft_rekey_cow_after *after,
 		const struct ft_detach_recompact_out *detach_rc,
 		struct ft_held_anchor *marks, unsigned int *nr_marks,
@@ -3056,7 +3056,7 @@ static
 int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
 		const uint8_t *dst_key, size_t dst_len,
-		bool require_empty, bool len_fits, struct urcu_txn *optxn)
+		bool require_empty, bool len_fits, struct ft_op *optxn)
 {
 	uint8_t src_ord[FT_MAX_KEY_LEN], dst_ord[FT_MAX_KEY_LEN];
 	struct cds_ft_inode_flag *s_top, *s_top_prime = NULL, *attached_nf = NULL;
@@ -4119,7 +4119,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				 * -digit retries) and far below a livelock (the
 				 * measured one ran 193k attempts).
 				 */
-				if (optxn->retry < FT_REKEY_UNCOVERED_AFTER)
+				if (optxn->txn.retry < FT_REKEY_UNCOVERED_AFTER)
 					return -EAGAIN;
 				/*
 				 * Aged out, so the reading is STRUCTURAL: the
@@ -8519,7 +8519,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * attempt one there is none -- so seed it rather than read an
 	 * indeterminate local into a trace field.
 	 */
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 	bool len_fits;
 	int ret = 0;
 
@@ -8655,7 +8655,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * period in the process, so quiescing here is what keeps a contended move
 	 * from wedging the peers that wait on one.
 	 */
-	urcu_txn_set_park_quiescent(&optxn, 1);
+	ft_op_set_park_quiescent(&optxn, 1);
 	ft_op_retry_init(&op_retry, FT_OP_REKEY, src_key, src_len);
 	for (;;) {
 		/*
@@ -8695,7 +8695,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 			abort();
 		}
 #endif
-		urcu_txn_begin(&optxn);
+		ft_op_begin(&optxn);
 		/*
 		 * PER ATTEMPT, not around the loop.  The pin exists to keep the
 		 * nodes ONE attempt captures alive from descent through commit, and
@@ -8711,7 +8711,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		/* Age the conflict, as cds_ft_replace does; the turn is forfeited. */
 		ft_txn_attempt_bail(&optxn, true);
 	}
-	urcu_txn_end(&optxn);
+	ft_op_end(&optxn);
 	/*
 	 * A COMMITTED move can LENGTHEN every key it carried (@dst_len > @src_len),
 	 * so raise the trie's high-water hint the same way ft_rekey_at_inner does
@@ -10629,7 +10629,7 @@ static enum cds_ft_status ft_rekey_at_inner(struct cds_ft *dst_ft,
 	 * contract that syncs nowhere, and it is where every one of those
 	 * 585250 declines was measured (livesrc=0).
 	 */
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 
 	MRG_SPIN_PROBE(0);
 	ft_txn_op_init(dst_ft, &optxn);
@@ -10670,7 +10670,7 @@ merge_spine_retry:
 		 * exclusive dst).  RCU read sections nest; @md_rlock now marks
 		 * both, and every site that releases it closes the txn too.
 		 */
-		urcu_txn_begin(&optxn);
+		ft_op_begin(&optxn);
 		dst_ft->group->flavor->read_lock();
 		md_rlock = true;
 	}
@@ -10728,7 +10728,7 @@ merge_spine_retry:
 		 */
 		if (md_rlock) {
 			dst_ft->group->flavor->read_unlock();
-			urcu_txn_end(&optxn);
+			ft_op_end(&optxn);
 			md_rlock = false;
 		}
 		return CDS_FT_STATUS_NOT_SUPPORTED;
@@ -10786,7 +10786,7 @@ merge_spine_retry:
 		}
 		if (md_rlock) {
 			dst_ft->group->flavor->read_unlock();
-			urcu_txn_end(&optxn);
+			ft_op_end(&optxn);
 			md_rlock = false;
 		}
 		FT_TP(merge_exit, (int) status);
@@ -10802,7 +10802,7 @@ merge_spine_retry:
 	 */
 	if (md_rlock) {
 		dst_ft->group->flavor->read_unlock();
-		urcu_txn_end(&optxn);
+		ft_op_end(&optxn);
 		md_rlock = false;
 	}
 

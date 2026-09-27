@@ -125,6 +125,19 @@
 #include <urcu/fair-mutex.h>	/* MW coarse lock-mode FT-wide writer lock */
 #include <urcu/rcu-txn.h>
 #include <urcu/rcu-txn-list.h>
+
+/*
+ * THE FT OP HANDLE.  One per operation, spanning its retry loop.  @txn is the
+ * commit engine's handle: each attempt opens and closes it (ft_op_begin /
+ * ft_op_end), and a flip txn built on the op (ft_flip_txn_create_on) records
+ * into it.  The op is FT's own type so that FT policy -- the escalation lane
+ * that serializes a starving op, and the retry age that earns it -- can live
+ * with FT rather than with one engine: the SW engine (<urcu/rcu-txn-sw.h>)
+ * has no lane.
+ */
+struct ft_op {
+	struct urcu_txn txn;
+};
 #include <urcu/rculfhash.h>
 #include <urcu/arch.h>
 #include <urcu/assert.h>	/* urcu_assert_debug: the engine self-checks' arm */

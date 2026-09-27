@@ -3351,13 +3351,35 @@ static inline void ft_hold_trace_leak_canary(void) { }
 #endif
 
 static inline
-void ft_txn_op_init(struct cds_ft *ft, struct urcu_txn *op)
+void ft_txn_op_init(struct cds_ft *ft, struct ft_op *op)
 {
 	ft_hold_trace_leak_canary();
 	if (ft->exclusive)
-		urcu_txn_init_flavor(op, NULL, NULL);
+		urcu_txn_init_flavor(&op->txn, NULL, NULL);
 	else
-		urcu_txn_init_flavor(op, &ft->txn_domain, ft->group->flavor);
+		urcu_txn_init_flavor(&op->txn, &ft->txn_domain,
+			ft->group->flavor);
+}
+
+/* Open one attempt of the op's retry loop. */
+static inline
+void ft_op_begin(struct ft_op *op)
+{
+	urcu_txn_begin(&op->txn);
+}
+
+/* Close the attempt ft_op_begin() opened.  Always paired with it. */
+static inline
+void ft_op_end(struct ft_op *op)
+{
+	urcu_txn_end(&op->txn);
+}
+
+/* See urcu_txn_set_park_quiescent: only an op entered from no read section. */
+static inline
+void ft_op_set_park_quiescent(struct ft_op *op, int on)
+{
+	urcu_txn_set_park_quiescent(&op->txn, on);
 }
 
 /*
@@ -3372,10 +3394,10 @@ void ft_txn_op_init(struct cds_ft *ft, struct urcu_txn *op)
  * flag set beside begin() cannot.
  */
 static inline
-void ft_txn_attempt_end(struct urcu_txn *op, bool open)
+void ft_txn_attempt_end(struct ft_op *op, bool open)
 {
 	if (open)
-		urcu_txn_end(op);
+		ft_op_end(op);
 }
 
 /*
@@ -3487,10 +3509,10 @@ static inline void ft_dbg_held_at(const struct cds_ft_metadata *meta, int line)
 #endif
 
 static inline
-void ft_txn_attempt_bail(struct urcu_txn *op, bool open)
+void ft_txn_attempt_bail(struct ft_op *op, bool open)
 {
 	if (open) {
-		urcu_txn_conflict(op);
+		urcu_txn_conflict(&op->txn);
 		/*
 		 * Then once per refused lock-set.  An attempt that lost three
 		 * acquires waited on three peers, and folding them into the one
@@ -3498,10 +3520,10 @@ void ft_txn_attempt_bail(struct urcu_txn *op, bool open)
 		 * to rescue.
 		 */
 		while (ft_acq_contended) {
-			urcu_txn_conflict(op);
+			urcu_txn_conflict(&op->txn);
 			ft_acq_contended--;
 		}
-		urcu_txn_end(op);
+		ft_op_end(op);
 	}
 	/*
 	 * Refusals from an attempt that went on to SUCCEED belong to no retry.
@@ -3537,7 +3559,7 @@ uint64_t ft_linger_now_ns(void)
 }
 
 static inline
-void ft_dlm_linger(struct urcu_txn *op)
+void ft_dlm_linger(struct ft_op *op)
 {
 	const struct cds_ft_metadata *w = ft_linger_word;
 	uint64_t t0;
@@ -3552,7 +3574,7 @@ void ft_dlm_linger(struct urcu_txn *op)
 	 * rates the mechanism itself deflated.  The measured victims are all
 	 * at the lane head, so this gate loses none of the target class.
 	 */
-	if (op->retry < URCU_TXN_FALLBACK_MIN)
+	if (op->txn.retry < URCU_TXN_FALLBACK_MIN)
 		return;
 	if (!(CMM_LOAD_SHARED(w->state) & FT_STATE_LOCK))
 		return;
@@ -3978,7 +4000,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_at(FT_TK_SITE_PARAM
  */
 static inline
 struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
-		struct cds_ft *ft, struct urcu_txn *op)
+		struct cds_ft *ft, struct ft_op *op)
 {
 	struct ft_flip_txn *t = (struct ft_flip_txn *) malloc(sizeof(*t));
 
@@ -3988,7 +4010,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 #ifdef FT_DEBUG_HIDDEN_FILL
 	t->nr_hidden = 0;	/* ☠ a REUSED struct is the PREVIOUS op */
 #endif
-	t->mtxn = op;
+	t->mtxn = &op->txn;
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->committed = false;
@@ -4078,7 +4100,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
  */
 static inline
 struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
-		struct cds_ft *ft, struct urcu_txn *op, unsigned int cap)
+		struct cds_ft *ft, struct ft_op *op, unsigned int cap)
 {
 	struct ft_flip_txn *t;
 
@@ -4098,8 +4120,8 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 #ifdef FT_DEBUG_HIDDEN_FILL
 	t->nr_hidden = 0;	/* ☠ a REUSED struct is the PREVIOUS op */
 #endif
-	t->mtxn = op;
-	if (urcu_txn_reserve(op, cap) < 0) {
+	t->mtxn = &op->txn;
+	if (urcu_txn_reserve(t->mtxn, cap) < 0) {
 		ft_flip_txn_free(t);
 		return NULL;
 	}
@@ -7351,7 +7373,7 @@ struct ft_lock_ctx {
 	 * and then a peer can hold a member while a lane-holding writer spins
 	 * for it.  NULL builds a standalone acquire txn, as before.
 	 */
-	struct urcu_txn *op;
+	struct ft_op *op;
 };
 
 /*
@@ -7657,7 +7679,7 @@ int ft_member_node_snap(const struct ft_lock_ctx *ctx,
  */
 static inline
 void ft_lock_ctx_init(struct ft_lock_ctx *ctx, const struct ft_descent *d,
-		struct ft_flip_txn *txn, struct urcu_txn *op)
+		struct ft_flip_txn *txn, struct ft_op *op)
 {
 	ctx->d = d;
 	ctx->held.txn = txn;
@@ -11938,7 +11960,7 @@ void ft_acq_lane_backoff(const struct cds_ft *ft,
 
 	if (!ctx || !ctx->op || !ft)
 		{ FT_LANE(no_ctx); return; }
-	dom = ctx->op->domain;
+	dom = ctx->op->txn.domain;
 	if (!dom)
 		{ FT_LANE(no_dom); return; }
 	if (ft_acq_contended < FT_ACQ_LANE_AGE)
@@ -13235,7 +13257,7 @@ e2_closing:
 		sl->meta = taken[i];
 		sl->fn = fn;
 		sl->line = line;
-		sl->op_bound = !!(ctx && ctx->op && ctx->op->domain);
+		sl->op_bound = !!(ctx && ctx->op && ctx->op->txn.domain);
 		sl->tid = (unsigned long) pthread_self();
 		sl->ts_ns = ft_dbg_now_ns();
 		/*
@@ -14505,7 +14527,7 @@ static inline
 int ft_root_attach_fence_empty(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag **root_out,
 		struct cds_ft_metadata **meta_out, uintptr_t *snap_out,
-		bool *shared_out, struct urcu_txn *op)
+		bool *shared_out, struct ft_op *op)
 {
 	unsigned int attempt;
 
@@ -21583,7 +21605,7 @@ struct ft_glue {
 	 * glue builds can age it on a refused acquire (ft_dlm_acquire_set).
 	 * NULL where the op has none.
 	 */
-	struct urcu_txn *op;
+	struct ft_op *op;
 	struct ft_glue_deferred_edge *deferred;
 	int nr_deferred;
 	int cap_deferred;

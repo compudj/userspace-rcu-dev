@@ -8326,7 +8326,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node,
 		bool *need_retry,
-		struct urcu_txn *op)
+		struct ft_op *op)
 {
 	/*
 	 * Anchor source for the op's lock-sets, populated only where a descent
@@ -9550,7 +9550,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node)
 {
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 	struct ft_op_retry op_retry;
 	enum cds_ft_status s;
 	bool need_retry;
@@ -9616,7 +9616,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		ft_tA = ft_dbg_now_ns();
 #endif
-		urcu_txn_begin(&optxn);
+		ft_op_begin(&optxn);
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		ft_tB = ft_dbg_now_ns();
 		ft_acc_begin += ft_tB - ft_tA;
@@ -9641,11 +9641,11 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				"retry=%lu in_fallback=%d(th %d) "
 				"fb_published=%d active=%d "
 				"dirtyLOCK=%u dirtyOTHER=%u cabort=%u\n",
-				ft_remove_attempts, optxn.retry,
-				optxn.in_fallback, urcu_txn_in_fallback(),
-				optxn.fb_published,
-				optxn.domain ? (int) uatomic_load(
-					&optxn.domain->active, CMM_RELAXED)
+				ft_remove_attempts, optxn.txn.retry,
+				optxn.txn.in_fallback, urcu_txn_in_fallback(),
+				optxn.txn.fb_published,
+				optxn.txn.domain ? (int) uatomic_load(
+					&optxn.txn.domain->active, CMM_RELAXED)
 					: -1,
 				ft_dbg_acq_dirty_lock, ft_dbg_acq_dirty_other,
 				ft_dbg_acq_cabort);
@@ -9756,7 +9756,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		ft_acc_bail += ft_dbg_now_ns() - ft_tC;
 #endif
 	}
-	urcu_txn_end(&optxn);
+	ft_op_end(&optxn);
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 	{
 		uint64_t wall = ft_dbg_now_ns() - ft_remove_t0;
@@ -9900,7 +9900,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node **result_node,
 		bool *need_retry,
-		struct urcu_txn *op)
+		struct ft_op *op)
 {
 	struct cds_ft_node *chain_head;
 	struct cds_ft_inode_flag *holder_flag;
@@ -10749,7 +10749,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node **result_node)
 {
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 	struct ft_op_retry op_retry;
 	enum cds_ft_status s;
 	bool need_retry;
@@ -10768,7 +10768,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	for (;;) {
 		need_retry = false;
 		ft_op_retry_tick(ft, &op_retry, 0);
-		urcu_txn_begin(&optxn);
+		ft_op_begin(&optxn);
 		s = _cds_ft_remove_all_locked(ft, iter, result_node,
 				&need_retry, &optxn);
 		if (!need_retry)
@@ -10776,7 +10776,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		/* Age the conflict, keep the FIFO turn, close the attempt. */
 		ft_txn_attempt_bail(&optxn, true);
 	}
-	urcu_txn_end(&optxn);
+	ft_op_end(&optxn);
 	return s;
 }
 

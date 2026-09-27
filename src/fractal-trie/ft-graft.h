@@ -2088,7 +2088,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	 * root-only spacing.  Scoping the handle to the retry loop left that
 	 * acquire with nothing to age.
 	 */
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 	struct cds_ft_metadata *src_rmeta;
 
 	/*
@@ -2506,7 +2506,7 @@ retry_attach:
 		 * escalates here, and escalation blocks on the domain's fair mutex.
 		 */
 		if (ra_txn)
-			urcu_txn_begin(&optxn);
+			ft_op_begin(&optxn);
 		RSPIN_ENTER_X(2, ra_depth, 1, ra_txn);
 		/*
 		 * Preallocate a fresh empty root for the source trie
@@ -3942,14 +3942,14 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	 * re-evaluated condition is a second chance to disagree with the entry.
 	 */
 	const bool gs_bracket = dst_ft->lock_fine && swap_ft->exclusive;
-	struct urcu_txn optxn;
+	struct ft_op optxn;
 	bool gs_open = false;
 
 	if (gs_bracket)
 		ft_txn_op_init(dst_ft, &optxn);
 retry_swap:
 	if (gs_bracket) {
-		urcu_txn_begin(&optxn);
+		ft_op_begin(&optxn);
 		gs_open = true;
 	}
 	/*
