@@ -1267,7 +1267,7 @@ void ft_ab_note_lost(const struct urcu_txn_desc *t,
 #define FT_SS_DEPTH	12
 
 static unsigned long ft_ss_tab[FT_SS_HAD][FT_AB_CLS_NR][2][2][2][2][2];
-static unsigned long ft_ss_total;
+static unsigned long ft_ss_total, ft_ss_declared;
 /*
  * The LOCK bit's transition on each side of the pair, for the words that
  * carry one (every class but RANK): 0 no lock bit, 1 RELEASE (L -> ~L),
@@ -1316,6 +1316,10 @@ void ft_ss_note(const struct urcu_txn_record *r, void *old_ptr,
 	void *pc[FT_SS_DEPTH + 1];
 	int depth;
 
+	if (ft_ss_fold_depth) {
+		uatomic_inc(&ft_ss_declared);
+		return;
+	}
 	if (hc >= FT_SS_HAD)
 		hc = FT_AB_UNSET;
 	if (gc >= FT_AB_CLS_NR)
@@ -1369,7 +1373,9 @@ void ft_ss_report(void)
 	unsigned int hc, gc, hk, gk, hv, gv, ch, i, j;
 
 	fprintf(stderr, "=== FT_DEBUG_SAME_SLOT: records added onto a slot the "
-		"descriptor already holds: %lu ===\n", ft_ss_total);
+		"descriptor already holds: %lu, plus %lu DECLARED folds "
+		"(the SW engine's record_chain sites) ===\n", ft_ss_total,
+		ft_ss_declared);
 	fprintf(stderr, "  %-14s %-14s had got  had-val got-val chained %12s\n",
 		"had", "got", "n");
 	for (hc = 0; hc < FT_SS_HAD; hc++)

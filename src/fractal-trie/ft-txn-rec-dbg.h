@@ -246,6 +246,18 @@ static void ft_ss_note(const struct urcu_txn_record *r, void *old_ptr,
 
 #define URCU_TXN_REC_DBG_SAME_SLOT(r, o, n, up, k)	\
 	ft_ss_note((r), (o), (n), (up), (k))
+/*
+ * A DECLARED FOLD: a producer whose write site is COMPUTED, so a second
+ * record on one slot is its design, not an accident -- the rank count walks
+ * (several walks add deltas to a shared ancestor's nr_keys) and the glue's
+ * deferred re-home (a back edge re-aimed after an earlier step of the same
+ * txn aimed it).  Those map to the SW engine's fusing pair
+ * (urcu_txn_sw_load + urcu_txn_sw_record_chain); every other same-slot hit
+ * must be made distinct.  The census counts the two apart.
+ */
+static __thread int ft_ss_fold_depth;
+# define FT_SS_FOLD_BEGIN()	do { ft_ss_fold_depth++; } while (0)
+# define FT_SS_FOLD_END()	do { ft_ss_fold_depth--; } while (0)
 #endif
 
 #ifdef FT_WINNER_DBG
@@ -408,6 +420,11 @@ static void ft_dt_will_write(const struct urcu_txn_record *r, void *v);
 # elif defined(FT_DEBUG_SLOT_HIST)
 #  define URCU_TXN_REC_WROTE(r, v)	ft_sh_note((r), (void *) (v))
 # endif
+#endif
+
+#ifndef FT_SS_FOLD_BEGIN
+# define FT_SS_FOLD_BEGIN()	do { } while (0)
+# define FT_SS_FOLD_END()	do { } while (0)
 #endif
 
 #endif /* _FT_TXN_REC_DBG_H */

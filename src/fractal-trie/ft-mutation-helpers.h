@@ -9246,6 +9246,37 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 }
 
 /*
+ * A SAME-VALUE record ({v -> v}, a validate) onto a slot this txn already
+ * records with pending value @v adds nothing: it would validate the txn's own
+ * pending write.  The MW front end fuses it away; the SW engine's blind
+ * append would park a second proxy on the slot.  So neither funnel records
+ * it (the same-slot census, -DFT_DEBUG_SAME_SLOT, found 158 per ft_unit run:
+ * a child's consumed-mark edge {live -> live} recorded again when the glue
+ * re-homed that child a second time in the same txn).
+ * -DFT_DEBUG_NOOP_RERECORD records it anyway.
+ */
+static inline
+bool ft_flip_txn_record_is_noop(const struct ft_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr)
+{
+#ifdef FT_DEBUG_NOOP_RERECORD
+	(void) t; (void) slot; (void) old_ptr; (void) new_ptr;
+	return false;
+#else
+	struct urcu_txn_desc *d;
+	const struct urcu_txn_record *r;
+
+	if (old_ptr != new_ptr || !t->mtxn)
+		return false;
+	d = t->mtxn->desc;
+	if (!d || d == URCU_TXN_ENOMEM)
+		return false;
+	r = urcu_txn_find(d, slot);
+	return r && r->new_ptr == old_ptr;
+#endif
+}
+
+/*
  * Record one structural edge (FT's type-7 / 0xF proxy tag) directly into the
  * txn.  Used by the GLUE flip-txn fold and the single-commit ops, whose txn was
  * pre-reserved to its bounded edge count (create_bounded / ft_flip_txn_reserve),
@@ -9294,6 +9325,8 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 
 	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
+	if (ft_flip_txn_record_is_noop(t, slot, old_ptr, new_ptr))
+		return;
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	if (!FT_TK_TXN_IS_TAKE(t)) {
 		void *pc0 = __builtin_return_address(0);
@@ -9791,6 +9824,8 @@ void __ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 
 	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
+	if (ft_flip_txn_record_is_noop(t, slot, old_ptr, new_ptr))
+		return;
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	ft_sa_rec_count(FT_TK_TXN_SITE(t), __builtin_return_address(0),
 		FT_SA_CALLER_PC(),
@@ -20697,10 +20732,17 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		 * makes the park safe on the abort path too: settle() writes
 		 * old_ptr BLIND, so a derived old would be published.
 		 */
+		/*
+		 * A DECLARED FOLD: another walk of this txn may already carry a
+		 * delta on this ancestor, and this one chains onto it (see
+		 * FT_SS_FOLD_BEGIN).
+		 */
+		FT_SS_FOLD_BEGIN();
 		ft_flip_txn_record_tag_mw(t, (void **) &m->nr_keys,
 			(void *) old_raw, (void *) new_raw,
 			FT_NR_KEYS_PROXY_TAG
 			FT_TK_MWA(FT_TK_MWA_RANK));
+		FT_SS_FOLD_END();
 		cur = ft_parent_node(m->parent_word);
 	}
 }
@@ -24809,10 +24851,18 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 					ft_skip_child_ptr(g->deferred[i].child));
 			}
 #endif
+			/*
+			 * A DECLARED FOLD: an earlier step of this txn can have
+			 * re-homed the same child already (the COW sweep, the
+			 * detach), and this edge re-aims that record (see
+			 * FT_SS_FOLD_BEGIN).
+			 */
+			FT_SS_FOLD_BEGIN();
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
 				g->deferred[i].parent, g->deferred[i].slot,
 				g->deferred[i].held_lock, /*hold_ctx=*/ NULL,
 				/*check_child=*/ true);
+			FT_SS_FOLD_END();
 			continue;
 		}
 		ft_set_parent(ft, g->deferred[i].child, g->deferred[i].parent,
@@ -24960,10 +25010,18 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		 * Every non-fold caller keeps structural_sw false and is byte-identical.
 		 */
 		if (g->txn->structural_sw) {
+			/*
+			 * A DECLARED FOLD: an earlier step of this txn can have
+			 * re-homed the same child already (the COW sweep, the
+			 * detach), and this edge re-aims that record (see
+			 * FT_SS_FOLD_BEGIN).
+			 */
+			FT_SS_FOLD_BEGIN();
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
 				g->deferred[i].parent, g->deferred[i].slot,
 				g->deferred[i].held_lock, /*hold_ctx=*/ NULL,
 				/*check_child=*/ true);
+			FT_SS_FOLD_END();
 			continue;
 		}
 		ft_glue_record_back_edge(ft, g->txn, g->deferred[i].child,
