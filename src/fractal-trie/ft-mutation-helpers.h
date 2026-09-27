@@ -10049,6 +10049,23 @@ void __ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
 	if (ft_flip_txn_record_is_noop(t, slot, old_ptr, new_ptr))
 		return;
+	/*
+	 * ☞ A DOOMED TXN RECORDS NO MW.  @acquire_miss means a lock-set member
+	 * was not taken, and ft_flip_txn_commit then discards the txn: nothing
+	 * recorded here can ever be installed.  The one population that reached
+	 * this with a miss is the SKIP_X dual into a grandparent the op failed
+	 * to take (ft_lock_skip_dual_gp's MISS exit, twelve callers, each
+	 * carrying on to its discarding commit): measured by FT_DEBUG_MW_KEPT's
+	 * record-time count as the whole of ft_inv MW's MW records, ~20k per run,
+	 * none committed.  The SW engine takes no MW record at all -- not even
+	 * one bound for a discard -- so the funnel drops it.  SW records are
+	 * untouched, so an op that reads its own pending values reads the same.
+	 * -DFT_DEBUG_MW_IN_DOOMED_TXN records them anyway.
+	 */
+#ifndef FT_DEBUG_MW_IN_DOOMED_TXN
+	if (caa_unlikely(t->acquire_miss))
+		return;
+#endif
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	ft_sa_rec_count(FT_TK_TXN_SITE(t), __builtin_return_address(0),
 		FT_SA_CALLER_PC(),
