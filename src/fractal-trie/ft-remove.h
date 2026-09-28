@@ -3212,7 +3212,24 @@ int ft_detach_node(struct cds_ft *ft,
 	 * carries external_nodes, so this gate is a no-op for them.
 	 */
 	if (free_detached_subtree) {
-		struct cds_ft_inode_flag *detach_child = *detach_node_flag_ptr;
+		/*
+		 * ☠ ONE RESOLUTION FOR BOTH USES.  The leaf check below and the
+		 * external_nodes capture after it must judge the SAME value.  The
+		 * slot can hold a peer's parked proxy, and a proxy resolves
+		 * through a decision that may flip between two resolutions: the
+		 * check resolved it UNDECIDED, to the old value (our leaf), and
+		 * passed; the capture resolved it DECIDED, to the peer's fresh
+		 * junction, and took the junction's external_nodes -- our leaf --
+		 * as a chain to promote.  The climb then pruned the boundary and
+		 * published the leaf this op removes into the boundary's slot,
+		 * frozen, with its cell already unspliced: every later insert
+		 * whose predecessor search lands on it planned against the dead
+		 * cell and retried for ever.  MEASURED (ft_inv 147,
+		 * inv_prefix_pair_compressed_holder: a two-insert livelock after
+		 * a remove committed root[96]: compressed -> the removed leaf).
+		 */
+		struct cds_ft_inode_flag *detach_child =
+			ft_resolve_flip_proxy(*detach_node_flag_ptr);
 
 		/*
 		 * ☠ THE SLOT MUST STILL HOLD THE CALLER'S LEAF.  Every destroy-
@@ -3230,8 +3247,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 #ifndef FT_DEBUG_NO_LEAF_IDENTITY
 		if (freeze_leaf && caa_unlikely((struct cds_ft_node *)
-				ft_node_ptr(ft_resolve_flip_proxy(detach_child)) !=
-					freeze_leaf))
+				ft_node_ptr(detach_child) != freeze_leaf))
 			return -EAGAIN;
 #endif
 		/*
@@ -3239,8 +3255,9 @@ int ft_detach_node(struct cds_ft *ft,
 		 * entry-holder read below at :2373 does exactly this:
 		 * ft_reanchor_flag(ft, ft_resolve_flip_proxy(raw), ...)).
 		 *
-		 * ☠ THE FLIP-PROXY HALF WAS MISSING HERE, AND IT FAULTS.  This
-		 * slot is loaded RAW above, and a concurrent one-commit splice
+		 * ☠ THE FLIP-PROXY HALF WAS MISSING HERE, AND IT FAULTS.  (It is
+		 * now done once, at the load above -- see there for why once.)
+		 * This slot can hold a parked proxy: a concurrent one-commit splice
 		 * parks a type-7 MCAS descriptor in it; the low nibble 0xF then
 		 * fails ft_node_external, so the type check below admits it and
 		 * ft_flag_to_metadata computes a metadata address from a
@@ -3264,8 +3281,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 * as a CAS expected-old -- the same argument the entry-holder
 		 * read below makes for @cur.
 		 */
-		detach_child = ft_resolve_skip_compressed(ft,
-			ft_resolve_flip_proxy(detach_child));
+		detach_child = ft_resolve_skip_compressed(ft, detach_child);
 
 		if (detach_child && !ft_node_external(detach_child)) {
 			struct cds_ft_metadata *child_meta =
