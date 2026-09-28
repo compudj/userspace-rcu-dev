@@ -210,7 +210,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 						*_replace_old_ptr = true;
 				} else {
 					/*
-					 * Recompact-on-insert (default): refilling a
+					 * Recompact-on-insert (tier off): refilling a
 					 * soft-deleted hole (bit sticky-set, slot NULL)
 					 * bumps this LIVE node's nr_child -- report
 					 * -ERANGE so the wrapper routes through
@@ -220,6 +220,18 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * place (also avoids recompact-within-recompact).
 					 */
 					if (!in_place && !defer_parent)
+						return -ERANGE;
+					/*
+					 * ...AND ONLY AT THE END OF THE SUBKEYS.  An
+					 * in-place insert appends (Cases 2A/2B) and
+					 * every other byte recompacts (Case 3); a hole
+					 * is no exception.  One BELOW a live subkey is
+					 * not the end, so its refill goes through the
+					 * recompact too.  Pointer order is key order,
+					 * so the end is the last rank.
+					 */
+					if (!defer_parent && qp_ptr_idx + 1 !=
+							(unsigned int) __builtin_popcountll(qp_bms))
 						return -ERANGE;
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
@@ -391,7 +403,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 						*_replace_old_ptr = true;
 				} else {
 					/*
-					 * Recompact-on-insert (default): refilling a
+					 * Recompact-on-insert (tier off): refilling a
 					 * soft-deleted hole (bit sticky-set, slot NULL)
 					 * bumps this LIVE node's nr_child -- report
 					 * -ERANGE so the wrapper routes through
@@ -401,6 +413,10 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * place (also avoids recompact-within-recompact).
 					 */
 					if (!in_place && !defer_parent)
+						return -ERANGE;
+					/* ...and only at the end of the subkeys (see the first arm). */
+					if (!defer_parent && qp_ptr_idx + 1 !=
+							(unsigned int) __builtin_popcountll(qp_bms))
 						return -ERANGE;
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
@@ -589,7 +605,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 						*_replace_old_ptr = true;
 				} else {
 					/*
-					 * Recompact-on-insert (default): refilling a
+					 * Recompact-on-insert (tier off): refilling a
 					 * soft-deleted hole (bit sticky-set, slot NULL)
 					 * bumps this LIVE node's nr_child -- report
 					 * -ERANGE so the wrapper routes through
@@ -599,6 +615,11 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * place (also avoids recompact-within-recompact).
 					 */
 					if (!in_place && !defer_parent)
+						return -ERANGE;
+					/* ...and only at the end of the subkeys (see the first arm). */
+					if (!defer_parent && qp_ptr_idx + 1 !=
+							ft_popcount_2l_node_get_nr_child(
+								type, node))
 						return -ERANGE;
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
@@ -736,7 +757,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					*_replace_old_ptr = true;
 			} else {
 				/*
-				 * Recompact-on-insert (default): refilling a
+				 * Recompact-on-insert (tier off): refilling a
 				 * soft-deleted hole (bit sticky-set, slot NULL) bumps
 				 * this LIVE node's nr_child -- report -ERANGE so the
 				 * wrapper routes through ft_node_recompact(ADD_SAME)
@@ -745,6 +766,13 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				 * place (also avoids recompact-within-recompact).
 				 */
 				if (!in_place && !defer_parent)
+					return -ERANGE;
+				/* ...and only at the end of the subkeys (see the first arm). */
+				if (!defer_parent && ptr_idx + 1 != (unsigned int)
+						(__builtin_popcountll(bm[0]) +
+						__builtin_popcountll(bm[1]) +
+						__builtin_popcountll(bm[2]) +
+						__builtin_popcountll(bm[3])))
 					return -ERANGE;
 				if (_replace_old_ptr)
 					*_replace_old_ptr = false;

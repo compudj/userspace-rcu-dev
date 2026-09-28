@@ -587,7 +587,10 @@ int ft_op_in_lane(void)
  * the node, on shared tries too (the three point-remove ft_detach_node calls,
  * since 2026-09-16).  Delete-on / insert-off is a supported mix: refilling a
  * soft-deleted hole is itself an insert-tier store, so with the insert tier
- * off the refill reports -ERANGE and the recompact drops the hole.  On EVERY
+ * off the refill reports -ERANGE and the recompact drops the hole.  With it
+ * on, a popcount node refills in place only a hole at its END, the one
+ * position an append would take; a hole below a live subkey recompacts too
+ * (in-place inserts happen at the end of the subkeys, never before).  On EVERY
  * trie type: what makes the insert store safe
  * against concurrent WRITERS is that the op HOLDS the node before it writes --
  * the node's DLM lock, or its anchor at a coarser spacing, or the FT-wide lock
