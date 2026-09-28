@@ -795,7 +795,8 @@ bool ft_insert_lock_skip_dual_gp(struct cds_ft *ft,
 	cn = ft_compressed_node_ptr(parent_nf);
 	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	skip_slot = ft_txn_parent_slot_at(cn_meta, ft, NULL, &gp_nf);
-	if (!skip_slot || !ft_node_skip_compressed(*skip_slot)) {
+	/* The dual is decided under GP, never before it (ft-helpers.h). */
+	if (!skip_slot) {
 #ifdef FT_DEBUG_DUAL_DROP
 		uatomic_inc(&ft_dual_ins_noskip);
 #endif
@@ -4734,6 +4735,7 @@ unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
 		struct cds_ft_inode_flag **sslot =
 			ft_txn_parent_slot(cn_meta, ft, mtxn);
 
+		FT_DUAL_SLOT_SETTLED_CHECK(sslot, gp_held);
 		if (sslot && ft_node_skip_compressed(*sslot)) {
 			/*
 			 * ☠ BOTH EXPECTED-OLDS ARE RESOLVED, and both used to

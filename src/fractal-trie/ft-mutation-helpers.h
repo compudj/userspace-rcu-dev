@@ -17413,7 +17413,8 @@ bool ft_skip_dual_gp_held(struct cds_ft *ft,
 	cn = ft_compressed_node_ptr(parent_nf);
 	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	skip_slot = ft_txn_parent_slot_at(cn_meta, ft, mtxn, &gp_nf);
-	if (!skip_slot || !ft_node_skip_compressed(*skip_slot))
+	/* The dual is decided under GP, never before it (ft-helpers.h). */
+	if (!skip_slot)
 		return false;		/* no dual edge will be recorded */
 	if (skip_slot == &ft->root || !gp_nf)
 		return false;		/* root dual: no owning node */
@@ -17560,7 +17561,8 @@ bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 	cn = ft_compressed_node_ptr(parent_nf);
 	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	skip_slot = ft_txn_parent_slot_at(cn_meta, ft, mtxn, &gp_nf);
-	if (!skip_slot || !ft_node_skip_compressed(*skip_slot))
+	/* The dual is decided under GP, never before it (ft-helpers.h). */
+	if (!skip_slot)
 		return false;		/* no dual edge will be recorded */
 	if (skip_slot == &ft->root || !gp_nf)
 		return false;		/* root dual: no owning node */

@@ -3005,6 +3005,66 @@ struct cds_ft_inode_flag **ft_txn_parent_slot_at(const struct cds_ft_metadata *m
 #define ft_txn_parent_slot(meta, ft, mtxn)				\
 	ft_txn_parent_slot_at((meta), (ft), (mtxn), NULL)
 
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+/*
+ * ☠ DECIDE THE SKIP_X DUAL UNDER ITS OWNER, NOT BEFORE IT.
+ *
+ * A compressed P published in skip form has a second word to keep in step:
+ * the SKIP_X word in GP's slot.  Whether an op must refresh it is decided by
+ * reading that slot, and the slot is GP's (§8.2).  Read without GP held, it can
+ * hold a PEER's parked proxy -- a commit that published or re-encoded the dual
+ * and has not settled yet.  GP is that peer's until after its settle (locks are
+ * released after the txn), so the proxy's settled value is unknown here, and a
+ * proxy is not skip-encoded.  Reading it as "no dual" dropped the refresh: the
+ * peer then settled SKIP_X(H) while this op moved H under a new node, and the
+ * dual named a compressed node that no longer held H.  MEASURED on
+ * inv_owned_prefix_dense_remove_all: an insert committed H -> prefix head of N
+ * 74 us into a peer's 1.9 ms park-to-settle window on the dual slot; the stale
+ * dual then failed cds_ft_verify, and remove_all spun on the torn parentage.
+ *
+ * Counting a proxy as a possible dual is not enough either: a slot that holds
+ * a plain value at the read can be parked on by a peer right after it, and the
+ * recording site then meets the proxy (measured: 17 of 17 through
+ * cds_ft_insert_replace -> ft_insert_compressed_past_child).  Nothing about the
+ * slot can be decided before GP is held.  So a taker takes GP whenever P is
+ * compressed and has a node GP -- what the recompact already does up front --
+ * and the dual is decided under it, where a peer that parks on the slot must
+ * hold GP and has therefore settled.  The only cost is a GP hold for a
+ * compressed P whose dual turns out not to exist.
+ *
+ * The recording side of the same rule: a site that decides the dual while it
+ * HOLDS GP must find the slot SETTLED -- a peer parked there would hold GP too.
+ * Asked only where the op holds GP: an attempt whose GP take was refused is
+ * doomed (acquire_miss, discarded unpublished) and may still meet the holder's
+ * proxy on its way to that discard.
+ */
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
+# include <execinfo.h>
+__attribute__((noinline, cold, noreturn))
+static void ft_dual_slot_unsettled(const char *fn, int line, void *slot, void *v)
+{
+	void *bt[24];
+	int n = backtrace(bt, 24);
+
+	fprintf(stderr, "FT DUAL SLOT UNSETTLED: %s:%d decides the SKIP_X dual "
+		"on slot %p holding a parked proxy %p\n", fn, line, slot, v);
+	backtrace_symbols_fd(bt, n, 2);
+	fflush(stderr);
+	abort();
+}
+# define FT_DUAL_SLOT_SETTLED_CHECK(slot, held)				\
+	do {								\
+		if (caa_unlikely((held) && (slot) &&			\
+				ft_node_flip_proxy(CMM_LOAD_SHARED(*(slot))))) \
+			ft_dual_slot_unsettled(__func__, __LINE__,	\
+				(void *) (slot),			\
+				(void *) CMM_LOAD_SHARED(*(slot)));	\
+	} while (0)
+#else
+# define FT_DUAL_SLOT_SETTLED_CHECK(slot, held)	do { } while (0)
+#endif
+#endif /* FEATURE_FT_SKIP_COMPRESSED */
+
 /*
  * ft_slot_in_node: is @slot one of @node_flag's OWN child slots?
  *
@@ -4017,6 +4077,7 @@ void _ft_publish_to_parent_meta_at(const char *pub_fn, int pub_line,
 			ft_dbg_dual_probe(ft, cn, cn_meta, skip_slot,
 				skip_owner_nf, expected_old, new_child);
 #endif
+			FT_DUAL_SLOT_SETTLED_CHECK(skip_slot, dual_owner_held);
 			if (skip_slot &&
 			    ft_node_skip_compressed(*skip_slot)) {
 				struct cds_ft_inode_flag *skip_new =
