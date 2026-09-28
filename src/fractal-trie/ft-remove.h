@@ -9162,17 +9162,37 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					.detach_byte = 0,
 				};
 
-				cret = ft_chain_compress_fused(ft,
-					holder_flag, holder_depth, &lctx,
-					holder_meta,
-					s_child, s_byte,
-					1 /* sole body child; the removed entry is external */,
-					fuse_cell, NULL,
-					NULL, 0, NULL, NULL, 0 /* no orphan chain */, node,
-					1 /* @node is this key's SOLE entry */,
-					-1, ft->rank_stats ? key_len + 1 : 0,
-					NULL, false,
-					NULL /* no pending publish */, &intent, NULL);
+				/*
+				 * NO SURVIVOR MEANS A PEER MOVED IT.  The count and
+				 * the scan above are two UNLOCKED reads, and the scan
+				 * reads the body one slot at a time.  With the in-place
+				 * tiers a peer can refill a hole below the child and
+				 * remove the child between two of those slot reads: each
+				 * slot reads empty although the count was right and a
+				 * child existed at every instant (measured, ft_inv 154:
+				 * holder {97 hole, 98 live} -> {97 live, 98 hole}, the
+				 * collapse's `surviving_child` assert).  At rest a count
+				 * of one IS one non-NULL slot, and a child that stays
+				 * put is always found, so a NULL here proves a peer
+				 * committed on the holder since the count was read.
+				 * Re-plan, as the non-fused arm's under-lock re-check
+				 * below does: the collapse re-validates under its locks,
+				 * but it needs a survivor to name.
+				 */
+				if (caa_unlikely(!s_child))
+					cret = -EAGAIN;
+				else
+					cret = ft_chain_compress_fused(ft,
+						holder_flag, holder_depth, &lctx,
+						holder_meta,
+						s_child, s_byte,
+						1 /* sole body child; the removed entry is external */,
+						fuse_cell, NULL,
+						NULL, 0, NULL, NULL, 0 /* no orphan chain */, node,
+						1 /* @node is this key's SOLE entry */,
+						-1, ft->rank_stats ? key_len + 1 : 0,
+						NULL, false,
+						NULL /* no pending publish */, &intent, NULL);
 
 				if (cret == 0) {
 					/*
@@ -10326,17 +10346,25 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					.detach_byte = 0,
 				};
 
-				cret = ft_chain_compress_fused(ft,
-					holder_flag, holder_depth, &lctx,
-					holder_meta,
-					s_child, s_byte,
-					1 /* sole body child; the removed entry is external */,
-					ft->ordered_list ? dead_cell : NULL,
-					NULL, NULL, 0, NULL, NULL, 0 /* no orphan chain */,
-					chain_head, nr_frozen,
-					-1, ft->rank_stats ? key_len + 1 : 0,
-					NULL, false,
-					NULL /* no pending publish */, &intent, NULL);
+				/*
+				 * No survivor: a peer edited the holder in place
+				 * between the two unlocked reads above -- re-plan (see
+				 * the same arm in _cds_ft_remove_locked).
+				 */
+				if (caa_unlikely(!s_child))
+					cret = -EAGAIN;
+				else
+					cret = ft_chain_compress_fused(ft,
+						holder_flag, holder_depth, &lctx,
+						holder_meta,
+						s_child, s_byte,
+						1 /* sole body child; the removed entry is external */,
+						ft->ordered_list ? dead_cell : NULL,
+						NULL, NULL, 0, NULL, NULL, 0 /* no orphan chain */,
+						chain_head, nr_frozen,
+						-1, ft->rank_stats ? key_len + 1 : 0,
+						NULL, false,
+						NULL /* no pending publish */, &intent, NULL);
 
 				if (cret == 0) {
 					/*
