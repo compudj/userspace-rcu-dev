@@ -2797,6 +2797,8 @@ struct ft_flip_txn {
 	struct urcu_txn own;	/* backing handle for standalone txns */
 	struct ft_op *op;	/* the op whose handle @mtxn is, or NULL */
 	bool reserved;			/* @mtxn pre-reserved (bounded) => infallible commit */
+	bool list_locked;		/* holds class-1 words (ft_list_locked_txns) */
+	unsigned char glue_anchors;	/* ft_glue_lock_anchors: 0 not yet, 1 taken, 2 refused */
 	/*
 	 * ☠ DID THIS TXN COMMIT?  ft_flip_txn_destroy documents itself as
 	 * "a flip-txn that was NOT committed" and then CAS-clears every
@@ -3254,6 +3256,34 @@ struct ft_flip_txn {
 	unsigned int sa_ntpend;
 #endif
 };
+
+/*
+ * RULE C's WITNESS: how many of this thread's live flip txns hold class-1
+ * (list) words.  A txn counts from its first class-1 take to its free, which
+ * every terminal reaches (commit, destroy).
+ */
+static __thread unsigned int ft_list_locked_txns;
+
+static inline
+void ft_flip_txn_mark_list_locked(struct ft_flip_txn *t)
+{
+	if (!t->list_locked) {
+		t->list_locked = true;
+		ft_list_locked_txns++;
+	}
+}
+
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
+__attribute__((noinline, cold, noreturn))
+static void ft_lock_class_violation(const char *fn, int line, unsigned int n)
+{
+	fprintf(stderr, "FT RULE C: %s:%d takes a class-0 (trie anchor) word "
+		"while %u txn(s) of this op hold class-1 (list) words\n", fn, line,
+		n);
+	fflush(stderr);
+	abort();
+}
+#endif
 
 #ifdef FT_DEBUG_LOCK_LEAK
 /*
@@ -3978,6 +4008,8 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	 * ft_flip_txn_create_bounded).  The exact age-1+ reconcile has no Bloom. */
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
+	t->list_locked = false;
+	t->glue_anchors = 0;
 	t->committed = false;
 	t->nr_locks = 0;
 #ifdef FT_DEBUG_LOCK_LEAK
@@ -4258,6 +4290,8 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->op = op;
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
+	t->list_locked = false;
+	t->glue_anchors = 0;
 	t->committed = false;
 	t->nr_locks = 0;
 #ifdef FT_DEBUG_LOCK_LEAK
@@ -4372,6 +4406,8 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 		return NULL;
 	}
 	t->reserved = true;
+	t->list_locked = false;
+	t->glue_anchors = 0;
 	t->committed = false;
 	t->nr_locks = 0;
 #ifdef FT_DEBUG_LOCK_LEAK
@@ -6928,6 +6964,8 @@ static inline
 void ft_flip_txn_free(struct ft_flip_txn *t)
 {
 	FT_TXN_OPEN_DEC();
+	if (t->list_locked)
+		ft_list_locked_txns--;
 	if (t->locks != t->locks_floor)
 		free(t->locks);
 	if (t->rel_after != t->rel_after_floor)
@@ -8172,6 +8210,7 @@ struct ft_dlm_member {
 	 */
 	struct cds_ft_metadata *anchor;
 	bool lock_only;
+	bool list_lock;		/* class 1 (Rule C, ft_dlm_acquire_set_at) */
 };
 
 /* Defined below; the single-member acquire is a one-element set. */
@@ -12868,6 +12907,14 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	unsigned int nr_taken = 0;
 	int i, nr_present = 0;
 
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
+	/* RULE C (see the ordering comment below): no class 0 after class 1. */
+	if (caa_unlikely(ft_list_locked_txns))
+		for (i = 0; i < nr; i++)
+			if (!set[i].list_lock)
+				ft_lock_class_violation(fn, line, ft_list_locked_txns);
+#endif
+
 	/*
 	 * THE ACQUIRE SEAM (-DFT_DELAY_INJECT, FT_DELAY_MODE=acquire).  Every
 	 * caller of this helper follows the same shape -- LOOK UP a node or slot,
@@ -13005,9 +13052,33 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * starving removes against 4 for aging alone, complete separation).
 	 */
 	/*
-	 * ASCENDING ANCHOR ORDER, and the whole deadlock argument rides on it:
-	 * with a total order on the words no cycle can form, which is what lets
-	 * the takes below be plain CASes instead of one atomic commit.
+	 * ASCENDING ANCHOR ORDER WITHIN ONE TAKE, the PROGRESS argument: two ops
+	 * contending for the same set meet at its lowest word, and the one that
+	 * has it takes the rest -- neither can hold a word the other needs to
+	 * reach its first one.
+	 *
+	 * ☞ THE ORDER ACROSS TAKES IS BY CLASS (doc/design/
+	 * ft-cell-list-locking-scheme-PROPOSAL.md §2.1).  Class 0 is the trie
+	 * anchors -- node words and ft->root_lock; class 1 is the list locks --
+	 * cell words and ft->ord_begin_lock / ft->ord_end_lock
+	 * (ft_cell_lockset_take and ft_cell_lockset_take_edges, the only takers,
+	 * which mark their members @list_lock).  RULE C: an op never takes a
+	 * class-0 word while it holds a class-1 word, so the class-1 take is the
+	 * LAST take before the commit.  Checked below in debug builds.  Every
+	 * point op kept it; the glue commit (graft, graft_swap, merge, the rekey
+	 * fold) took its cells before its reparent marks and publish parent until
+	 * those moved ahead of it (ft_glue_lock_anchors).
+	 *
+	 * ☞ CLASS 0 IS TAKEN IN STAGES and is NOT one sorted set: a remove
+	 * plan-locks its orphan chain, then the parent guard, the recompact and
+	 * the collapse; a replace its holder, then the parent.  A later stage
+	 * can take a word below one an earlier stage holds (MEASURED, ft_inv
+	 * per-node: ~1.8M of 93M takes; 0 within class 1).
+	 * That cannot DEADLOCK -- every take below is a non-blocking CAS, a
+	 * refused take releases everything taken (all-or-none), and the only
+	 * blocking waits (the escalation lane, the refused-word wait) happen
+	 * with nothing held -- but two ops can refuse each other across stages
+	 * and both retry: that LIVELOCK is what the escalation lane settles.
 	 *
 	 * ☞ DECIDED BEFORE THE TRANSACTION EXISTS, because on this path there is
 	 * no transaction: takes are CASes and guards are loads (ft_acq_guard),
@@ -14316,7 +14387,8 @@ bool ft_cell_lock_member(const struct cds_ft *ft,
 	probe.slot = (struct ft_ord_cell **) side_slot;
 	*out = (struct ft_dlm_member){
 		.anchor = ft_cell_word_lock(ft, &probe),
-		.lock_only = true };
+		.lock_only = true,
+		.list_lock = true };
 	return out->anchor != NULL;
 }
 
@@ -15974,6 +16046,7 @@ have_lock:
 			return -EAGAIN;	/* more cells than the order can hold */
 		set[n].anchor = lock;
 		set[n].lock_only = true;
+		set[n].list_lock = true;
 		n++;
 	}
 	if (!n)
@@ -15981,6 +16054,7 @@ have_lock:
 	ret = ft_dlm_acquire_set(ft, ctx, set, n);
 	if (ret)
 		return ret;		/* all-or-none: @txn untouched */
+	ft_flip_txn_mark_list_locked(txn);
 	for (i = 0; i < n; i++) {
 		if (set[i].held.shared)
 			continue;
@@ -16116,6 +16190,7 @@ int ft_cell_lockset_take(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	ret = ft_dlm_acquire_set(ft, ctx, set, n);
 	if (ret)
 		return ret;		/* all-or-none: @txn untouched */
+	ft_flip_txn_mark_list_locked(txn);
 	for (i = 0; i < n; i++) {
 		/*
 		 * A SHARED hold deduped onto a word this op already had (a
@@ -25479,42 +25554,20 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 }
 
 /*
- * Transactional commit of a GLUE attach/replace (used when g->txn is set).
- * Follows the bulk-op rule: a pointer NOT reader-observable during the commit
- * window is set IMMEDIATELY with a plain store; only a reader-observable
- * ("live") pointer rides the txn, so its flip is atomic with the forward
- * publish.  A reader -- which descends (forward) before it walks up (back) --
- * thus observes the whole publish as old XOR new, never a half-applied mix.
- *
- *   - Hidden back-pointers (the drained payload + fresh cluster): tagged @live
- *     false, ft_glue_apply_deferred sets them immediately, in recorded order.
- *     Unreachable until the forward flip, so no atomicity is needed.
- *   - Live back-pointers (a node reachable until the forward publish -- via the
- *     OLD DST spine, tagged @dst_origin, or via the fold's not-yet-unlinked SRC
- *     spine) + the forward edge + the <=4 ordered-list cell edges: recorded into
- *     g->txn and committed with one selector flip.  The dst-origin half is
- *     recorded by the loop below, the src-origin half by apply_deferred.
- *
- * Called AFTER the source unlink + drain, where abort is already impossible, so
- * the live back-edge bookkeeping (ft_set_parent_slot inside
- * ft_glue_record_back_edge) runs here rather than during the build -- doing it
- * during the build would corrupt a live node's parent_slot_offset if a later
- * build step OOM'd and aborted.  The build is unchanged: edges queue in
- * g->deferred, and fresh-to-fresh edges + top->publish_parent are wired during
- * the build.
- *
- * The records cannot fail: g->txn was reserved to the bounded cluster size up
- * front (ft_flip_txn_reserve).  Reclaims the txn (deferred via the flavor, or
- * freed immediately on the exclusive fast path).
+ * THE GLUE'S CLASS-0 TAKES, ahead of its class-1 (cell) take.  Rule C
+ * (ft_dlm_acquire_set_at) puts the list locks LAST, and a glue commit takes
+ * both kinds: its cell set, and here the reparent marks on the children its
+ * records SW-park into plus its publish parent (or the root).  So a caller that
+ * takes the glue's cells calls this FIRST.  ft_glue_txn_commit_edges calls it
+ * too; the answer is kept in @g->txn (@glue_anchors), so the takes run once per
+ * txn.  ABORT only from the reparent marks, under record_only (see there).
  */
 static
-enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
-		const struct ft_ord_cell_edge *cedges, unsigned int n_cedges)
+enum urcu_txn_status ft_glue_lock_anchors(struct cds_ft *ft, struct ft_glue *g)
 {
-	struct ft_pub_rec rec = { .n = 0, .mtxn = g->txn ? g->txn->mtxn : NULL };
-	int i;
-	enum urcu_txn_status cst;
-
+	if (g->txn && g->txn->glue_anchors)
+		return g->txn->glue_anchors == 1 ? URCU_TXN_STATUS_OK :
+			URCU_TXN_STATUS_ABORT;
 	/*
 	 * FOLD: take the lock acquire on every child the records below will SW-park
 	 * into, BEFORE the first of them is recorded and before
@@ -25552,9 +25605,111 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		 */
 		if (ft->lock_fine && !ft->exclusive)
 			assert(g->record_only);
-		if (ft_glue_acquire_reparent_marks(ft, g))
+		if (ft_glue_acquire_reparent_marks(ft, g)) {
+			g->txn->glue_anchors = 2;
 			return URCU_TXN_STATUS_ABORT;
+		}
 	}
+	{
+		struct ft_lock_ctx gctx;
+
+		ft_glue_lock_ctx(g, &gctx);
+		/*
+		 * A SHARED fence records NOTHING here: the earlier acquire owns
+		 * both the {LOCK|s -> s} release and the registry entry, and the
+		 * held arm below would settle the single word a second time.
+		 * Routing it to the NULL arm instead would be worse -- that arm
+		 * re-acquires or guards a word this op already holds.
+		 */
+		if (!g->publish_parent_shared && !g->publish_parent_txn_owned)
+			ft_flip_txn_hold_or_lock_parent(ft, g->txn, &gctx,
+				g->publish_parent, FT_DEPTH_FROM_DESCENT,
+				g->publish_parent_holder,
+				g->publish_parent_snap);
+		/*
+		 * No publish parent: the slot is &ft->root, whose own lock is
+		 * P's.  A miss sets @acquire_miss -- this commit is abortable
+		 * (see ft_glue_publish: a shared destination is contracted).
+		 */
+		if (!g->publish_parent && g->publish_slot == &ft->root)
+			(void) ft_flip_txn_lock_root(g->txn, &gctx,
+				(void **) g->publish_slot,
+				ft_glue_publish_expected_old(g));
+	}
+	if (g->publish_parent_holder) {
+		/*
+		 * OWNERSHIP TRANSFER (the split_cn_holder block below mirrors
+		 * this): the held arm just recorded the {LOCK|s -> s} RELEASE
+		 * and REGISTERED the fence with @txn, so the txn owns the clear --
+		 * a commit consumes it, an abort or destroy CAS-clears it back to
+		 * LIVE through ft_flip_txn_lock_release_all.  NULL the holder so
+		 * the caller's post-abort ft_glue_abort does NOT clear it a SECOND
+		 * time: by then the survivor is LIVE and CLEAN, and under the live
+		 * peers a commit-abort implies, a peer may have re-marked it in the
+		 * drain->abort window -- the second clear then STEALS the peer's
+		 * fence (double-free / torn publish), the exact hazard spelled out
+		 * for @split_cn_holder.
+		 *
+		 * Two callers already DOCUMENT this NULLing as the mechanism they
+		 * rely on (fractal-trie.c, the post-commit_edges bail and
+		 * bail_build) and ft_merge_spine_copy open-codes it at its own
+		 * hold_or_lock_parent call; commit_edges was the one path where the
+		 * mechanism was missing.  Safe here because every ft_glue_op_holds
+		 * read happens at the TOP of this function
+		 * (ft_glue_acquire_reparent_marks), so the reconciliation set is
+		 * complete before the field is disowned.
+		 */
+		g->publish_parent_holder = NULL;
+		g->publish_parent_shared = false;
+		g->publish_parent_snap = 0;
+		g->publish_parent_txn_owned = false;
+		g->publish_parent_scrubbed = false;
+	}
+	if (g->txn)
+		g->txn->glue_anchors = 1;
+	return URCU_TXN_STATUS_OK;
+}
+
+/*
+ * Transactional commit of a GLUE attach/replace (used when g->txn is set).
+ * Follows the bulk-op rule: a pointer NOT reader-observable during the commit
+ * window is set IMMEDIATELY with a plain store; only a reader-observable
+ * ("live") pointer rides the txn, so its flip is atomic with the forward
+ * publish.  A reader -- which descends (forward) before it walks up (back) --
+ * thus observes the whole publish as old XOR new, never a half-applied mix.
+ *
+ *   - Hidden back-pointers (the drained payload + fresh cluster): tagged @live
+ *     false, ft_glue_apply_deferred sets them immediately, in recorded order.
+ *     Unreachable until the forward flip, so no atomicity is needed.
+ *   - Live back-pointers (a node reachable until the forward publish -- via the
+ *     OLD DST spine, tagged @dst_origin, or via the fold's not-yet-unlinked SRC
+ *     spine) + the forward edge + the <=4 ordered-list cell edges: recorded into
+ *     g->txn and committed with one selector flip.  The dst-origin half is
+ *     recorded by the loop below, the src-origin half by apply_deferred.
+ *
+ * Called AFTER the source unlink + drain, where abort is already impossible, so
+ * the live back-edge bookkeeping (ft_set_parent_slot inside
+ * ft_glue_record_back_edge) runs here rather than during the build -- doing it
+ * during the build would corrupt a live node's parent_slot_offset if a later
+ * build step OOM'd and aborted.  The build is unchanged: edges queue in
+ * g->deferred, and fresh-to-fresh edges + top->publish_parent are wired during
+ * the build.
+ *
+ * The records cannot fail: g->txn was reserved to the bounded cluster size up
+ * front (ft_flip_txn_reserve).  Reclaims the txn (deferred via the flavor, or
+ * freed immediately on the exclusive fast path).
+ */
+static
+enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
+		const struct ft_ord_cell_edge *cedges, unsigned int n_cedges)
+{
+	struct ft_pub_rec rec = { .n = 0, .mtxn = g->txn ? g->txn->mtxn : NULL };
+	int i;
+	enum urcu_txn_status cst;
+
+	/* The class-0 takes, before any record: see ft_glue_lock_anchors. */
+	if (ft_glue_lock_anchors(ft, g) != URCU_TXN_STATUS_OK)
+		return URCU_TXN_STATUS_ABORT;
 
 	/*
 	 * The src-origin half, dispatched PER EDGE on @live.  Hidden re-parents --
@@ -25659,61 +25814,6 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 * re-mark's masking guard would self-abort on the op's own held fence).
 	 * Holder NULL routes to the ordinary acquire-or-guard (non-lock_fine / root).
 	 */
-	{
-		struct ft_lock_ctx gctx;
-
-		ft_glue_lock_ctx(g, &gctx);
-		/*
-		 * A SHARED fence records NOTHING here: the earlier acquire owns
-		 * both the {LOCK|s -> s} release and the registry entry, and the
-		 * held arm below would settle the single word a second time.
-		 * Routing it to the NULL arm instead would be worse -- that arm
-		 * re-acquires or guards a word this op already holds.
-		 */
-		if (!g->publish_parent_shared && !g->publish_parent_txn_owned)
-			ft_flip_txn_hold_or_lock_parent(ft, g->txn, &gctx,
-				g->publish_parent, FT_DEPTH_FROM_DESCENT,
-				g->publish_parent_holder,
-				g->publish_parent_snap);
-		/*
-		 * No publish parent: the slot is &ft->root, whose own lock is
-		 * P's.  A miss sets @acquire_miss -- this commit is abortable
-		 * (see ft_glue_publish: a shared destination is contracted).
-		 */
-		if (!g->publish_parent && g->publish_slot == &ft->root)
-			(void) ft_flip_txn_lock_root(g->txn, &gctx,
-				(void **) g->publish_slot,
-				ft_glue_publish_expected_old(g));
-	}
-	if (g->publish_parent_holder) {
-		/*
-		 * OWNERSHIP TRANSFER (the split_cn_holder block below mirrors
-		 * this): the held arm just recorded the {LOCK|s -> s} RELEASE
-		 * and REGISTERED the fence with @txn, so the txn owns the clear --
-		 * a commit consumes it, an abort or destroy CAS-clears it back to
-		 * LIVE through ft_flip_txn_lock_release_all.  NULL the holder so
-		 * the caller's post-abort ft_glue_abort does NOT clear it a SECOND
-		 * time: by then the survivor is LIVE and CLEAN, and under the live
-		 * peers a commit-abort implies, a peer may have re-marked it in the
-		 * drain->abort window -- the second clear then STEALS the peer's
-		 * fence (double-free / torn publish), the exact hazard spelled out
-		 * for @split_cn_holder.
-		 *
-		 * Two callers already DOCUMENT this NULLing as the mechanism they
-		 * rely on (fractal-trie.c, the post-commit_edges bail and
-		 * bail_build) and ft_merge_spine_copy open-codes it at its own
-		 * hold_or_lock_parent call; commit_edges was the one path where the
-		 * mechanism was missing.  Safe here because every ft_glue_op_holds
-		 * read happens at the TOP of this function
-		 * (ft_glue_acquire_reparent_marks), so the reconciliation set is
-		 * complete before the field is disowned.
-		 */
-		g->publish_parent_holder = NULL;
-		g->publish_parent_shared = false;
-		g->publish_parent_snap = 0;
-		g->publish_parent_txn_owned = false;
-		g->publish_parent_scrubbed = false;
-	}
 	/*
 	 * THE SECOND SLOT THE PUBLISH BELOW WRITES.  A compressed
 	 * @publish_parent makes _ft_publish_to_parent re-encode the SKIP_X dual
@@ -26114,6 +26214,9 @@ enum urcu_txn_status ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
 			.succ = ft_ord_or_sentinel(ft, run->succ),
 		};
 
+		/* Rule C: the glue's class-0 takes first. */
+		if (g->txn && ft_glue_lock_anchors(ft, g) != URCU_TXN_STATUS_OK)
+			return URCU_TXN_STATUS_ABORT;
 		if (g->txn && ft_cell_lockset_take(ft, NULL, g->txn, &plan)) {
 			ft_glue_take_refused(g);
 			return URCU_TXN_STATUS_ABORT;
@@ -26156,6 +26259,9 @@ enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
 
 		n = ft_ord_cell_run_replace_edges(ft, run->d_first,
 			run->d_last, run->s_first, run->s_last, cedges, 0);
+		/* Rule C: the glue's class-0 takes first. */
+		if (g->txn && ft_glue_lock_anchors(ft, g) != URCU_TXN_STATUS_OK)
+			return URCU_TXN_STATUS_ABORT;
 		if (g->txn && ft_cell_lockset_take_edges(ft, NULL, g->txn,
 				cedges, n)) {
 			ft_glue_take_refused(g);

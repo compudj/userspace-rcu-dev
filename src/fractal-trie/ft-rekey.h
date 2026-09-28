@@ -7648,6 +7648,17 @@ detach_bail:
 	 * conflicting splice aborts this commit clean and the caller re-descends.
 	 */
 	if (ft->ordered_list) {
+		/*
+		 * RULE C (ft_dlm_acquire_set_at): the cell takes below are the
+		 * op's class-1 take, so the glue's class-0 takes -- its reparent
+		 * marks and publish parent, taken by the ft_glue_txn_commit_edges
+		 * fold further down -- come first.  A refusal skips the cells and
+		 * leaves the fold to report it, down its own bail.
+		 */
+		if ((prep == FT_GRAFT_PREP_GLUE || merge_dst) &&
+				ft_glue_lock_anchors(ft, &glue) !=
+					URCU_TXN_STATUS_OK)
+			goto cells_done;
 		/* Zero-initialised: see the note on ms_edges in ft-merge.h. */
 		struct ft_ord_cell_edge cedges[FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
 			FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES] = { 0 };

@@ -243,6 +243,29 @@ Within one class the take is one sorted all-or-none `ft_dlm_acquire_set`
 `(class, address)`, a total order, and §3's argument composes across the two
 takes exactly as it does within one.
 
+> ☞ **MEASURED (2026-09-28), and what it changes.** Every point op kept Rule
+> C, and class 1 is one take per op (0 inversions).  The glue commit did not:
+> `ft_glue_txn_commit`, `ft_glue_txn_commit_replace` and the rekey fold took
+> the cell set, then `ft_glue_txn_commit_edges` took the reparent marks and
+> the publish parent (graft_swap ~91k per `ft_inv` run, merge and rekey
+> hundreds per `ft_unit` run).  Those class-0 takes now run first
+> (`ft_glue_lock_anchors`).  A first census through the hold ledger had
+> reported 0 violations and was blind: the ledger drops a word once its
+> release is recorded, which for a cell lock is at the take.  The
+> per-txn witness behind `FT RULE C` counts what the txn really holds.
+> Class 0 is **not** one take: ops take their
+> anchors in stages (a remove plan-locks its orphan chain, then takes the
+> parent guard, the recompact and the collapse; a replace takes its holder,
+> then the parent; the root lock follows a merge's or graft's node takes), and
+> about 1.8M of 93M takes per `ft_inv` run land below a class-0 word an
+> earlier stage of the same op holds.  So the order is `(class, address)`
+> only within a take, and by class across takes.  Deadlock freedom does not
+> need more: every take is a non-blocking CAS whose refusal releases what the
+> take got, and the blocking waits (the escalation lane, the refused-word
+> wait) happen with nothing held.  What the class-0 stages can do is refuse
+> each other and retry -- a livelock the escalation lane settles.  Rule C is
+> checked in debug builds (`ft_dlm_acquire_set_at`, `FT RULE C`).
+
 Why two takes instead of the single take the companion doc and v3 tried:
 
 * the class-1 set is derivable only from the cell (`pred`/`succ` are the
