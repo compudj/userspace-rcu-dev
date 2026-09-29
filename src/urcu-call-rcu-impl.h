@@ -49,7 +49,9 @@ struct call_rcu_data {
 	struct cds_wfcq_head cbs_head;
 	unsigned long flags;
 	int32_t futex;
-	unsigned long qlen; /* maintained for debugging. */
+	int32_t delay_futex;	/* -1 while the worker sits in a cuttable batching delay */
+	unsigned long qlen;	/* callbacks queued, not yet invoked */
+	unsigned long qlen_cap;	/* end the batching delay at this @qlen (0: never) */
 	pthread_t tid;
 	int cpu_affinity;
 	unsigned long gp_count;
@@ -70,6 +72,34 @@ struct call_rcu_data {
 	struct cds_list_head affinity_notifiers;
 	int affinity_lost;
 } __attribute__((__aligned__(CAA_CACHE_LINE_SIZE)));
+
+/*
+ * QUEUE-LENGTH CAP ON THE BATCHING DELAY.
+ *
+ * After each batch a (non-RT) worker sleeps 10 ms so callbacks accumulate and
+ * one grace period retires many.  Against a fast producer that sleep is also
+ * how long every queued callback waits beyond its grace period, and how much
+ * memory waits with it: at 192 writers each committing a transaction, a worker
+ * holds tens of thousands of callbacks per batch, and the blocks they free come
+ * back cold.  The cap bounds the batch instead of the time: an enqueue that
+ * brings @qlen to URCU_CALL_RCU_QLEN_CAP ends its worker's delay, which then
+ * starts the next grace period at once.  Below the cap nothing changes.
+ *
+ * On Linux the delay is a futex wait with a 10 ms timeout that the enqueuer
+ * wakes; elsewhere (and if the futex syscall is missing) the worker checks
+ * @qlen once per millisecond of the delay, because the compat and FreeBSD
+ * futex paths take no relative timeout.  RT workers keep their plain 10 ms
+ * poll.  0 disables the cap; the URCU_CALL_RCU_QLEN_CAP environment variable,
+ * read when a worker is created, overrides the default.
+ *
+ * The default, 1024: on a 384-cpu machine with a worker per writer cpu, caps
+ * of 256 to 1024 gave the same throughput at 192 writers committing
+ * transactions, 20% above no cap, while 4096 and 16384 gave back part of it;
+ * 1024 retires the most callbacks per grace period of the caps that tie.
+ */
+#ifndef URCU_CALL_RCU_QLEN_CAP
+#define URCU_CALL_RCU_QLEN_CAP	1024UL
+#endif
 
 struct call_rcu_completion {
 	int barrier_count;
@@ -336,6 +366,60 @@ static void call_rcu_wait(struct call_rcu_data *crdp)
 	}
 }
 
+static unsigned long call_rcu_qlen_cap(void)
+{
+	const char *e = getenv("URCU_CALL_RCU_QLEN_CAP");
+
+	return e ? strtoul(e, NULL, 10) : URCU_CALL_RCU_QLEN_CAP;
+}
+
+/*
+ * The worker's batching delay: 10 ms, ended early once @qlen reaches the cap.
+ * The store of @delay_futex and the load of @qlen are ordered by a full
+ * barrier, as are _call_rcu()'s increment of @qlen and its load of
+ * @delay_futex (uatomic_add_return()), so either the worker sees the cap and
+ * does not sleep, or the enqueuer sees the worker waiting and wakes it.
+ */
+static void call_rcu_batch_delay(struct call_rcu_data *crdp)
+{
+	unsigned long cap = crdp->qlen_cap;
+	int ms;
+
+	if (!cap) {
+		(void) poll(NULL, 0, 10);
+		return;
+	}
+#if defined(__linux__) && defined(__NR_futex)
+	{
+		const struct timespec ts = { 0, 10L * 1000 * 1000 };
+		int ret = 0;
+
+		uatomic_store(&crdp->delay_futex, -1);
+		cmm_smp_mb();
+		if (uatomic_load(&crdp->qlen) < cap)
+			ret = futex(&crdp->delay_futex, FUTEX_WAIT, -1, &ts,
+					NULL, 0);
+		uatomic_store(&crdp->delay_futex, 0);
+		if (!(ret < 0 && errno == ENOSYS))
+			return;
+	}
+#endif
+	for (ms = 0; ms < 10 && uatomic_load(&crdp->qlen) < cap; ms++)
+		(void) poll(NULL, 0, 1);
+}
+
+/* An enqueue reached the cap: end the worker's batching delay, if it is in one. */
+static void call_rcu_cut_delay(struct call_rcu_data *crdp)
+{
+#if defined(__linux__) && defined(__NR_futex)
+	if (uatomic_load(&crdp->delay_futex) == -1 &&
+			uatomic_cmpxchg(&crdp->delay_futex, -1, 0) == -1)
+		(void) futex(&crdp->delay_futex, FUTEX_WAKE, 1, NULL, NULL, 0);
+#else
+	(void) crdp;			/* the polled delay reads @qlen itself */
+#endif
+}
+
 static void call_rcu_wake_up(struct call_rcu_data *crdp)
 {
 	/* Write to call_rcu list before reading/writing futex */
@@ -465,7 +549,7 @@ static void *call_rcu_thread(void *arg)
 			if (cds_wfcq_empty(&crdp->cbs_head,
 					&crdp->cbs_tail)) {
 				call_rcu_wait(crdp);
-				(void) poll(NULL, 0, 10);
+				call_rcu_batch_delay(crdp);
 				uatomic_dec(&crdp->futex);
 				/*
 				 * Decrement futex before reading
@@ -473,7 +557,7 @@ static void *call_rcu_thread(void *arg)
 				 */
 				cmm_smp_mb();
 			} else {
-				(void) poll(NULL, 0, 10);
+				call_rcu_batch_delay(crdp);
 			}
 		} else {
 			(void) poll(NULL, 0, 10);
@@ -512,7 +596,9 @@ static void call_rcu_data_init(struct call_rcu_data **crdpp,
 	memset(crdp, '\0', sizeof(*crdp));
 	cds_wfcq_init(&crdp->cbs_head, &crdp->cbs_tail);
 	crdp->qlen = 0;
+	crdp->qlen_cap = call_rcu_qlen_cap();
 	crdp->futex = 0;
+	crdp->delay_futex = 0;
 	crdp->flags = flags;
 	cds_list_add(&crdp->list, &call_rcu_data_list);
 	crdp->cpu_affinity = cpu_affinity;
@@ -806,11 +892,15 @@ static void _call_rcu(struct rcu_head *head,
 		      void (*func)(struct rcu_head *head),
 		      struct call_rcu_data *crdp)
 {
+	unsigned long qlen;
+
 	cds_wfcq_node_init(&head->next);
 	head->func = func;
 	cds_wfcq_enqueue(&crdp->cbs_head, &crdp->cbs_tail, &head->next);
-	uatomic_inc(&crdp->qlen);
+	qlen = uatomic_add_return(&crdp->qlen, 1);
 	wake_call_rcu_thread(crdp);
+	if (caa_unlikely(crdp->qlen_cap && qlen >= crdp->qlen_cap))
+		call_rcu_cut_delay(crdp);
 }
 
 /*
