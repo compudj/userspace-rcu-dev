@@ -767,9 +767,21 @@ static void budget_test(void)
 
 	urcu_slab_init(&bs, CLASSES, NCLASS, "budget", 8);
 	if (!urcu_slab_enabled(&bs) || bs.ncpu < 2 || !bs.quota) {
-		skip(5, "budget: needs an enabled slab, a budget and 2+ cpus");
+		skip(6, "budget: needs an enabled slab, a budget and 2+ cpus");
 		return;
 	}
+#ifndef URCU_SLAB_MAX_MB
+	if (!getenv("URCU_TXN_SLAB_MAX_MB"))
+		ok(bs.max_sb_total == ((URCU_SLAB_MAX_MB_PER_CPU *
+				(unsigned long) bs.ncpu) << 20) / URCU_SLAB_RANGE,
+			"budget: the default pool is %lu MiB per cpu (%lu "
+			"superblocks for %d cpus)", URCU_SLAB_MAX_MB_PER_CPU,
+			bs.max_sb_total, bs.ncpu);
+	else
+		skip(1, "budget: URCU_TXN_SLAB_MAX_MB set, default not in force");
+#else
+	skip(1, "budget: URCU_SLAB_MAX_MB fixes the total at build time");
+#endif
 	bs.max_sb_total = total;		/* nothing drawn yet */
 
 	first = urcu_slab_reserve_sb(&bs, 0);

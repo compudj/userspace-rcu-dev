@@ -107,8 +107,10 @@ extern "C" {
 #endif
 
 /*
- * Default footprint budget for the WHOLE slab, in MiB (URCU_TXN_SLAB_MAX_MB;
- * 0 = unlimited).
+ * Default footprint budget for the WHOLE slab, in MiB per configured cpu: the
+ * pool holds URCU_SLAB_MAX_MB_PER_CPU times the cpu count.  URCU_TXN_SLAB_MAX_MB
+ * (environment), or URCU_SLAB_MAX_MB defined at build time, sets the total in
+ * MiB instead; 0 = unlimited.
  *
  * Process-wide, not per-arena.  A per-arena cap has to be guessed against
  * demand that is not a property of the arena at all: blocks in flight are
@@ -125,6 +127,17 @@ extern "C" {
  * cpu that still holds quota.  A cpu that finds the pool drained takes spare
  * quota another cpu drew but has not used before refusing, so chunking
  * strands nothing at the limit: the total stays the bound.
+ *
+ * SIZED BY THE MACHINE.  Blocks in flight grow with the writers, and the
+ * writers a machine can run grow with its cpus, so a fixed total is too small
+ * on a large machine long before it bounds anything.  Measured on a 384-cpu
+ * machine, 192 writers committing transactions under the call_rcu queue cap:
+ * the old fixed 1 GiB spilled ~4.5 GiB into posix_memalign, where transparent
+ * huge pages back it, so the process held 7.4 GiB instead of the 4.2 GiB it
+ * holds unbounded -- the valve inflating the footprint it exists to bound.
+ * 8 MiB per cpu (3 GiB there) spilled slightly; 16 MiB (6 GiB) never did.
+ * Only the total scales: the pool still lets a busy cpu take more than its
+ * share, which is what a per-arena number could not.
  *
  * THIS IS A MEMORY SAFETY VALVE, AND NOTHING MORE.  It is not a tuning knob,
  * and reaching it is not a sizing mistake to be corrected by raising it.
@@ -149,8 +162,8 @@ extern "C" {
  * the raised cap achieves -- while the footprint PLATEAUS at 194 MiB.  Bounded
  * memory and better throughput, rather than one traded for the other.
  */
-#ifndef URCU_SLAB_MAX_MB
-#define URCU_SLAB_MAX_MB	1024UL
+#ifndef URCU_SLAB_MAX_MB_PER_CPU
+#define URCU_SLAB_MAX_MB_PER_CPU	16UL
 #endif
 
 /* Superblocks of budget a cpu draws from the pool at a time (see above). */
@@ -789,6 +802,24 @@ int urcu_slab_enabled(const struct urcu_slab *s)
  * each one small enough to fit a superblock past its header.  All three are
  * checked here.
  */
+/* The budget in superblocks, for @ncpu configured cpus (see URCU_SLAB_MAX_MB_PER_CPU). */
+static inline
+unsigned long urcu_slab_budget_sb(long ncpu)
+{
+	const char *e = getenv("URCU_TXN_SLAB_MAX_MB");
+	unsigned long mb;
+
+	if (e)
+		mb = strtoul(e, NULL, 10);
+	else
+#ifdef URCU_SLAB_MAX_MB
+		mb = URCU_SLAB_MAX_MB;
+#else
+		mb = URCU_SLAB_MAX_MB_PER_CPU * (unsigned long) ncpu;
+#endif
+	return (mb << 20) / URCU_SLAB_RANGE;
+}
+
 static inline
 void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 		const char *name, size_t link_off)
@@ -826,14 +857,7 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 	}
 	s->sb_granted = 0;
 	s->sb_spent = 0;
-	s->max_sb_total = (URCU_SLAB_MAX_MB << 20) / URCU_SLAB_RANGE;
-	{
-		const char *e = getenv("URCU_TXN_SLAB_MAX_MB");
-
-		if (e)
-			s->max_sb_total = (strtoul(e, NULL, 10) << 20) /
-					URCU_SLAB_RANGE;
-	}
+	s->max_sb_total = 0;		/* sized below, once the cpu count is known */
 	if (getenv("URCU_TXN_NO_CACHE"))
 		return;
 	/*
@@ -867,6 +891,7 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 	n = sysconf(_SC_NPROCESSORS_CONF);
 	if (n < 1)
 		n = 1;
+	s->max_sb_total = urcu_slab_budget_sb(n);
 	{
 		size_t bytes = (size_t) nclass * (size_t) n * sizeof(*s->arenas);
 
