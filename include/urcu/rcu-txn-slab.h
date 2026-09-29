@@ -42,8 +42,9 @@
  * the blocks it freed strand in their origin arena, so the process-wide
  * footprint tracks the SUM of the per-arena peaks: bounded, not minimal.
  *
- * Superblocks are left demand-paged (no MADV_HUGEPAGE: a partial superblock then
- * stays resident only for touched pages).  URCU_TXN_NO_CACHE (environment,
+ * Superblocks are backed by 4 KiB pages (MADV_NOHUGEPAGE, see
+ * urcu_slab_sb_new()), so a partial superblock stays resident only for the
+ * pages it has touched.  URCU_TXN_NO_CACHE (environment,
  * checked at init) disables the slab (the engine falls back to malloc).
  * URCU_TXN_CACHE_STATS dumps reuse/footprint; the engines' slab INSTANCES are
  * defined once in liburcu-common (src/urcu-txn.c) where init -- hence stats
