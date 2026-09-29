@@ -118,6 +118,14 @@ extern "C" {
  * the busy arena and meaningless as a bound on the process.  Budget the total
  * and let arenas take what they need.
  *
+ * ACCOUNTED PER CPU, BOUNDED IN TOTAL.  The total is a pool; each cpu draws
+ * quota from it URCU_SLAB_QUOTA_CHUNK superblocks at a time and carves
+ * against its own share, on a cache line of its own.  So the pool's line is
+ * written once per chunk rather than once per superblock, and never by a
+ * cpu that still holds quota.  A cpu that finds the pool drained takes spare
+ * quota another cpu drew but has not used before refusing, so chunking
+ * strands nothing at the limit: the total stays the bound.
+ *
  * THIS IS A MEMORY SAFETY VALVE, AND NOTHING MORE.  It is not a tuning knob,
  * and reaching it is not a sizing mistake to be corrected by raising it.
  * Superblocks are never unmapped, so the cap is the only thing standing between
@@ -143,6 +151,11 @@ extern "C" {
  */
 #ifndef URCU_SLAB_MAX_MB
 #define URCU_SLAB_MAX_MB	1024UL
+#endif
+
+/* Superblocks of budget a cpu draws from the pool at a time (see above). */
+#ifndef URCU_SLAB_QUOTA_CHUNK
+#define URCU_SLAB_QUOTA_CHUNK	4UL
 #endif
 
 #define URCU_SLAB_RANGE_MASK	(URCU_SLAB_RANGE - 1)
@@ -411,8 +424,18 @@ urcu_static_assert(sizeof(struct urcu_slab_arena) == 256,
 		urcu_slab_arena_not_four_lines);
 #endif
 
+/*
+ * One cpu's share of the footprint budget: superblocks it may still map
+ * without drawing on the pool.  Written by that cpu's carves, and by another
+ * cpu only when the pool is drained (see urcu_slab_reserve_sb()).
+ */
+struct urcu_slab_quota {
+	unsigned long left;
+} __attribute__((aligned(64)));
+
 struct urcu_slab {
 	struct urcu_slab_arena *arenas;	/* [nclass * ncpu], row-major by class */
+	struct urcu_slab_quota *quota;	/* [ncpu] budget shares; NULL = unlimited */
 	const size_t *class_size;	/* ascending byte size per class */
 	int nclass;
 	int ncpu;			/* 0 => disabled (engine falls back to malloc) */
@@ -490,12 +513,9 @@ struct urcu_slab {
 	 * Aligned, the block clears @call_rcu_fn, which then shares its line
 	 * only with @dead and @name -- both write-once.
 	 *
-	 * NOTE this does NOT address @nr_sb_total, which is
-	 * uatomic_add_return()'d on every superblock reserve while sharing line
-	 * 0 with @arenas, @class_size, @link_off and the rest of the read-hot
-	 * configuration.  That one is pre-existing and mild: reserves are rare
-	 * once reuse is high, and vanish under an unlimited budget, where
-	 * urcu_slab_reserve_sb() returns before touching it.
+	 * The budget's pool counter has a line of its own too (below), and
+	 * each cpu carves against its own quota line, so no reserve writes the
+	 * read-hot configuration's line either.
 	 */
 	/*
 	 * Footprint cap, in superblocks (0 = unlimited).
@@ -509,14 +529,14 @@ struct urcu_slab {
 	 * is permanent, not what is live.
 	 */
 	/*
-	 * The cap's ledger sits on a cache line of its own.  Every allocation
-	 * reads @arenas and @ncpu above, and every carve writes @nr_sb_total,
-	 * so sharing a line made each carve invalidate the fields every cpu's
-	 * allocation needs.  @sb_spent is sticky (see urcu_slab_reserve_sb()).
+	 * The pool sits on a cache line of its own.  Every allocation reads
+	 * @arenas and @ncpu above; a pool counter sharing their line made each
+	 * draw invalidate the fields every cpu's allocation needs.  @sb_spent is
+	 * sticky (see urcu_slab_reserve_sb()).
 	 */
 	unsigned long max_sb_total __attribute__((aligned(64)));	/* budget, in superblocks */
-	unsigned long nr_sb_total;	/* superblocks currently mapped */
-	int sb_spent;			/* a reservation was refused: stays spent */
+	unsigned long sb_granted;	/* superblocks handed out as quota */
+	int sb_spent;			/* pool and every spare share exhausted */
 	unsigned long st_reuse __attribute__((aligned(64)));
 	unsigned long st_carve, st_sbs;
 	/* which PATH served the op: rseq-local vs atomic fallback */
@@ -611,8 +631,8 @@ void urcu_slab_census(struct urcu_slab *s)
 		unsigned long parked = on_free + on_local + on_pend + on_lpend;
 		unsigned long live = blk_carved > parked ? blk_carved - parked : 0;
 		/*
-		 * st_sbs, NOT nr_sb_total: reserve_sb() returns early without
-		 * counting when the budget is unlimited, so nr_sb_total is
+		 * st_sbs, NOT sb_granted: reserve_sb() returns early without
+		 * counting when the budget is unlimited, so sb_granted is
 		 * maintained only while a cap is active and reads 0 exactly in
 		 * the unbounded case this census exists to inspect.
 		 */
@@ -778,6 +798,7 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 	int cl, c;
 
 	s->arenas = NULL;
+	s->quota = NULL;
 	s->ncpu = 0;
 	s->class_size = class_size;
 	s->nclass = nclass;
@@ -803,7 +824,7 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 		if (!s->batch_max)
 			s->batch_max = 1;
 	}
-	s->nr_sb_total = 0;
+	s->sb_granted = 0;
 	s->sb_spent = 0;
 	s->max_sb_total = (URCU_SLAB_MAX_MB << 20) / URCU_SLAB_RANGE;
 	{
@@ -853,6 +874,17 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 		if (!s->arenas)
 			return;			/* OOM: stay disabled */
 		memset(s->arenas, 0, bytes);
+	}
+	if (s->max_sb_total) {
+		size_t bytes = (size_t) n * sizeof(*s->quota);
+
+		s->quota = (struct urcu_slab_quota *) aligned_alloc(64, bytes);
+		if (!s->quota) {
+			free(s->arenas);
+			s->arenas = NULL;
+			return;			/* OOM: stay disabled */
+		}
+		memset(s->quota, 0, bytes);
 	}
 	for (cl = 0; cl < nclass; cl++) {
 		for (c = 0; c < (int) n; c++) {
@@ -904,44 +936,100 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 #endif
 }
 
-/* Map one RANGE-aligned superblock and prepend it to arena @a's list. */
+/* Take one superblock of quota from @q, if it has any left. */
+static inline
+int urcu_slab_quota_take(struct urcu_slab_quota *q)
+{
+	unsigned long v = uatomic_load(&q->left, CMM_RELAXED);
+
+	while (v) {
+		unsigned long old = uatomic_cmpxchg(&q->left, v, v - 1);
+
+		if (old == v)
+			return 1;
+		v = old;
+	}
+	return 0;
+}
+
+/* Draw up to @want superblocks of quota from the pool; returns how many. */
+static inline
+unsigned long urcu_slab_pool_take(struct urcu_slab *s, unsigned long want)
+{
+	unsigned long g = uatomic_load(&s->sb_granted, CMM_RELAXED);
+
+	for (;;) {
+		unsigned long n, old;
+
+		if (g >= s->max_sb_total)
+			return 0;
+		n = s->max_sb_total - g;
+		if (n > want)
+			n = want;
+		old = uatomic_cmpxchg(&s->sb_granted, g, g + n);
+		if (old == g)
+			return n;
+		g = old;
+	}
+}
+
 /*
- * Claim one superblock against the budget.  Returns 0 when the budget is spent,
- * at which point the caller returns NULL and the engines spill to
- * posix_memalign -- slower, but memory libc hands back when the burst ends,
- * whereas a superblock is never unmapped.
+ * Claim one superblock against the budget, for a carve on @cpu's arenas.
+ * Returns 0 when the budget is spent, at which point the caller returns NULL
+ * and the engines spill to posix_memalign -- slower, but memory libc hands back
+ * when the burst ends, whereas a superblock is never unmapped.
+ *
+ * In order: this cpu's own quota (its own line); else a chunk from the pool;
+ * else, the pool drained, one superblock of spare quota from another cpu.
+ *
+ * SPENT IS STICKY, and read with a plain load before the pool's atomics.
+ * Superblocks are never unmapped, so a pool that is drained, with no spare
+ * share left to take, stays that way.  Without the flag every carve past that
+ * point pays the pool's atomics and a scan of every cpu's share, and with the
+ * freelists dry that is every allocation: efficios-trie-benchmark's
+ * txn_sw_list under per-node locks fell from 280 to 10 Mops/s at 192 writers
+ * once the default budget ran out, on the shared counter this pool replaces.  Two cases leave the flag set while a
+ * superblock could still fit: an mmap failure's rollback, and a chunk another
+ * cpu drew in the instant before the scan and has not yet stored as its share.
+ * That quota is still carved by its owner; refusing here only spills to
+ * posix_memalign, which is what a budget refusal does anyway.
  */
 static inline
-int urcu_slab_reserve_sb(struct urcu_slab *s)
+int urcu_slab_reserve_sb(struct urcu_slab *s, int cpu)
 {
-	unsigned long n;
+	struct urcu_slab_quota *q;
+	unsigned long got;
+	int c;
 
 	if (!s->max_sb_total)
 		return 1;				/* unlimited */
-	/*
-	 * SPENT IS STICKY, and read with a plain load before the ledger's
-	 * atomics.  Superblocks are never unmapped, so once one reservation has
-	 * been refused the budget stays spent: the ledger only shrinks back when
-	 * a reservation rolls back or an mmap fails.  Without the flag every
-	 * carve past that point pays an add and a rollback on a line every cpu
-	 * shares, and with the freelists dry that is every allocation: P1's
-	 * list under per-node locks fell from 280 to 10 Mops/s at 192 writers
-	 * once the default budget ran out.  The one case the flag gets wrong is
-	 * an mmap failure's rollback, after which a reservation could have fit;
-	 * refusing it falls back to posix_memalign, which is what a budget
-	 * refusal does anyway.
-	 */
+	q = &s->quota[cpu];
+	if (urcu_slab_quota_take(q))
+		return 1;
 	if (uatomic_load(&s->sb_spent, CMM_RELAXED))
 		return 0;
-	n = uatomic_add_return(&s->nr_sb_total, 1);
-	if (n > s->max_sb_total) {
-		uatomic_dec(&s->nr_sb_total);
-		uatomic_store(&s->sb_spent, 1, CMM_RELAXED);
-		return 0;
+	got = urcu_slab_pool_take(s, URCU_SLAB_QUOTA_CHUNK);
+	if (got) {
+		if (got > 1)
+			uatomic_add(&q->left, got - 1);	/* the rest is this cpu's */
+		return 1;
 	}
-	return 1;
+	for (c = 0; c < s->ncpu; c++)
+		if (c != cpu && urcu_slab_quota_take(&s->quota[c]))
+			return 1;
+	uatomic_store(&s->sb_spent, 1, CMM_RELAXED);
+	return 0;
 }
 
+/* Give back a superblock reserved on @cpu whose mapping then failed. */
+static inline
+void urcu_slab_unreserve_sb(struct urcu_slab *s, int cpu)
+{
+	if (s->max_sb_total)
+		uatomic_inc(&s->quota[cpu].left);
+}
+
+/* Map one RANGE-aligned superblock and prepend it to arena @a's list. */
 static inline
 struct urcu_slab_sb *urcu_slab_sb_new(struct urcu_slab *s, struct urcu_slab_arena *a)
 {
@@ -1447,14 +1535,13 @@ carve:
 		 * back to posix_memalign, so the transaction still proceeds --
 		 * it just stops making the permanent footprint bigger.
 		 */
-		if (!urcu_slab_reserve_sb(s)) {
+		if (!urcu_slab_reserve_sb(s, a->cpu)) {
 			cds_lfs_pop_unlock(&a->freelist);
 			return NULL;
 		}
 		nsb = urcu_slab_sb_new(s, a);
-		if (!nsb)
-			uatomic_dec(&s->nr_sb_total);
 		if (!nsb) {
+			urcu_slab_unreserve_sb(s, a->cpu);
 			cds_lfs_pop_unlock(&a->freelist);
 			return NULL;
 		}
@@ -1535,15 +1622,17 @@ struct cds_lfs_node *urcu_slab_take_floor(struct urcu_slab *s,
 		 * later, so skipping the add would make every floor carve widen
 		 * the real footprint past URCU_TXN_SLAB_MAX_MB invisibly.  The
 		 * overrun is one superblock per floor carve -- not, as this
-		 * comment used to claim, one per arena.
+		 * comment used to claim, one per arena.  A refused reservation
+		 * is charged straight to the pool, past its limit.
 		 */
 		if (!a->sb || a->sb->bump + a->obj > URCU_SLAB_RANGE) {
 			struct urcu_slab_sb *nsb;
 
-			uatomic_add(&s->nr_sb_total, 1);
+			if (s->max_sb_total && !urcu_slab_reserve_sb(s, a->cpu))
+				uatomic_inc(&s->sb_granted);
 			nsb = urcu_slab_sb_new(s, a);
 			if (!nsb) {
-				uatomic_dec(&s->nr_sb_total);
+				urcu_slab_unreserve_sb(s, a->cpu);
 				cds_lfs_pop_unlock(&a->freelist);
 				return NULL;
 			}

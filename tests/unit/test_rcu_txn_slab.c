@@ -751,6 +751,58 @@ static void batch_concurrent_test(void)
 		"double-armed batch tail)");
 }
 
+/*
+ * The budget is a pool each cpu draws quota from, URCU_SLAB_QUOTA_CHUNK
+ * superblocks at a time; a cpu that finds the pool drained takes another cpu's
+ * spare quota before refusing, so the total stays the bound and chunking
+ * strands nothing.  Driven through urcu_slab_reserve_sb() directly, on a
+ * budget of one chunk plus one superblock, so nothing is mapped.
+ */
+static void budget_test(void)
+{
+	static struct urcu_slab bs;
+	const unsigned long chunk = URCU_SLAB_QUOTA_CHUNK, total = chunk + 1;
+	unsigned long granted = 0;
+	int taken = 0, first, i;
+
+	urcu_slab_init(&bs, CLASSES, NCLASS, "budget", 8);
+	if (!urcu_slab_enabled(&bs) || bs.ncpu < 2 || !bs.quota) {
+		skip(5, "budget: needs an enabled slab, a budget and 2+ cpus");
+		return;
+	}
+	bs.max_sb_total = total;		/* nothing drawn yet */
+
+	first = urcu_slab_reserve_sb(&bs, 0);
+	ok(first && bs.sb_granted == chunk && bs.quota[0].left == chunk - 1,
+		"budget: a cpu's first reserve draws a chunk of %lu and keeps "
+		"the rest as its own quota", chunk);
+
+	taken = urcu_slab_reserve_sb(&bs, 1);
+	ok(taken && bs.sb_granted == total && bs.quota[1].left == 0,
+		"budget: a second cpu draws what the pool has left (1), not a "
+		"whole chunk");
+
+	/* Pool drained: cpu 1 now takes cpu 0's spare quota, one at a time. */
+	for (i = 0; i < (int) chunk - 1; i++)
+		taken += urcu_slab_reserve_sb(&bs, 1);
+	granted = bs.sb_granted;
+	ok(first + taken == (int) total && bs.quota[0].left == 0 &&
+		granted == total,
+		"budget: a drained pool takes other cpus' spare quota, and the "
+		"reserves granted add up to the budget exactly (%d of %lu)",
+		first + taken, total);
+
+	ok(!urcu_slab_reserve_sb(&bs, 1) && bs.sb_spent &&
+		!urcu_slab_reserve_sb(&bs, 0) && bs.sb_granted == total,
+		"budget: with no spare quota left the refusal is sticky, for "
+		"every cpu, and the pool never exceeds its limit");
+
+	urcu_slab_unreserve_sb(&bs, 1);
+	ok(urcu_slab_reserve_sb(&bs, 1),
+		"budget: a cpu's own quota is still carved after the pool is "
+		"spent (an unreserved superblock comes back to its cpu)");
+}
+
 int main(void)
 {
 	static struct urcu_slab s;
@@ -776,6 +828,7 @@ int main(void)
 
 	basic_tests(&s);
 	footprint_test();
+	budget_test();
 	origin_test();
 	concurrent_test();
 	hotplug_test();
