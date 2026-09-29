@@ -416,17 +416,6 @@ struct urcu_slab {
 	int nclass;
 	int ncpu;			/* 0 => disabled (engine falls back to malloc) */
 	/*
-	 * Footprint cap, in superblocks per arena (0 = unlimited).
-	 *
-	 * Superblocks are NEVER unmapped, so without a cap a transient burst --
-	 * anything that makes allocation outrun the drain, since freed blocks
-	 * only become reusable when a batch is spliced back -- inflates the
-	 * process permanently.  Past the cap urcu_slab_alloc() returns NULL and
-	 * the engines fall back to posix_memalign(), which is slower but hands
-	 * the memory back to libc when the burst ends.  So the cap bounds what
-	 * is permanent, not what is live.
-	 */
-	/*
 	 * Byte offset within a block of the scratch word the slab links through.
 	 *
 	 * It CANNOT be offset 0.  A block reaches free_pending() at commit, one
@@ -446,8 +435,6 @@ struct urcu_slab {
 	 * block, two live roles, so they cannot share an offset.
 	 */
 	size_t batch_off;
-	unsigned long max_sb_total;	/* budget, in superblocks (0 = unlimited) */
-	unsigned long nr_sb_total;	/* superblocks currently mapped */
 	unsigned long batch_max;	/* close a batch at this many blocks */
 	/*
 	 * Deferral used to schedule batch closes and splices.  A parameter, not a
@@ -509,6 +496,26 @@ struct urcu_slab {
 	 * once reuse is high, and vanish under an unlimited budget, where
 	 * urcu_slab_reserve_sb() returns before touching it.
 	 */
+	/*
+	 * Footprint cap, in superblocks (0 = unlimited).
+	 *
+	 * Superblocks are NEVER unmapped, so without a cap a transient burst --
+	 * anything that makes allocation outrun the drain, since freed blocks
+	 * only become reusable when a batch is spliced back -- inflates the
+	 * process permanently.  Past the cap urcu_slab_alloc() returns NULL and
+	 * the engines fall back to posix_memalign(), which is slower but hands
+	 * the memory back to libc when the burst ends.  So the cap bounds what
+	 * is permanent, not what is live.
+	 */
+	/*
+	 * The cap's ledger sits on a cache line of its own.  Every allocation
+	 * reads @arenas and @ncpu above, and every carve writes @nr_sb_total,
+	 * so sharing a line made each carve invalidate the fields every cpu's
+	 * allocation needs.  @sb_spent is sticky (see urcu_slab_reserve_sb()).
+	 */
+	unsigned long max_sb_total __attribute__((aligned(64)));	/* budget, in superblocks */
+	unsigned long nr_sb_total;	/* superblocks currently mapped */
+	int sb_spent;			/* a reservation was refused: stays spent */
 	unsigned long st_reuse __attribute__((aligned(64)));
 	unsigned long st_carve, st_sbs;
 	/* which PATH served the op: rseq-local vs atomic fallback */
@@ -796,6 +803,7 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 			s->batch_max = 1;
 	}
 	s->nr_sb_total = 0;
+	s->sb_spent = 0;
 	s->max_sb_total = (URCU_SLAB_MAX_MB << 20) / URCU_SLAB_RANGE;
 	{
 		const char *e = getenv("URCU_TXN_SLAB_MAX_MB");
@@ -909,9 +917,25 @@ int urcu_slab_reserve_sb(struct urcu_slab *s)
 
 	if (!s->max_sb_total)
 		return 1;				/* unlimited */
+	/*
+	 * SPENT IS STICKY, and read with a plain load before the ledger's
+	 * atomics.  Superblocks are never unmapped, so once one reservation has
+	 * been refused the budget stays spent: the ledger only shrinks back when
+	 * a reservation rolls back or an mmap fails.  Without the flag every
+	 * carve past that point pays an add and a rollback on a line every cpu
+	 * shares, and with the freelists dry that is every allocation: P1's
+	 * list under per-node locks fell from 280 to 10 Mops/s at 192 writers
+	 * once the default budget ran out.  The one case the flag gets wrong is
+	 * an mmap failure's rollback, after which a reservation could have fit;
+	 * refusing it falls back to posix_memalign, which is what a budget
+	 * refusal does anyway.
+	 */
+	if (uatomic_load(&s->sb_spent, CMM_RELAXED))
+		return 0;
 	n = uatomic_add_return(&s->nr_sb_total, 1);
 	if (n > s->max_sb_total) {
 		uatomic_dec(&s->nr_sb_total);
+		uatomic_store(&s->sb_spent, 1, CMM_RELAXED);
 		return 0;
 	}
 	return 1;
