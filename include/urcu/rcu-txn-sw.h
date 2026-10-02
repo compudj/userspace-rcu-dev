@@ -1365,10 +1365,10 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
  * period.  The convenience wrapper urcu_txn_sw_commit() passes the
  * compile-time-selected call_rcu (hence its include-after-flavor requirement).
  *
- * @flavor names the flavor whose readers may hold a proxy, so that a
- * -DURCU_TXN_SLAB_BATCH build can retire the block in that flavor's batches;
- * it is used only when @call_rcu_fn is @flavor->update_call_rcu, and may be
- * NULL (per-block deferral).  urcu_txn_sw_commit() passes &rcu_flavor, the
+ * @flavor names the flavor whose readers may hold a proxy, so that the block
+ * can be retired in that flavor's batches (the default; -DURCU_TXN_SLAB_NO_BATCH
+ * opts out); it is used only when @call_rcu_fn is @flavor->update_call_rcu, and
+ * may be NULL (per-block deferral).  urcu_txn_sw_commit() passes &rcu_flavor, the
  * compile-time flavor's own struct, alongside its call_rcu.
  *
  * Reclaim:
@@ -1456,13 +1456,13 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	/*
 	 * A reader may hold a proxy into @blk, so this must not free it before a
 	 * grace period.  Both routes honour that; they differ in WHO defers.
-	 * -DURCU_TXN_SLAB_BATCH hands the block to the slab's batch retirement
-	 * (one call_rcu per BATCH); the default keeps one call_rcu per block.
+	 * By default the block goes to the slab's batch retirement (one call_rcu
+	 * per BATCH); -DURCU_TXN_SLAB_NO_BATCH keeps one call_rcu per block.
 	 * See urcu_txn_retire() in <urcu/rcu-txn-mcas.h> for the reasoning, for
 	 * why only slab-stamped blocks may take the batch route, and for why only
 	 * under @flavor's own deferral (batches are per flavor).
 	 */
-#ifdef URCU_TXN_SLAB_BATCH
+#ifndef URCU_TXN_SLAB_NO_BATCH
 	if (!(caa_likely(blk->slab && flavor &&
 			flavor->update_call_rcu == call_rcu_fn) &&
 			urcu_slab_free_pending(blk, flavor)))

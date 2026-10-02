@@ -51,22 +51,21 @@
  * registration -- runs, so define it for the whole build (library and embedder
  * TUs alike): a TU-local define only adds increment instrumentation.
  *
- * EXPERIMENTAL SUBSYSTEMS.  Two parts of this file are opt-in and have no
- * in-tree user, hence no CI coverage of their concurrency:
+ * BATCH RETIREMENT (urcu_slab_free_pending() and the floor / closer / splice
+ * machinery) is how the engines retire descriptors by default: one call_rcu per
+ * batch, not per descriptor, with batches kept per RCU flavor (see struct
+ * urcu_slab_batch_arena).  -DURCU_TXN_SLAB_NO_BATCH makes a TU retire one
+ * descriptor at a time through urcu_slab_free() from a call_rcu callback
+ * instead; TUs may differ on it, since a block's two routes may be mixed (see
+ * urcu_slab_free_pending()).
  *
- *  - BATCH RETIREMENT (urcu_slab_free_pending() and the floor / closer /
- *    splice machinery).  The engines free through urcu_slab_free() from a
- *    call_rcu callback; nothing in the tree opts in.
- *  - RSEQ LOCAL LISTS (URCU_SLAB_RSEQ).  A developer CPPFLAG, wired into no
- *    build file, so every in-tree build compiles the atomic paths only.
- *
- * Both are documented as they are implemented, but an embedder opting in is
- * the first user of that code.  URCU_SLAB_RSEQ additionally shares the
- * IDENTICAL-ACROSS-EVERY-TU requirement stated for URCU_SLAB_RANGE below, and
- * for a sharper reason: a TU built without it takes the arena's pop lock while
- * a TU built with it pops the same arena's freelist locklessly, which is the
- * combination lfstack's synchronization matrix forbids.  Define it for the
- * whole build or not at all.
+ * EXPERIMENTAL: RSEQ LOCAL LISTS (URCU_SLAB_RSEQ, configure --enable-slab-rseq).
+ * Opt-in, so an embedder opting in is among the first users of that code.  It
+ * shares the IDENTICAL-ACROSS-EVERY-TU requirement stated for URCU_SLAB_RANGE
+ * below, and for a sharper reason: a TU built without it takes the arena's pop
+ * lock while a TU built with it pops the same arena's freelist locklessly,
+ * which is the combination lfstack's synchronization matrix forbids.  Define it
+ * for the whole build or not at all.
  */
 
 #include <stddef.h>			/* offsetof, size_t */
@@ -158,10 +157,10 @@ extern "C" {
  * number only moves when the valve opens.
  *
  * The actual fix is to stop the leak.  Routing an engine's retirement through
- * URCU_TXN_SLAB_BATCH (see urcu_slab_free_pending()) takes block reuse from
- * ~11% to 99.6%: the same workload then reaches ~122 Mchurn/s -- faster than
- * the raised cap achieves -- while the footprint PLATEAUS at 194 MiB.  Bounded
- * memory and better throughput, rather than one traded for the other.
+ * batches (urcu_slab_free_pending(), now the engines' default) took block reuse
+ * from ~11% to 99.6%: the same workload then reached ~122 Mchurn/s -- faster
+ * than the raised cap achieves -- while the footprint PLATEAUED at 194 MiB.
+ * Bounded memory and better throughput, rather than one traded for the other.
  */
 #ifndef URCU_SLAB_MAX_MB_PER_CPU
 #define URCU_SLAB_MAX_MB_PER_CPU	16UL

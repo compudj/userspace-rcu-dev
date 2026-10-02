@@ -965,19 +965,21 @@ void urcu_txn_free_rcu(struct rcu_head *head)
 /*
  * Retire a committed descriptor.
  *
- * DEFAULT: one call_rcu per descriptor; the callback frees it with
- * urcu_slab_free(), i.e. AFTER the caller's grace period, straight onto the
- * origin arena's freelist.
+ * DEFAULT: hand it to the slab's BATCH retirement -- urcu_slab_free_pending(),
+ * BEFORE the grace period, the slab owning the deferral from here.  The block
+ * sits on its batch arena's pending list until the batch closes (about once
+ * per grace period; see URCU_SLAB_BATCH_MAX), and one call_rcu then splices
+ * the WHOLE batch onto the freelist with a single CAS.  The call_rcu worker
+ * never touches the blocks themselves: the freeing thread linked them while
+ * they were hot in its cache, and the splice writes only the tail.  Per
+ * descriptor, the worker instead visits every block a grace period after its
+ * commit, when its line has left the writer's cache -- and one call_rcu per
+ * descriptor is ~56M in 2 s at 48 writers, more than reclaim kept up with
+ * (block reuse 60-75%, backlog growing without bound).
  *
- * -DURCU_TXN_SLAB_BATCH: hand it to the slab's BATCH retirement instead --
- * urcu_slab_free_pending(), BEFORE the grace period, the slab owning the
- * deferral from here.  The block sits on its arena's pending list until a batch
- * closes (every URCU_SLAB_BATCH_MAX blocks), and one call_rcu then splices the
- * WHOLE batch onto the freelist with a single CAS.  That is what the batch
- * machinery exists for, and it is the difference between one call_rcu per
- * descriptor and one per batch: measured, this workload issues ~56M of the
- * former in 2 s at 48 writers, and reclaim cannot keep up -- block reuse sits
- * at 60-75% and the backlog grows without bound.
+ * -DURCU_TXN_SLAB_NO_BATCH: one call_rcu per descriptor instead; the callback
+ * frees it with urcu_slab_free(), i.e. AFTER the caller's grace period,
+ * straight onto the origin arena's freelist.
  *
  * Only a slab-backed descriptor may take that path: free_pending() derives the
  * origin arena by masking the block address to its superblock, which is
@@ -1002,7 +1004,7 @@ void urcu_txn_retire(struct urcu_txn_desc *t,
 			void (*)(struct rcu_head *)),
 		const struct rcu_flavor_struct *flavor)
 {
-#ifdef URCU_TXN_SLAB_BATCH
+#ifndef URCU_TXN_SLAB_NO_BATCH
 	if (caa_likely(t->slab && flavor &&
 			flavor->update_call_rcu == call_rcu_fn) &&
 			urcu_slab_free_pending(t, flavor))

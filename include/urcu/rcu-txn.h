@@ -654,8 +654,9 @@ void (*urcu_txn__call_rcu(const struct urcu_txn *txn))(struct rcu_head *,
 /*
  * The flavor that deferral belongs to, chosen the same way: the bound one, or
  * the compile-time-selected flavor's own struct.  The engines use it to retire
- * descriptors in that flavor's batches (-DURCU_TXN_SLAB_BATCH); a commit given
- * a deferral that is not this flavor's update_call_rcu retires per descriptor.
+ * descriptors in that flavor's batches (the default, unless
+ * -DURCU_TXN_SLAB_NO_BATCH); a commit given a deferral that is not this
+ * flavor's update_call_rcu retires per descriptor.
  */
 static inline
 const struct rcu_flavor_struct *urcu_txn__flavor(const struct urcu_txn *txn)
