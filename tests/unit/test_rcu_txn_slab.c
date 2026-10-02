@@ -41,6 +41,16 @@
  *      fallback closer.  Two closers that both recall the same floor as their
  *      batch tail queue one rcu_head twice and splice one chain twice, which
  *      shows up here as a block handed out by two allocations.
+ *  10. PER-FLAVOR BATCHES: a grace period is flavor-scoped, so a batch may
+ *      only hold one flavor's blocks.  Blocks retired under two flavors into
+ *      the SAME arena, interleaved, with the second flavor's grace period held
+ *      open by the test: every block of the first comes back after its grace
+ *      period, and not one block of the second does until the test ends that
+ *      flavor's grace period -- then all of them do, nothing twice.  A shared
+ *      batch would splice second-flavor blocks on the first flavor's grace
+ *      period.
+ *  11. DECLINE: a NULL flavor, and a flavor past URCU_SLAB_MAX_FLAVORS, are
+ *      declined (0, block untouched) rather than batched.
  *
  * Compiled with -DURCU_TXN_CACHE_STATS so the st_reuse/st_carve counters on the
  * test's own slab instances are live and assertable (the counters are
@@ -487,13 +497,18 @@ static int batch_stamp_ok(void *p)
 static int batch_floors_held(struct urcu_slab *s, struct urcu_slab_arena *a,
 		void **set, int n)
 {
-	int held = 0;
+	int held = 0, f;
 
-	if (a->floor && in_set(set, n, urcu_slab_block(s, a->floor)))
-		held++;
-	if (a->local_floor &&
-			in_set(set, n, urcu_slab_block(s, a->local_floor)))
-		held++;
+	/* every flavor's batch arena for @a keeps its own floors */
+	for (f = 0; f < URCU_SLAB_MAX_FLAVORS && s->batch[f].flavor; f++) {
+		struct urcu_slab_batch_arena *ba = &s->batch[f].arenas[a->idx];
+
+		if (ba->floor && in_set(set, n, urcu_slab_block(s, ba->floor)))
+			held++;
+		if (ba->local_floor &&
+				in_set(set, n, urcu_slab_block(s, ba->local_floor)))
+			held++;
+	}
 	return held;
 }
 
@@ -545,7 +560,7 @@ static void batch_test(void)
 	 * below must come from a fresh carve.
 	 */
 	for (i = 0; i < BATCH_N; i++)
-		urcu_slab_free_pending(blk[i], call_rcu);
+		urcu_slab_free_pending(blk[i], &rcu_flavor);
 	for (i = 0; i < BATCH_N; i++) {
 		probe[i] = urcu_slab_alloc(&bs, BATCH_CL);
 		if (probe[i] && in_set(blk, BATCH_N, probe[i]))
@@ -592,6 +607,7 @@ static void batch_exclusion_test(void)
 {
 	static struct urcu_slab xs;
 	struct urcu_slab_arena *a;
+	struct urcu_slab_batch_arena *ba;
 	struct cds_lfs_node *floor_before, *floor_blocked, *floor_after;
 	struct cds_lfs_node *lfloor_before, *lfloor_blocked, *lfloor_after;
 	void *p[4];
@@ -623,21 +639,22 @@ static void batch_exclusion_test(void)
 	 * it swaps that floor and only that floor.
 	 */
 	for (i = 0; i < 4; i++)
-		urcu_slab_free_pending(p[i], call_rcu);
-	floor_before = a->floor;
-	lfloor_before = a->local_floor;
+		urcu_slab_free_pending(p[i], &rcu_flavor);
+	ba = &urcu_slab_batch_arenas(&xs, &rcu_flavor)[a->idx];
+	floor_before = ba->floor;
+	lfloor_before = ba->local_floor;
 
-	/* Another closer owns the arena: this one must leave it alone. */
-	pthread_mutex_lock(&a->boot);
-	closed_blocked = urcu_slab_close_arena(&xs, a, cpu);
-	floor_blocked = a->floor;
-	lfloor_blocked = a->local_floor;
-	pthread_mutex_unlock(&a->boot);
+	/* Another closer owns the batch: this one must leave it alone. */
+	pthread_mutex_lock(&ba->boot);
+	closed_blocked = urcu_slab_close_arena(&xs, ba, cpu);
+	floor_blocked = ba->floor;
+	lfloor_blocked = ba->local_floor;
+	pthread_mutex_unlock(&ba->boot);
 
-	/* Control: the very same call closes once the arena is free. */
-	closed_free = urcu_slab_close_arena(&xs, a, cpu);
-	floor_after = a->floor;
-	lfloor_after = a->local_floor;
+	/* Control: the very same call closes once the batch is free. */
+	closed_free = urcu_slab_close_arena(&xs, ba, cpu);
+	floor_after = ba->floor;
+	lfloor_after = ba->local_floor;
 
 	ok(!closed_blocked && floor_blocked == floor_before &&
 			lfloor_blocked == lfloor_before,
@@ -677,7 +694,7 @@ static void *bc_freer_thr(void *v)
 
 	pin_to(arg->cpu);
 	for (i = 0; i < arg->n; i++)
-		urcu_slab_free_pending(arg->blk[i], call_rcu);
+		urcu_slab_free_pending(arg->blk[i], &rcu_flavor);
 	return NULL;
 }
 
@@ -758,6 +775,177 @@ static void batch_concurrent_test(void)
  * strands nothing.  Driven through urcu_slab_reserve_sb() directly, on a
  * budget of one chunk plus one superblock, so nothing is mapped.
  */
+/* ------------------------------------------------------------------ */
+/* 10 + 11. per-flavor batches                                        */
+/* ------------------------------------------------------------------ */
+/*
+ * A second flavor whose grace period the test controls: its update_call_rcu
+ * only queues, and gp_end() runs whatever was queued -- the closer, and the
+ * splices the closer arms -- until nothing is left.
+ */
+#define PF_N		256
+#define PF_LINK		8
+
+struct pf_cb {
+	struct rcu_head *head;
+	void (*fn)(struct rcu_head *);
+};
+
+static struct pf_cb pf_queue[4096];
+static int pf_nq;
+static unsigned long pf_deferrals;
+
+static void pf_call_rcu(struct rcu_head *head, void (*fn)(struct rcu_head *))
+{
+	if (pf_nq >= (int) (sizeof(pf_queue) / sizeof(pf_queue[0])))
+		abort();
+	pf_queue[pf_nq].head = head;
+	pf_queue[pf_nq].fn = fn;
+	pf_nq++;
+	pf_deferrals++;
+}
+
+static void pf_gp_end(void)
+{
+	while (pf_nq) {
+		struct pf_cb cb = pf_queue[--pf_nq];
+
+		cb.fn(cb.head);
+	}
+}
+
+static struct rcu_flavor_struct pf_flavor = { .update_call_rcu = pf_call_rcu };
+
+static void batch_flavor_test(void)
+{
+	static struct urcu_slab fs;
+	static void *blk[2 * PF_N], *all[8 * PF_N];
+	void **back = all, **back2 = all + 4 * PF_N;
+	struct urcu_slab_arena *a;
+	int i, cpu, taken = 0, got_a = 0, got_b = 0, held, stamp_bad = 0;
+
+	urcu_slab_init(&fs, CLASSES, NCLASS, "batch_flavor", PF_LINK);
+	if (!urcu_slab_enabled(&fs)) {
+		skip(3, "slab disabled");
+		return;
+	}
+	fs.batch_max = BATCH_MAX;
+	pin_to(0);
+	cpu = urcu_slab_cpu();
+	if (cpu < 0 || cpu >= fs.ncpu)
+		cpu = 0;
+	a = &fs.arenas[BATCH_CL * fs.ncpu + cpu];
+	for (i = 0; i < 2 * PF_N; i++) {
+		blk[i] = urcu_slab_alloc(&fs, BATCH_CL);
+		if (!blk[i]) {
+			skip(3, "slab OOM during flavor test setup");
+			return;
+		}
+		batch_stamp(blk[i], (uint64_t) i + 1);
+	}
+	/* even blocks under this test's flavor (QSBR), odd under pf_flavor */
+	for (i = 0; i < 2 * PF_N; i++)
+		taken += urcu_slab_free_pending(blk[i],
+				(i & 1) ? &pf_flavor : &rcu_flavor);
+
+	/* QSBR grace periods only: pf_flavor's never ends here */
+	batch_drain();
+	for (i = 0; i < 4 * PF_N; i++)
+		back[i] = urcu_slab_alloc(&fs, BATCH_CL);
+	for (i = 0; i < 4 * PF_N; i++) {
+		int j;
+
+		if (!back[i])
+			continue;
+		for (j = 0; j < 2 * PF_N; j++) {
+			if (back[i] != blk[j])
+				continue;
+			if (j & 1)
+				got_b++;
+			else
+				got_a++;
+		}
+	}
+	held = batch_floors_held(&fs, a, blk, 2 * PF_N);
+	ok(taken == 2 * PF_N && got_b == 0 && got_a >= PF_N - held &&
+		got_a <= PF_N && pf_deferrals > 0,
+		"flavor: %d/%d taken; after the first flavor's grace periods, "
+		"%d of its %d blocks back and %d of the second flavor's (held "
+		"open) -- none may be", taken, 2 * PF_N, got_a, PF_N, got_b);
+	/*
+	 * End the second flavor's grace period and allocate again, keeping
+	 * the first round: freeing it would park it on an rseq build's local
+	 * list, which a second round of the same size would drain without
+	 * ever reaching the freelist the splices refill.
+	 */
+	pf_gp_end();
+	pf_gp_end();
+	for (i = 0; i < 4 * PF_N; i++)
+		back2[i] = urcu_slab_alloc(&fs, BATCH_CL);
+	got_a = got_b = 0;
+	for (i = 0; i < 4 * PF_N; i++) {
+		int j;
+
+		if (!back2[i])
+			continue;
+		for (j = 0; j < 2 * PF_N; j++) {
+			if (back2[i] != blk[j])
+				continue;
+			if (!batch_stamp_ok(back2[i]))
+				stamp_bad++;
+			if (j & 1)
+				got_b++;
+			else
+				got_a++;
+		}
+	}
+	ok(got_b >= PF_N - 2 && got_b <= PF_N && stamp_bad == 0,
+		"flavor: once the second flavor's grace period ends, %d/%d of its "
+		"blocks back (its floors aside), %d stamp faults", got_b, PF_N,
+		stamp_bad);
+	ok(count_dups(all, 8 * PF_N) == 0,
+		"flavor: no block handed out twice, across both flavors and both "
+		"rounds");
+}
+
+static void batch_decline_test(void)
+{
+	static struct urcu_slab ds;
+	static struct rcu_flavor_struct many[URCU_SLAB_MAX_FLAVORS + 1];
+	void *p[URCU_SLAB_MAX_FLAVORS + 2];
+	int i, taken = 0, last, null_ret;
+	uint64_t mark;
+
+	urcu_slab_init(&ds, CLASSES, NCLASS, "batch_decline", PF_LINK);
+	if (!urcu_slab_enabled(&ds)) {
+		skip(1, "slab disabled");
+		return;
+	}
+	for (i = 0; i < URCU_SLAB_MAX_FLAVORS + 2; i++) {
+		p[i] = urcu_slab_alloc(&ds, BATCH_CL);
+		if (!p[i]) {
+			skip(1, "slab OOM during decline test setup");
+			return;
+		}
+		*(uint64_t *) ((char *) p[i] + PF_LINK) = 0xdec11e0000ULL + i;
+	}
+	null_ret = urcu_slab_free_pending(p[0], NULL);
+	for (i = 0; i < URCU_SLAB_MAX_FLAVORS; i++) {
+		many[i].update_call_rcu = pf_call_rcu;
+		taken += urcu_slab_free_pending(p[i + 1], &many[i]);
+	}
+	many[i].update_call_rcu = pf_call_rcu;
+	last = urcu_slab_free_pending(p[i + 1], &many[i]);
+	mark = *(uint64_t *) ((char *) p[i + 1] + PF_LINK);
+	ok(!null_ret && taken == URCU_SLAB_MAX_FLAVORS && !last &&
+		mark == 0xdec11e0000ULL + (uint64_t) (i + 1) &&
+		ds.st_p_declined == 2,
+		"decline: NULL flavor declined, %d/%d flavors batched, flavor "
+		"%d declined with its block untouched", taken,
+		URCU_SLAB_MAX_FLAVORS, URCU_SLAB_MAX_FLAVORS + 1);
+	pf_gp_end();
+}
+
 static void budget_test(void)
 {
 	static struct urcu_slab bs;
@@ -849,6 +1037,8 @@ int main(void)
 	batch_test();
 	batch_exclusion_test();
 	batch_concurrent_test();
+	batch_flavor_test();
+	batch_decline_test();
 	rcu_barrier();
 	rcu_unregister_thread();
 	return exit_status();

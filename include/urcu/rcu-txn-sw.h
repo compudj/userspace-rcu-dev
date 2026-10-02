@@ -1365,6 +1365,12 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
  * period.  The convenience wrapper urcu_txn_sw_commit() passes the
  * compile-time-selected call_rcu (hence its include-after-flavor requirement).
  *
+ * @flavor names the flavor whose readers may hold a proxy, so that a
+ * -DURCU_TXN_SLAB_BATCH build can retire the block in that flavor's batches;
+ * it is used only when @call_rcu_fn is @flavor->update_call_rcu, and may be
+ * NULL (per-block deferral).  urcu_txn_sw_commit() passes &rcu_flavor, the
+ * compile-time flavor's own struct, alongside its call_rcu.
+ *
  * Reclaim:
  *   - nr >= 2 (proxies parked): the group block (carrying the record array) is
  *     deferred through call_rcu_fn(.., urcu_txn_sw_free_rcu).
@@ -1391,7 +1397,8 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 static inline
 enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 		void (*call_rcu_fn)(struct rcu_head *,
-			void (*)(struct rcu_head *)))
+			void (*)(struct rcu_head *)),
+		const struct rcu_flavor_struct *flavor)
 {
 	struct urcu_txn_sw_block *blk;
 	unsigned int i;
@@ -1451,15 +1458,17 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	 * grace period.  Both routes honour that; they differ in WHO defers.
 	 * -DURCU_TXN_SLAB_BATCH hands the block to the slab's batch retirement
 	 * (one call_rcu per BATCH); the default keeps one call_rcu per block.
-	 * See urcu_txn_retire() in <urcu/rcu-txn-mcas.h> for the reasoning and
-	 * for why only slab-stamped blocks may take the batch route.
+	 * See urcu_txn_retire() in <urcu/rcu-txn-mcas.h> for the reasoning, for
+	 * why only slab-stamped blocks may take the batch route, and for why only
+	 * under @flavor's own deferral (batches are per flavor).
 	 */
 #ifdef URCU_TXN_SLAB_BATCH
-	if (caa_likely(blk->slab))
-		urcu_slab_free_pending(blk, call_rcu_fn);
-	else
+	if (!(caa_likely(blk->slab && flavor &&
+			flavor->update_call_rcu == call_rcu_fn) &&
+			urcu_slab_free_pending(blk, flavor)))
 		call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);
 #else
+	(void) flavor;
 	call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);
 #endif
 	t->block = NULL;		/* handle consumed */
@@ -1476,7 +1485,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 static inline
 enum urcu_txn_status urcu_txn_sw_commit(struct urcu_txn_sw_txn *t)
 {
-	return urcu_txn_sw_commit_flavor(t, call_rcu);
+	return urcu_txn_sw_commit_flavor(t, call_rcu, &rcu_flavor);
 }
 
 #ifdef __cplusplus

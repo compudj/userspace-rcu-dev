@@ -206,7 +206,7 @@ static void *worker(void *arg)
 				ow = (uintptr_t) urcu_txn_read(&g_word[w], URCU_TXN_TAG);
 				urcu_txn_add_mw(t, &g_word[w],
 					(void *) ow, (void *) lf_bump(ow, 1), URCU_TXN_TAG);
-				ok = urcu_txn_desc_commit(t, call_rcu);
+				ok = urcu_txn_desc_commit(t, call_rcu, &rcu_flavor);
 				rcu_read_unlock();
 				if (!ok)
 					retry++;
@@ -254,7 +254,7 @@ static void *worker(void *arg)
 					urcu_txn_add_mw(t, &g_word[j],
 						(void *) oj, (void *) lf_bump(oj, -2), URCU_TXN_TAG);
 				}
-				ok = urcu_txn_desc_commit(t, call_rcu);
+				ok = urcu_txn_desc_commit(t, call_rcu, &rcu_flavor);
 				rcu_read_unlock();
 				if (!ok)
 					retry++;

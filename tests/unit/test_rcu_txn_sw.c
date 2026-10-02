@@ -190,7 +190,7 @@ int main(void)
 			"inline latch buffer is 16-byte aligned (tag room)");
 		urcu_txn_sw_init_inline(t, buf, 1);
 		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200, TEST_TAG);
-		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu);	/* lone edge: fn unused */
+		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu, NULL);	/* lone edge: fn unused */
 		ok(st == URCU_TXN_STATUS_OK, "inline lone-edge commit_flavor returns OK");
 		ok(slot == (void *) 0x200 && !is_proxy(slot),
 			"inline lone-edge slot holds new directly, no proxy");
@@ -212,7 +212,7 @@ int main(void)
 		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
 		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
 		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x31, TEST_TAG);
-		st = urcu_txn_sw_commit_flavor(t, counting_call_rcu);
+		st = urcu_txn_sw_commit_flavor(t, counting_call_rcu, NULL);
 		ok(st == URCU_TXN_STATUS_OK, "commit_flavor multi-edge returns OK");
 		ok(s1 == (void *) 0x11 && s2 == (void *) 0x21 &&
 			s3 == (void *) 0x31, "commit_flavor slots all settled to new");
@@ -234,7 +234,7 @@ int main(void)
 		urcu_txn_sw_init(t);
 		urcu_txn_sw_record(t, &s1, (void *) 0x40, (void *) 0x41, TEST_TAG);
 		urcu_txn_sw_record(t, &s2, (void *) 0x50, (void *) 0x51, TEST_TAG);
-		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu);
+		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu, NULL);
 		ok(st == URCU_TXN_STATUS_OK,
 			"exclusive (synchronous-reclaim) multi-edge commit returns OK");
 		ok(s1 == (void *) 0x41 && s2 == (void *) 0x51,

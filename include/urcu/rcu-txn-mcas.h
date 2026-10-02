@@ -984,6 +984,13 @@ void urcu_txn_free_rcu(struct rcu_head *head)
  * meaningless for an exact malloc'd descriptor.  The @slab STAMP decides, not
  * the slab's current enabled state -- the same rule urcu_txn_free() uses.
  *
+ * And only under @flavor's own deferral.  Batches are per flavor (a grace
+ * period is flavor-scoped; see urcu_slab_free_pending()), so the batch route
+ * needs to know WHICH flavor's readers may still reach @t, and is taken only
+ * when @call_rcu_fn is that flavor's update_call_rcu.  A NULL @flavor, a
+ * custom deferral function, or a slab that declines all take the
+ * per-descriptor call_rcu below -- correct, merely unbatched.
+ *
  * The layout precondition -- bytes [link_off, batch_off + 8) dead to readers
  * from this call until the splice -- holds by construction: that range is
  * @rcu_head plus the batch overlay reserved after it, and the descriptor pins
@@ -992,13 +999,16 @@ void urcu_txn_free_rcu(struct rcu_head *head)
 static inline
 void urcu_txn_retire(struct urcu_txn_desc *t,
 		void (*call_rcu_fn)(struct rcu_head *,
-			void (*)(struct rcu_head *)))
+			void (*)(struct rcu_head *)),
+		const struct rcu_flavor_struct *flavor)
 {
 #ifdef URCU_TXN_SLAB_BATCH
-	if (caa_likely(t->slab)) {
-		urcu_slab_free_pending(t, call_rcu_fn);
+	if (caa_likely(t->slab && flavor &&
+			flavor->update_call_rcu == call_rcu_fn) &&
+			urcu_slab_free_pending(t, flavor))
 		return;
-	}
+#else
+	(void) flavor;
 #endif
 	call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 }
@@ -1007,8 +1017,10 @@ void urcu_txn_retire(struct urcu_txn_desc *t,
  * Commit @t (the sw-mw-aware path): install MW records (may abort), then SW
  * records, decide, settle.  Returns true on commit (SUCCEEDED), false on abort
  * (FAILED) -- the caller re-reads and retries.  Reclaim is deferred through
- * @call_rcu_fn; a lone edge commits without a proxy and frees immediately (no
- * grace period).  Call within an RCU read-side section.
+ * @call_rcu_fn -- in batches when it is @flavor's update_call_rcu, see
+ * urcu_txn_retire(); @flavor may be NULL -- and a lone edge commits without a
+ * proxy and frees immediately (no grace period).  Call within an RCU read-side
+ * section.
  *
  * Use urcu_txn_desc_commit_sw() instead when the descriptor is known to
  * carry NO MW records: it skips the partition, sort, CAS-install and abort path
@@ -1017,7 +1029,8 @@ void urcu_txn_retire(struct urcu_txn_desc *t,
 static inline
 bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 		void (*call_rcu_fn)(struct rcu_head *,
-			void (*)(struct rcu_head *)))
+			void (*)(struct rcu_head *)),
+		const struct rcu_flavor_struct *flavor)
 {
 	unsigned int i, nr_mw, planted;
 	/*
@@ -1121,7 +1134,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			 */
 			urcu_txn_destroy(t);
 		} else {
-			urcu_txn_retire(t, call_rcu_fn);
+			urcu_txn_retire(t, call_rcu_fn, flavor);
 		}
 		return false;
 	}
@@ -1130,7 +1143,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 		urcu_txn_park(&t->recs[i]);	/* SW parks: plain, never fail */
 	urcu_txn_decide(t, URCU_TXN_DESC_SUCCEEDED);	/* linearization point */
 	urcu_txn_settle(t, nr, URCU_TXN_DESC_SUCCEEDED);
-	urcu_txn_retire(t, call_rcu_fn);
+	urcu_txn_retire(t, call_rcu_fn, flavor);
 	return true;
 }
 
@@ -1147,7 +1160,8 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 static inline
 bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 		void (*call_rcu_fn)(struct rcu_head *,
-			void (*)(struct rcu_head *)))
+			void (*)(struct rcu_head *)),
+		const struct rcu_flavor_struct *flavor)
 {
 	unsigned int i;
 	/*
@@ -1169,7 +1183,7 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 	 * Degrading to the general path is strictly better than being wrong.
 	 */
 	if (caa_unlikely(t->nr_mw != 0))
-		return urcu_txn_desc_commit(t, call_rcu_fn);
+		return urcu_txn_desc_commit(t, call_rcu_fn, flavor);
 	if (caa_unlikely(t->poisoned)) {
 		urcu_txn_destroy(t);
 		return false;
@@ -1195,7 +1209,7 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 		urcu_txn_park(&t->recs[i]);		/* plain stores, never fail */
 	urcu_txn_decide(t, URCU_TXN_DESC_SUCCEEDED);	/* linearization point */
 	urcu_txn_settle(t, nr, URCU_TXN_DESC_SUCCEEDED);
-	urcu_txn_retire(t, call_rcu_fn);
+	urcu_txn_retire(t, call_rcu_fn, flavor);
 	return true;
 }
 

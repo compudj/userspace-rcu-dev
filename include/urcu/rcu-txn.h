@@ -652,6 +652,18 @@ void (*urcu_txn__call_rcu(const struct urcu_txn *txn))(struct rcu_head *,
 }
 
 /*
+ * The flavor that deferral belongs to, chosen the same way: the bound one, or
+ * the compile-time-selected flavor's own struct.  The engines use it to retire
+ * descriptors in that flavor's batches (-DURCU_TXN_SLAB_BATCH); a commit given
+ * a deferral that is not this flavor's update_call_rcu retires per descriptor.
+ */
+static inline
+const struct rcu_flavor_struct *urcu_txn__flavor(const struct urcu_txn *txn)
+{
+	return txn->flavor ? txn->flavor : &rcu_flavor;
+}
+
+/*
  * Retire the PER-OPERATION state at a terminal outcome -- a committed OK, a
  * MEMORY_ERROR, or urcu_txn_abandon().  Not on ABORT: aging must accumulate
  * across the attempts of ONE operation, which is the whole point of it.
@@ -1443,7 +1455,7 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_txn *txn,
 	urcu_txn__learn_cost(txn);
 	txn->desc = NULL;
 	poisoned = m->poisoned;		/* read before commit consumes @m */
-	if (urcu_txn_desc_commit(m, call_rcu_fn)) {
+	if (urcu_txn_desc_commit(m, call_rcu_fn, urcu_txn__flavor(txn))) {
 		urcu_txn__op_done(txn);
 		return URCU_TXN_STATUS_OK;
 	}
@@ -1509,7 +1521,7 @@ enum urcu_txn_status urcu_txn_commit_sw_flavor(struct urcu_txn *txn,
 	urcu_txn__learn_cost(txn);
 	txn->desc = NULL;
 	poisoned = m->poisoned;		/* read before commit consumes @m */
-	if (urcu_txn_desc_commit_sw(m, call_rcu_fn)) {
+	if (urcu_txn_desc_commit_sw(m, call_rcu_fn, urcu_txn__flavor(txn))) {
 		urcu_txn__op_done(txn);
 		return URCU_TXN_STATUS_OK;
 	}
