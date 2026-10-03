@@ -1196,6 +1196,19 @@ struct urcu_slab_sb *urcu_slab_sb_new(struct urcu_slab *s, struct urcu_slab_aren
  * the right bet for a stack usually found empty and the wrong one for ours --
  * the pending stack always carries a floor, so it is never empty.  Prime with a
  * load instead and the common case costs one cmpxchg.
+ *
+ * NO LEGACY BARRIER, here or in urcu_slab_pop().  lfstack's push and pop each
+ * issue cmm_emit_legacy_smp_mb() beside their cmpxchg, because the lfstack API
+ * documented a full barrier there and old callers may order their own state
+ * on it.  The slab is not such a caller: all it needs from the push is that
+ * the store to node->next be ordered before the node is published, and the
+ * CMM_SEQ_CST cmpxchg does that on every architecture.  A legacy-barrier build
+ * (liburcu's default) otherwise pays a second full barrier next to each
+ * cmpxchg: on x86, 49 of the 300 cycles a transacted list update costs its
+ * writer.  Nothing here orders anything on a barrier AFTER the cmpxchg either:
+ * urcu_slab_arm_closer() does follow the pending push with a relaxed load, and
+ * that pairing never rested on the legacy barrier, which sat BEFORE the
+ * cmpxchg.
  */
 static inline
 void urcu_slab_push(struct cds_lfs_stack *s, struct cds_lfs_node *node)
@@ -1208,11 +1221,36 @@ void urcu_slab_push(struct cds_lfs_stack *s, struct cds_lfs_node *node)
 	for (;;) {
 		old = head;
 		node->next = &head->node;
-		cmm_emit_legacy_smp_mb();
 		head = uatomic_cmpxchg_mo(&s->head, old, new_head,
 				CMM_SEQ_CST, CMM_SEQ_CST);
 		if (caa_likely(old == head))
 			return;
+	}
+}
+
+/*
+ * __cds_lfs_pop() without its trailing legacy barrier (see urcu_slab_push()).
+ * Same synchronization as __cds_lfs_pop(): the caller holds the stack's pop
+ * lock, which is what makes reading head->next safe against a concurrent pop
+ * reusing the node.  Returns NULL on an empty stack.
+ */
+static inline
+struct cds_lfs_node *urcu_slab_pop(struct cds_lfs_stack *s)
+{
+	for (;;) {
+		struct cds_lfs_head *head, *next_head;
+		struct cds_lfs_node *next;
+
+		head = uatomic_load(&s->head, CMM_CONSUME);
+		if (!head)
+			return NULL;
+		/* Read head before head->next: the push's cmpxchg published both. */
+		next = uatomic_load(&head->node.next);
+		next_head = caa_container_of(next, struct cds_lfs_head, node);
+		if (uatomic_cmpxchg_mo(&s->head, head, next_head,
+				CMM_SEQ_CST, CMM_SEQ_CST) == head)
+			return &head->node;
+		/* head changed under us (a concurrent push): retry */
 	}
 }
 
@@ -1615,7 +1653,7 @@ void *urcu_slab_alloc(struct urcu_slab *s, int cl)
 	}
 #endif
 	cds_lfs_pop_lock(&a->freelist);
-	node = __cds_lfs_pop(&a->freelist);
+	node = urcu_slab_pop(&a->freelist);
 	if (node) {				/* reuse before carve -- caps the footprint */
 		cds_lfs_pop_unlock(&a->freelist);
 		URCU_SLAB_STAT(s, reuse);
@@ -1712,7 +1750,7 @@ struct cds_lfs_node *urcu_slab_take_floor(struct urcu_slab *s,
 	struct cds_lfs_node *n;
 
 	cds_lfs_pop_lock(&a->freelist);
-	n = __cds_lfs_pop(&a->freelist);
+	n = urcu_slab_pop(&a->freelist);
 	if (!n) {
 		/*
 		 * Exempt from the budget REFUSAL, but not from its ledger: the
