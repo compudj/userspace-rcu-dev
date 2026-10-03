@@ -439,7 +439,7 @@ struct urcu_txn_sw_txn {
 	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];  /* RYW certain-miss filter */
 };
 
-#define URCU_TXN_SW_CAP	8	/* initial record-array capacity */
+#define URCU_TXN_SW_CAP	8	/* first record-array capacity of an UNRESERVED handle */
 
 /*
  * URCU_TXN_SW_EXCL_VALIDATE: runtime validation of the SINGLE-UPDATER contract.
@@ -755,7 +755,13 @@ void urcu_txn_sw__block_free(struct urcu_txn_sw_block *blk)
  * so cannot fail.  This trades the design's "fail-and-destroy replaces the
  * count pass" for a single up-front alloc, which is the right call for a
  * bounded txn whose records are interleaved through a build that does not
- * otherwise thread an OOM return.  Call after init, before any install; a
+ * otherwise thread an OOM return.  The block comes from the smallest slab class
+ * that holds @cap -- there is no floor at URCU_TXN_SW_CAP, which is only where
+ * an UNRESERVED handle starts -- so a fixed-arity embedder that reserves its
+ * true bound (a list op: 2) carries a 4-record block across its grace period,
+ * not an 8-record one.  Reserving LESS than the bracket goes on to record is
+ * still correct, and costs the grow that a reserve exists to avoid.
+ * Call after init, before any install; a
  * handle already buffering (an earlier reserve or record) grows to fit @cap,
  * mirroring the concurrent front-end's urcu_txn_reserve().  Returns false on
  * OOM; the failure is sticky (URCU_TXN_SW_OOM), so the caller may ignore this
@@ -807,8 +813,6 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 		t->cap = blk->cap;
 		return true;
 	}
-	if (cap < URCU_TXN_SW_CAP)
-		cap = URCU_TXN_SW_CAP;
 	blk = urcu_txn_sw__block_alloc(cap);
 	if (!blk) {
 		t->state = URCU_TXN_SW_OOM;	/* sticky: commit reports it */
@@ -989,6 +993,63 @@ struct urcu_txn_sw_latch *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
 }
 
 /*
+ * Grow a full record array: double it, or give an unreserved handle its first
+ * URCU_TXN_SW_CAP records.  Returns false on OOM, leaving the handle in the
+ * sticky URCU_TXN_SW_OOM state.
+ *
+ * OUT OF LINE ON PURPOSE.  This is urcu_txn_sw_record()'s only bulky path, and
+ * while it sat in record()'s body the compiler declined to inline record() at
+ * all (and urcu_txn_sw_record_chain() with it): every edge of every transaction
+ * then paid a call and a six-register frame for an append that is five stores.
+ * Kept apart, the append inlines into its callers and only a transaction that
+ * outgrows its capacity pays the call.  `unused` because a translation unit
+ * that only reads never records.
+ */
+static __attribute__((noinline, unused))
+bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
+{
+	unsigned int newcap = t->cap ? t->cap * 2 : URCU_TXN_SW_CAP;
+	struct urcu_txn_sw_block *nb;
+
+	/*
+	 * Caller-owned (inline) storage is sized to the embedder's edge
+	 * bound and must never grow -- realloc-ing it would move caller
+	 * (e.g. on-stack) memory.  Overflow here is an embedder sizing
+	 * bug.
+	 */
+	urcu_posix_assert(!t->latches_inline);
+	/*
+	 * No proxy address is live yet -> the array may move.  No
+	 * aligned realloc exists, so allocate a fresh 16-byte-aligned
+	 * block, copy the buffered records, and free the old one.
+	 */
+	nb = urcu_txn_sw__block_alloc(newcap);
+	if (!nb) {
+		t->state = URCU_TXN_SW_OOM;	/* sticky: commit reports it */
+		return false;
+	}
+	memcpy(nb->latches, t->latches,
+			(size_t) t->nr * sizeof(*nb->latches));
+	urcu_txn_sw__block_free(t->block);	/* NULL on the first grow */
+	t->block = nb;
+	t->latches = nb->latches;
+	t->cap = nb->cap;
+	/*
+	 * The storage is now the ENGINE's, so drop the inline flag.  It
+	 * can still be set here: the assert above compiles out under
+	 * NDEBUG, and an oversized caller-storage handle then reaches
+	 * this grow and MIGRATES to engine-owned heap (its records
+	 * copied; the caller's buffer left untouched and, as promised,
+	 * never freed).  Leaving the flag set would make
+	 * __free_records() skip the free of the block we just adopted
+	 * -- a leak -- and would trip commit()'s inline assert on a
+	 * handle that is no longer inline.
+	 */
+	t->latches_inline = false;
+	return true;
+}
+
+/*
  * Record one edge {*slot: old -> new} tagged with @tag (the bits OR'd into the
  * parked proxy value installed in *slot, so that slot's readers recognise the
  * proxy and route resolution -- e.g. the fractal trie's 0xF type code or a
@@ -1034,49 +1095,11 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	urcu_posix_assert(!t->latches_inline || t->nr == 0);
 	urcu_txn_sw__excl_owner(t, "record()");
 	urcu_txn_sw__excl_slot_free(slot, tag, "record()");
-	if (t->nr == t->cap) {
-		unsigned int newcap = t->cap ? t->cap * 2 : URCU_TXN_SW_CAP;
-
-		/*
-		 * Caller-owned (inline) storage is sized to the embedder's edge
-		 * bound and must never grow -- realloc-ing it would move caller
-		 * (e.g. on-stack) memory.  Overflow here is an embedder sizing
-		 * bug.
-		 */
-		urcu_posix_assert(!t->latches_inline);
-		/*
-		 * No proxy address is live yet -> the array may move.  No
-		 * aligned realloc exists, so allocate a fresh 16-byte-aligned
-		 * block, copy the buffered records, and free the old one.
-		 */
-		struct urcu_txn_sw_block *nb = urcu_txn_sw__block_alloc(newcap);
-
-		if (!nb) {
-			t->state = URCU_TXN_SW_OOM;	/* sticky: commit reports it */
-			return false;
-		}
-		memcpy(nb->latches, t->latches,
-				(size_t) t->nr * sizeof(*nb->latches));
-		urcu_txn_sw__block_free(t->block);	/* NULL on the first grow */
-		t->block = nb;
-		t->latches = nb->latches;
-		t->cap = nb->cap;
-		/*
-		 * The storage is now the ENGINE's, so drop the inline flag.  It
-		 * can still be set here: the assert above compiles out under
-		 * NDEBUG, and an oversized caller-storage handle then reaches
-		 * this grow and MIGRATES to engine-owned heap (its records
-		 * copied; the caller's buffer left untouched and, as promised,
-		 * never freed).  Leaving the flag set would make
-		 * __free_records() skip the free of the block we just adopted
-		 * -- a leak -- and would trip commit()'s inline assert on a
-		 * handle that is no longer inline.
-		 */
-		t->latches_inline = false;
-	}
+	if (caa_unlikely(t->nr == t->cap) && !urcu_txn_sw__grow(t))
+		return false;			/* OOM, now sticky */
 	l = &t->latches[t->nr++];
 	urcu_txn_sw_latch_set(l, slot, old_ptr, new_ptr, tag);
-	if (t->bloom_live)		/* armed: keep it current (disjoint never arms) */
+	if (caa_unlikely(t->bloom_live))	/* armed: keep it current (disjoint never arms) */
 		urcu_txn__ryw_bloom_set(t->ryw_bloom, slot);
 	return true;
 }
@@ -1225,6 +1248,28 @@ void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 }
 
 /*
+ * The read-your-own-writes half of urcu_txn_sw_record_chain(): chain onto this
+ * transaction's record for @slot, or append one if it has none.  Out of line
+ * for the reason urcu_txn_sw__grow() is: the find (filter, lazy arming, scan)
+ * is the bulk of record_chain(), and a handle that declared its write set
+ * disjoint never reaches it -- its record_chain() is the inlined append.
+ */
+static __attribute__((noinline, unused))
+bool urcu_txn_sw__chain(struct urcu_txn_sw_txn *t, void **slot,
+		void *old_ptr, void *new_ptr, uintptr_t tag)
+{
+	struct urcu_txn_sw_latch *l;
+
+	l = urcu_txn_sw__find_ryw(t, slot);
+	if (!l)
+		return urcu_txn_sw_record(t, slot, old_ptr, new_ptr, tag);
+	urcu_assert_debug(l->tag == tag);
+	urcu_assert_debug(l->proxy.ptr[1] == old_ptr);	/* caller read its own writes */
+	l->proxy.ptr[1] = new_ptr;		/* committed old preserved */
+	return true;
+}
+
+/*
  * Record edge {*slot: @old_ptr -> @new_ptr} tagged @tag, CHAINING onto this
  * transaction's existing record for @slot if it has one -- keeping that
  * record's committed old and advancing only its new_ptr -- instead of
@@ -1241,8 +1286,6 @@ static inline
 bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
-	struct urcu_txn_sw_latch *l;
-
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;			/* sticky: an earlier alloc failed */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
@@ -1263,13 +1306,7 @@ bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
 #endif
 		return urcu_txn_sw_record(t, slot, old_ptr, new_ptr, tag);
 	}
-	l = urcu_txn_sw__find_ryw(t, slot);
-	if (!l)
-		return urcu_txn_sw_record(t, slot, old_ptr, new_ptr, tag);
-	urcu_assert_debug(l->tag == tag);
-	urcu_assert_debug(l->proxy.ptr[1] == old_ptr);	/* caller read its own writes */
-	l->proxy.ptr[1] = new_ptr;		/* committed old preserved */
-	return true;
+	return urcu_txn_sw__chain(t, slot, old_ptr, new_ptr, tag);
 }
 
 /*

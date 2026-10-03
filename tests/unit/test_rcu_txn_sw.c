@@ -30,7 +30,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 20
+#define NR_TESTS 26
 
 /* Per-record tag: bit 0 of the proxy pointer (latches are 16B-aligned). */
 #define TEST_TAG	1UL
@@ -172,6 +172,65 @@ int main(void)
 			if (slots[i] != (void *) ((((unsigned long) (i + 1)) << 8) | 0x10))
 				all_new = false;
 		ok(all_new, "all realloc-grown slots settled to new");
+	}
+
+	/*
+	 * 4b. reserve() honors a bound below URCU_TXN_SW_CAP: the handle gets
+	 * the smallest block that holds the bound, not the capacity an
+	 * unreserved handle starts at, and recording up to the bound does not
+	 * move the record array.
+	 */
+	{
+		void *s1 = (void *) 0x10, *s2 = (void *) 0x20;
+		struct urcu_txn_sw_txn _t, *t = &_t;
+		struct urcu_txn_sw_latch *latches;
+		enum urcu_txn_status st;
+
+		urcu_txn_sw_init(t);
+		ok(urcu_txn_sw_reserve(t, 2) && t->cap >= 2 &&
+			t->cap < URCU_TXN_SW_CAP,
+			"reserve(2) is not rounded up to the unreserved capacity");
+		latches = t->latches;
+		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
+		ok(t->latches == latches,
+			"recording the reserved bound does not move the record array");
+		st = urcu_txn_sw_commit(t);
+		ok(st == URCU_TXN_STATUS_OK && s1 == (void *) 0x11 &&
+			s2 == (void *) 0x21,
+			"small-reserve multi-edge commit settles both slots");
+	}
+
+	/*
+	 * 4c. Recording PAST a small reservation grows the array, as recording
+	 * past an unreserved handle's first capacity does: the reservation is a
+	 * floor on capacity, not a ceiling on the bracket.
+	 */
+	{
+		enum { NR_EDGES = URCU_TXN_SW_CAP + 1 };
+		void *slots[NR_EDGES];
+		struct urcu_txn_sw_txn _t, *t = &_t;
+		enum urcu_txn_status st;
+		bool all_recorded = true, all_new = true;
+		unsigned int i;
+
+		urcu_txn_sw_init(t);
+		urcu_txn_sw_reserve(t, 2);
+		for (i = 0; i < NR_EDGES; i++) {
+			slots[i] = (void *) (((unsigned long) (i + 1)) << 8);
+			if (!urcu_txn_sw_record(t, &slots[i], slots[i],
+				(void *) ((((unsigned long) (i + 1)) << 8) | 0x10), TEST_TAG))
+				all_recorded = false;
+		}
+		ok(all_recorded && t->cap >= NR_EDGES,
+			"record grows past a reservation smaller than the bracket");
+		st = urcu_txn_sw_commit(t);
+		ok(st == URCU_TXN_STATUS_OK,
+			"commit after growing past a small reservation returns OK");
+		for (i = 0; i < NR_EDGES; i++)
+			if (slots[i] != (void *) ((((unsigned long) (i + 1)) << 8) | 0x10))
+				all_new = false;
+		ok(all_new, "all slots recorded past a small reservation settled to new");
 	}
 
 	/*
