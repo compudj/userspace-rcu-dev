@@ -92,6 +92,21 @@
 #include <linux/membarrier.h>
 #endif
 
+/*
+ * The C library's rseq area, for urcu_slab_cpu().  glibc registers rseq for
+ * every thread and exports __rseq_offset since 2.35; the thread pointer comes
+ * from a compiler builtin.  Without either, urcu_slab_cpu() calls
+ * sched_getcpu() as it always did.  Not used under URCU_SLAB_RSEQ, where
+ * librseq supplies the same field.
+ */
+#if !defined(URCU_SLAB_RSEQ) && defined(__GLIBC__) && defined(__GLIBC_PREREQ) && \
+	defined(__has_builtin)
+# if __GLIBC_PREREQ(2, 35) && __has_builtin(__builtin_thread_pointer)
+#  include <sys/rseq.h>
+#  define URCU_SLAB_LIBC_RSEQ	1
+# endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -764,6 +779,16 @@ void urcu_slab_stats_dump(void)
 /*
  * Current cpu.  rseq's cpu_id is an inlined TLS load (~0.3 ns) against
  * sched_getcpu's un-inlinable PLT call (~3.1 ns); the value is the same.
+ *
+ * That load does not need librseq, nor the rseq freelists.  A C library that
+ * registers rseq for every thread (glibc >= 2.35) publishes where the area is,
+ * and its own sched_getcpu() returns this very field -- behind the PLT, a
+ * frame and the stack protector.  So read it here, whichever freelist build
+ * this is.  The kernel rewrites cpu_id whenever it moves the thread, hence a
+ * relaxed atomic load; a negative value means rseq is not registered for this
+ * thread (the tunable is off, or the kernel lacks it) and sched_getcpu()
+ * answers instead.  Either way the value is a hint: the thread can migrate
+ * the instant after, and every caller here already tolerates that.
  */
 static inline
 int urcu_slab_cpu(void)
@@ -771,6 +796,15 @@ int urcu_slab_cpu(void)
 #ifdef URCU_SLAB_RSEQ
 	if (caa_likely(rseq_registered()))
 		return rseq_current_cpu_raw();
+#elif defined(URCU_SLAB_LIBC_RSEQ)
+	{
+		struct rseq *abi = (struct rseq *)
+			((char *) __builtin_thread_pointer() + __rseq_offset);
+		int cpu = (int) uatomic_load(&abi->cpu_id, CMM_RELAXED);
+
+		if (caa_likely(cpu >= 0))
+			return cpu;
+	}
 #endif
 	return sched_getcpu();
 }
