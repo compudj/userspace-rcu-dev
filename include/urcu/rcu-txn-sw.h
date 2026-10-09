@@ -135,7 +135,7 @@ extern "C" {
  * cost.  A transaction that records more should urcu_txn_sw_reserve() its
  * bound rather than grow to it.
  */
-#define URCU_TXN_SW_CAP	4
+#define URCU_TXN_SW_CAP	URCU_TXN_SLAB_MIN_CAP
 
 /*
  * RCU pseudo-transaction (urcu_txn_sw_txn)
@@ -530,37 +530,18 @@ size_t urcu_txn_sw__desc_size(unsigned int cap)
 
 /*
  * Transaction descriptors come from the per-CPU size-classed slab of
- * <urcu/rcu-txn-slab.h>, the same machinery as the concurrent engine.  The
- * classes hold {4,8,16,32,64,128} records; a larger request is an exact,
- * uncached posix_memalign.  Each descriptor is stamped with its origin
+ * <urcu/rcu-txn-slab.h>, in the classes that header defines for both engines
+ * (urcu_txn_slab_class_cap[]); a larger request is an exact, uncached
+ * posix_memalign.  Each descriptor is stamped with its origin
  * (urcu_txn_sw_desc.slab), which the free path consults.  URCU_TXN_NO_CACHE
  * disables the slab.
- */
-static const unsigned int urcu_txn_sw_slab_rc[] = {
-	URCU_TXN_SW_CAP, 8u, 16u, 32u, 64u, 128u,
-};
-#define URCU_TXN_SW_SLAB_NCLASS	\
-	((int) (sizeof(urcu_txn_sw_slab_rc) / sizeof(urcu_txn_sw_slab_rc[0])))
-
-/*
+ *
  * The slab instance is defined once, in liburcu-common (src/urcu-txn.c), whose
  * constructor initializes it: this header requires linking liburcu-common.  A
  * header-static definition would give each translation unit its own arenas; see
  * <urcu/rcu-txn-mcas.h>.
  */
 extern struct urcu_slab urcu_txn_sw_slab;
-
-/* Smallest class that fits @req records, or -1 if none does. */
-static inline
-int urcu_txn_sw__slab_class_of(unsigned int req)
-{
-	int i;
-
-	for (i = 0; i < URCU_TXN_SW_SLAB_NCLASS; i++)
-		if (req <= urcu_txn_sw_slab_rc[i])
-			return i;
-	return -1;
-}
 
 /*
  * Allocate a transaction descriptor for at least @cap records.  It comes from
@@ -575,12 +556,12 @@ struct urcu_txn_sw_desc *urcu_txn_sw__desc_alloc(unsigned int cap)
 	int cl = -1;
 
 	if (urcu_slab_enabled(&urcu_txn_sw_slab))
-		cl = urcu_txn_sw__slab_class_of(cap);
+		cl = urcu_txn_slab_class_of(cap);
 	if (cl >= 0) {
 		desc = (struct urcu_txn_sw_desc *)
 				urcu_slab_alloc(&urcu_txn_sw_slab, cl);
 		if (caa_likely(desc != NULL)) {
-			cap = urcu_txn_sw_slab_rc[cl];	/* physical class cap */
+			cap = urcu_txn_slab_class_cap[cl];
 			desc->slab = 1;
 		}
 	}

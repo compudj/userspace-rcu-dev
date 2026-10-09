@@ -74,8 +74,11 @@ bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
 	return urcu_txn_sw__resize(t, t->cap ? t->cap * 2 : URCU_TXN_SW_CAP);
 }
 
-/* Byte size per record-count class; filled at init, must outlive the slab. */
-static size_t urcu_txn_sw_slab_bytes[URCU_TXN_SW_SLAB_NCLASS];
+/*
+ * Byte size of each descriptor class (urcu_txn_slab_class_cap[]), per engine;
+ * filled at init, must outlive the slab.
+ */
+static size_t urcu_txn_sw_slab_bytes[URCU_TXN_SLAB_NCLASS];
 static size_t urcu_txn_slab_bytes[URCU_TXN_SLAB_NCLASS];
 
 static __attribute__((constructor))
@@ -102,9 +105,12 @@ void urcu_txn_slab_ctor(void)
 	 */
 	(void) rseq_init();
 #endif
-	for (i = 0; i < URCU_TXN_SW_SLAB_NCLASS; i++)
-		urcu_txn_sw_slab_bytes[i] =
-				urcu_txn_sw__desc_size(urcu_txn_sw_slab_rc[i]);
+	for (i = 0; i < URCU_TXN_SLAB_NCLASS; i++) {
+		unsigned int cap = urcu_txn_slab_class_cap[i];
+
+		urcu_txn_sw_slab_bytes[i] = urcu_txn_sw__desc_size(cap);
+		urcu_txn_slab_bytes[i] = urcu_txn_blocksize(cap);
+	}
 	/*
 	 * Link the slab's lists through each block's rcu_head, never offset 0:
 	 * a block enters the pending list at commit, a grace period before
@@ -114,11 +120,8 @@ void urcu_txn_slab_ctor(void)
 	 * exactly this reason.
 	 */
 	urcu_slab_init(&urcu_txn_sw_slab, urcu_txn_sw_slab_bytes,
-			URCU_TXN_SW_SLAB_NCLASS, "txn_sw",
+			URCU_TXN_SLAB_NCLASS, "txn_sw",
 			offsetof(struct urcu_txn_sw_desc, rcu_head));
-	for (i = 0; i < URCU_TXN_SLAB_NCLASS; i++)
-		urcu_txn_slab_bytes[i] =
-				urcu_txn_blocksize(urcu_txn_slab_rc[i]);
 	urcu_slab_init(&urcu_txn_slab, urcu_txn_slab_bytes,
 			URCU_TXN_SLAB_NCLASS, "txn",
 			offsetof(struct urcu_txn_desc, rcu_head));

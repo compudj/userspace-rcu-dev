@@ -2265,6 +2265,33 @@ counted:
 	return 1;
 }
 
+/*
+ * Descriptor classes of the transaction engines.
+ *
+ * Both engines size a descriptor by the number of records it holds, and class
+ * their descriptors by the same capacities.  Each engine has its own slab,
+ * whose byte size-classes follow from these and from its descriptor layout
+ * (src/urcu-txn.c).
+ */
+#define URCU_TXN_SLAB_MIN_CAP	4	/* records held by the smallest class */
+
+static const unsigned int urcu_txn_slab_class_cap[] = {
+	URCU_TXN_SLAB_MIN_CAP, 8, 16, 32, 64, 128,
+};
+#define URCU_TXN_SLAB_NCLASS	((int) CAA_ARRAY_SIZE(urcu_txn_slab_class_cap))
+
+/* Smallest class that holds @cap records, or -1 if none does. */
+static inline
+int urcu_txn_slab_class_of(unsigned int cap)
+{
+	int i;
+
+	for (i = 0; i < URCU_TXN_SLAB_NCLASS; i++)
+		if (cap <= urcu_txn_slab_class_cap[i])
+			return i;
+	return -1;
+}
+
 #ifdef __cplusplus
 }
 #endif

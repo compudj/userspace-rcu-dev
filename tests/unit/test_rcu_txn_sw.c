@@ -169,7 +169,7 @@ int main(void)
 			if (!i)
 				first_cap = t->cap;
 		}
-		ok(first_cap == urcu_txn_sw_slab_rc[0],
+		ok(first_cap == urcu_txn_slab_class_cap[0],
 			"an unreserved handle starts in the first slab class");
 		ok(all_recorded, "record realloc-grows past the initial capacity");
 		st = urcu_txn_sw_commit(t);
@@ -195,7 +195,7 @@ int main(void)
 
 		urcu_txn_sw_init(t);
 		ok(urcu_txn_sw_reserve(t, 2) && t->cap >= 2 &&
-			t->cap <= urcu_txn_sw_slab_rc[0],
+			t->cap <= urcu_txn_slab_class_cap[0],
 			"reserve(2) is not rounded up past the first slab class");
 		records = t->records;
 		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x12, TEST_TAG);

@@ -743,22 +743,8 @@ struct urcu_txn_desc *urcu_txn_alloc(size_t size)
 	(sizeof(struct urcu_txn_desc) + \
 	 (size_t) (cap) * sizeof(struct urcu_txn_record))
 
-static const unsigned int urcu_txn_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
-#define URCU_TXN_SLAB_NCLASS	\
-	((int) (sizeof(urcu_txn_slab_rc) / sizeof(urcu_txn_slab_rc[0])))
-
+/* The classes are those of <urcu/rcu-txn-slab.h>, shared by both engines. */
 extern struct urcu_slab urcu_txn_slab;
-
-static inline
-int urcu_txn_slab_class_of(unsigned int req)
-{
-	int i;
-
-	for (i = 0; i < URCU_TXN_SLAB_NCLASS; i++)
-		if (req <= urcu_txn_slab_rc[i])
-			return i;
-	return -1;
-}
 
 static inline
 struct urcu_txn_desc *urcu_txn_alloc_cap(unsigned int req)
@@ -770,7 +756,7 @@ struct urcu_txn_desc *urcu_txn_alloc_cap(unsigned int req)
 			(cl = urcu_txn_slab_class_of(req)) >= 0) {
 		t = (struct urcu_txn_desc *) urcu_slab_alloc(&urcu_txn_slab, cl);
 		if (caa_likely(t != NULL)) {
-			t->cap = urcu_txn_slab_rc[cl];
+			t->cap = urcu_txn_slab_class_cap[cl];
 			t->slab = 1;
 			return t;
 		}
