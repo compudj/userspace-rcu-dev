@@ -210,8 +210,13 @@ struct urcu_txn_sw_group {
 };
 
 /*
- * Records are 16-byte aligned so each tagged proxy has its low 4 bits free.
+ * Records are aligned on URCU_TXN_SW_RECORD_ALIGN bytes, which leaves the low
+ * bits of a record's address, URCU_TXN_SW_TAG_MASK, free for the tag that marks
+ * an installed proxy.
  */
+#define URCU_TXN_SW_RECORD_ALIGN	16
+#define URCU_TXN_SW_TAG_MASK		(URCU_TXN_SW_RECORD_ALIGN - 1UL)
+
 struct urcu_txn_sw_record {
 	void *ptr[2];			/* [0] old, [1] new; selector-indexed */
 	struct urcu_txn_sw_group *group;
@@ -225,7 +230,7 @@ struct urcu_txn_sw_record {
 					 * bit-0 list edge -- can share one
 					 * transaction.
 					 */
-} __attribute__((aligned(16)));
+} __attribute__((aligned(URCU_TXN_SW_RECORD_ALIGN)));
 
 /*
  * Transaction descriptor: the single allocation that carries a committed
@@ -267,8 +272,9 @@ struct urcu_txn_sw_desc {
 	struct urcu_txn_sw_record records[];	/* frozen at install */
 };
 
-urcu_static_assert(!(offsetof(struct urcu_txn_sw_desc, records) % 16),
-		"urcu_txn_sw_desc.records must be 16-byte aligned for proxy tagging",
+urcu_static_assert(!(offsetof(struct urcu_txn_sw_desc, records) %
+			URCU_TXN_SW_RECORD_ALIGN),
+		"urcu_txn_sw_desc.records must keep the alignment of a record",
 		urcu_txn_sw_desc_records_aligned);
 
 /*
@@ -626,8 +632,9 @@ void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
  * (urcu_txn_sw_desc.slab), which the free path consults.  URCU_TXN_NO_CACHE
  * disables the slab.
  */
-static const unsigned int urcu_txn_sw_slab_rc[] =
-	{ 4u, 8u, 16u, 32u, 64u, 128u };
+static const unsigned int urcu_txn_sw_slab_rc[] = {
+	URCU_TXN_SW_CAP, 8u, 16u, 32u, 64u, 128u,
+};
 #define URCU_TXN_SW_SLAB_NCLASS	\
 	((int) (sizeof(urcu_txn_sw_slab_rc) / sizeof(urcu_txn_sw_slab_rc[0])))
 
@@ -683,7 +690,8 @@ struct urcu_txn_sw_desc *urcu_txn_sw__desc_alloc(unsigned int cap)
 		 * burst makes permanent, and the burst still has to complete:
 		 * serve it with an exact allocation.
 		 */
-		if (posix_memalign(&p, 16, urcu_txn_sw_descsize(cap)))
+		if (posix_memalign(&p, URCU_TXN_SW_RECORD_ALIGN,
+				urcu_txn_sw_descsize(cap)))
 			return NULL;
 		desc = (struct urcu_txn_sw_desc *) p;
 		desc->slab = 0;
@@ -855,7 +863,7 @@ void urcu_txn_sw_record_install(struct urcu_txn_sw_group *group,
 	 * values as proxies.  With a tag bit already set in the address, the OR
 	 * changes nothing and urcu_txn_sw_untag() subtracts to a wrong address.
 	 */
-	urcu_assert_debug(r->tag != 0 && r->tag <= 0xf);
+	urcu_assert_debug(r->tag && !(r->tag & ~URCU_TXN_SW_TAG_MASK));
 	urcu_assert_debug(!((uintptr_t) r & r->tag));
 	r->group = group;
 	/* Store-release of slot pairs with rcu_dereference(). */

@@ -143,14 +143,13 @@ extern "C" {
 #endif
 
 /*
- * Under a zero tag every plain value would pass for a proxy.  A tag beyond the
- * low 4 bits would overlap the address of a record, which is only 16-byte
- * aligned.
+ * Under a zero tag every plain value would pass for a proxy.  A tag beyond
+ * URCU_TXN_SW_TAG_MASK would overlap the address of a record.
  */
 urcu_static_assert(URCU_TXN_SW_HLIST_TAG != 0 &&
-			(URCU_TXN_SW_HLIST_TAG & ~0xFUL) == 0,
-		"URCU_TXN_SW_HLIST_TAG must be non-zero and fit the low 4 bits "
-		"left free by the 16-byte record alignment",
+			(URCU_TXN_SW_HLIST_TAG & ~URCU_TXN_SW_TAG_MASK) == 0,
+		"URCU_TXN_SW_HLIST_TAG must be non-zero and within "
+		"URCU_TXN_SW_TAG_MASK",
 		urcu_txn_sw_hlist_tag_out_of_range);
 
 struct urcu_txn_sw_hlist_node {

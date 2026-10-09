@@ -161,10 +161,9 @@
 #endif
 
 urcu_static_assert((URCU_TXN_SW_BITMAP_TAG & 1UL) == 1UL &&
-			(URCU_TXN_SW_BITMAP_TAG & ~0xFUL) == 0,
+			(URCU_TXN_SW_BITMAP_TAG & ~URCU_TXN_SW_TAG_MASK) == 0,
 		"URCU_TXN_SW_BITMAP_TAG must include bit 0 (which a settled word "
-		"always leaves clear) and fit the low 4 bits left free by the "
-		"16-byte record alignment",
+		"always leaves clear) and be within URCU_TXN_SW_TAG_MASK",
 		urcu_txn_sw_bitmap_tag_out_of_range);
 
 #ifdef __cplusplus
