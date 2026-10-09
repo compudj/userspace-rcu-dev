@@ -35,7 +35,7 @@
  *
  * rcu-txn-sw-list flips both edges as ONE atomic event using the proxy-flip
  * mechanism of <urcu/rcu-txn-sw.h>: the two slots transiently hold
- * tagged proxies that share a single selector word; one release store flips
+ * tagged proxies that share a single selector word; one store-release flips
  * the selector and switches both edges from old to new together.  So at
  * every instant the forward and backward chains describe the same list.
  *
@@ -114,7 +114,7 @@ struct urcu_txn_sw_list_node {
 /*
  * The list head embeds the circular sentinel node, so node and head are
  * distinct types -- matching the concurrent <urcu/rcu-txn-list.h>.  A
- * single-updater list has no escalation domain, so the head holds only the
+ * single-writer list has no escalation domain, so the head holds only the
  * sentinel.
  */
 struct urcu_txn_sw_list_head {
@@ -191,8 +191,8 @@ struct urcu_txn_sw_list_node *urcu_txn_sw_list_prev_rcu(
 
 /*
  * True iff the list is empty.  CALL WITHIN AN RCU READ-SIDE SECTION, like the
- * accessors it is built on: resolving a parked proxy dereferences the writer's
- * group block, reclaimed a grace period after that writer commits.
+ * accessors it is built on: resolving an installed proxy dereferences the
+ * writer's descriptor, reclaimed a grace period after that writer commits.
  */
 static inline
 int urcu_txn_sw_list_empty(struct urcu_txn_sw_list_head *head)
@@ -210,7 +210,7 @@ int urcu_txn_sw_list_empty(struct urcu_txn_sw_list_head *head)
  * still resolve to old, so install is reader-transparent), flips the shared
  * selector 0 -> 1 (the one reader-visible instant, switching both edges to new
  * together), and settles each slot to its direct new target.  commit() owns
- * reclaim and defers the group block through call_rcu() after a grace period.
+ * reclaim and defers the descriptor through call_rcu() after a grace period.
  *
  * A LOW-LEVEL CONVENIENCE, not the shape the list ops below use.  A SINGLE list
  * op transacts exactly two edges, which is where the "two" comes from -- but
@@ -218,7 +218,7 @@ int urcu_txn_sw_list_empty(struct urcu_txn_sw_list_head *head)
  * those carry more.  Nothing in this file calls this.
  *
  * PRECONDITION: @slot0 and @slot1 must be DISTINCT.  This records blindly, with
- * no chaining, so two records on one slot are parked and settled in record
+ * no chaining, so two records on one slot are installed and settled in record
  * order and the earlier edit is silently lost.
  *
  * Returns 0 on success, -1 on allocation failure.  An OOM in reserve()/record()
@@ -251,13 +251,13 @@ int urcu_txn_sw_list_flip2(
 
 /*
  * urcu_txn_sw_list_add_after_prepare: record the edges of an add-after into the
- * caller-owned single-updater transaction @txn, WITHOUT committing.  The
+ * caller-owned single-writer transaction @txn, WITHOUT committing.  The
  * composable form: the caller owns the bracket (init .. commit) and may fold
  * these records together with records from other structures into ONE flip --
  * e.g. publish a node into a trie and splice it into this list atomically.
- * Under a single updater there is no concurrent deletion, so it always succeeds
+ * Under a single writer there is no concurrent deletion, so it always succeeds
  * (returns 0); the int return matches the concurrent variant so callers share
- * one shape across the single-updater -> concurrent transition.  Each recorded
+ * one shape across the single-writer -> concurrent transition.  Each recorded
  * edge is tagged with URCU_TXN_SW_LIST_PROXY_TAG so the list's reader accessors
  * resolve the proxy.
  *
@@ -391,11 +391,11 @@ int urcu_txn_sw_list_add_tail_rcu(struct urcu_txn_sw_list_node *newp,
 
 /*
  * urcu_txn_sw_list_del_prepare: record the unlink of @elem into the caller-owned
- * single-updater transaction @txn, WITHOUT committing.  Composable form of del
+ * single-writer transaction @txn, WITHOUT committing.  Composable form of del
  * (see add_after_prepare for the contract).  @elem's own next/prev are left
  * intact (ghost) so a reader standing on it can still escape in either
  * direction; the caller frees @elem after a grace period (post-commit).  Always
- * returns 0 (single updater: no concurrent deletion); the int return matches
+ * returns 0 (single writer: no concurrent deletion); the int return matches
  * urcu_txn_list_del_prepare() for transition parity.
  */
 static inline
@@ -431,11 +431,11 @@ int urcu_txn_sw_list_del_rcu(struct urcu_txn_sw_list_node *elem)
 
 /*
  * urcu_txn_sw_list_replace_prepare: record the in-place replacement of @old by
- * @newp into the caller-owned single-updater transaction @txn, WITHOUT
+ * @newp into the caller-owned single-writer transaction @txn, WITHOUT
  * committing.  Composable form of replace (see add_after_prepare for the
  * contract): @newp inherits @old's neighbours; @old is left ghost for parked
  * readers.  Always returns 0.  Mirrors urcu_txn_list_replace_prepare()
- * (single-updater: no -ENOENT/-EAGAIN, since there is no concurrent deletion).
+ * (single-writer: no -ENOENT/-EAGAIN, since there is no concurrent deletion).
  */
 static inline
 int urcu_txn_sw_list_replace_prepare(struct urcu_txn_sw_txn *txn,

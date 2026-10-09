@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Test URCU_TXN_SW_EXCL_VALIDATE, the single-updater validator of
+ * Test URCU_TXN_SW_EXCL_VALIDATE, the single-writer validator of
  * <urcu/rcu-txn-sw.h>.
  *
  * The sw engine has no install-time CAS, no conflict detection and no abort: it
@@ -13,18 +13,18 @@
  * is opt-in and this test is compiled with it (see Makefile.am).
  *
  * There is no per-structure object to claim an owner on -- the sw mutators take
- * a node, never a head -- so the validator watches the two things that do exist:
- * the HANDLE (driven end to end by the thread that init'd it) and the SLOT,
- * which is what two racing writers actually share.  In a correct single-updater
- * program a slot being recorded or parked cannot already hold a parked proxy,
- * and at settle a slot must still hold the proxy WE parked.
+ * a node, never a head -- so the validator watches the two things that do
+ * exist: the HANDLE (driven end to end by the thread that init'd it) and the
+ * SLOT, which is what two racing writers actually share.  In a correct
+ * single-writer program a slot being recorded or parked cannot already hold an
+ * installed proxy, and at settle a slot must still hold the proxy WE installed.
  *
  * Each violation is provoked in a forked child and the parent asserts the child
  * died by SIGABRT; the child drops its core limit so a passing run leaves no
  * cores.  The writer/writer races are simulated DETERMINISTICALLY, driving two
  * transactions through the white-box install() entry in an interleaving a real
  * race would produce -- so the test is reproducible rather than timing-dependent.
- * A control case checks a well-formed single-updater transaction is untouched.
+ * A control case checks a well-formed single-writer transaction is untouched.
  *
  * QSBR flavor (the commit defers reclaim through call_rcu).
  */
@@ -135,7 +135,7 @@ static void body_record_over_parked(void)
 }
 
 /*
- * 3. A second writer PARKS onto a slot the first has already parked.  It
+ * 3. A second writer INSTALLS onto a slot the first has already parked.  It
  *    recorded the slot while it was still plain, so record() saw nothing wrong;
  *    the overlap only becomes visible at its own install.
  */
@@ -159,7 +159,7 @@ static void body_park_over_parked(void)
 	(void) urcu_txn_sw_commit(&t1);
 }
 
-/* 4. Our parked proxy is gone by the time we settle: someone overwrote it. */
+/* 4. Our proxy is gone by the time we settle: someone overwrote it. */
 static void body_settle_clobbered(void)
 {
 	struct urcu_txn_sw_txn t;
@@ -190,14 +190,14 @@ static void body_single_edge_changed(void)
 }
 
 /*
- * 6. The MULTI-edge park has the same witness.  A peer that ran a COMPLETE
- *    transaction on the slot -- park, flip, settle -- between our record() and
- *    our install() leaves a PLAIN value behind, so a presence-only "is there a
- *    proxy here?" check sees a free slot and waves us through.  We would then
- *    park a proxy whose old is stale (readers in the park window watch the
- *    committed value go backwards) and settle our new over the peer's,
- *    silently.  The value check catches it; the peer's committed write is
- *    simulated here by a plain store, which is what it leaves behind.
+ * 6. The MULTI-edge install has the same witness.  A peer that ran a COMPLETE
+ *    transaction on the slot -- install, flip, settle -- between our record()
+ *    and our install() leaves a PLAIN value behind, so a presence-only "is
+ *    there a proxy here?" check sees a free slot and waves us through.  We
+ *    would then install a proxy whose old is stale (readers in the install
+ *    window watch the committed value go backwards) and settle our new over the
+ *    peer's, silently.  The value check catches it; the peer's committed write
+ *    is simulated here by a plain store, which is what it leaves behind.
  */
 static void body_park_over_settled(void)
 {
@@ -209,11 +209,11 @@ static void body_park_over_settled(void)
 	(void) urcu_txn_sw_record(&t, &g_a, V0, V1, TAG);
 	(void) urcu_txn_sw_record(&t, &g_b, V0, V1, TAG);
 	uatomic_store(&g_b, V2, CMM_RELEASE);	/* a peer committed V0 -> V2 */
-	urcu_txn_sw_install(&t);		/* our park would lose it */
+	urcu_txn_sw_install(&t);		/* our install would lose it */
 	(void) urcu_txn_sw_commit(&t);
 }
 
-/* Control: a well-formed single-updater transaction trips nothing. */
+/* Control: a well-formed single-writer transaction trips nothing. */
 static void body_control(void)
 {
 	struct urcu_txn_sw_txn t;
@@ -251,16 +251,16 @@ int main(void)
 	ok(aborts_in_child(body_record_over_parked),
 		"recording a slot another writer has already parked aborts");
 	ok(aborts_in_child(body_park_over_parked),
-		"parking onto a slot another writer has already parked aborts");
+		"installing onto a slot another writer has already parked aborts");
 	ok(aborts_in_child(body_park_over_settled),
-		"parking onto a slot a peer already COMMITTED to aborts (the park "
+		"installing onto a slot a peer already COMMITTED to aborts (the install "
 		"witness is the value, not just proxy-presence)");
 	ok(aborts_in_child(body_settle_clobbered),
-		"settling a slot whose parked proxy was overwritten aborts");
+		"settling a slot whose installed proxy was overwritten aborts");
 	ok(aborts_in_child(body_single_edge_changed),
 		"a single-edge commit whose slot no longer holds the recorded old aborts");
 	ok(!aborts_in_child(body_control),
-		"control: a well-formed single-updater transaction trips nothing");
+		"control: a well-formed single-writer transaction trips nothing");
 
 	rcu_barrier();
 	rcu_unregister_thread();

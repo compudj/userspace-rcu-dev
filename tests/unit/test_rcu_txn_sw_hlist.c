@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Deterministic unit tests for <urcu/rcu-txn-sw-hlist.h>, the single-updater
+ * Deterministic unit tests for <urcu/rcu-txn-sw-hlist.h>, the single-writer
  * kernel-hlist-shaped RCU list.  Validates that:
  *   - forward iteration matches the model after add_head / add_after /
  *     add_before / del / replace;

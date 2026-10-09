@@ -500,7 +500,7 @@ struct urcu_slab {
 	 * It CANNOT be offset 0.  A block reaches free_pending() at commit, one
 	 * grace period BEFORE readers are done with it -- offset 0 is live
 	 * reader state in both engines (urcu_txn_desc::status, which a proxy
-	 * resolve loads; urcu_txn_sw_desc::group, which parked proxies point
+	 * resolve loads; urcu_txn_sw_desc::group, which installed proxies point
 	 * at).  Linking there corrupts exactly the field the deferral exists to
 	 * protect.  Point this at the block's rcu_head, which call_rcu already
 	 * writes at deferral time for the same reason: nobody reads it.

@@ -7,8 +7,8 @@
 
 /*
  * rcu-txn-sw-hlist: a kernel-hlist-shaped, single-pointer-head RCU list under a
- * SINGLE updater (writers mutually excluded, as with cds_hlist_*_rcu).  It is
- * the single-updater sibling of the concurrent-writer <urcu/rcu-txn-hlist.h>
+ * SINGLE writer (writers mutually excluded, as with cds_hlist_*_rcu).  It is
+ * the single-writer sibling of the concurrent-writer <urcu/rcu-txn-hlist.h>
  * and the hash-bucket sibling of the circular bidir <urcu/rcu-txn-sw-list.h>:
  * the head is a SINGLE 8-byte pointer, so a table of buckets is half the
  * footprint of the sentinel-node heads.  See design/rcu-txn-hlist.md.
@@ -31,7 +31,7 @@
  * pprev is written by a PLAIN STORE, eagerly, inside the _prepare form
  * ------------------------------------------------------------------
  * pprev is writer-only: no reader ever loads it (the walk is forward-only) and
- * a single updater has no concurrent writer, so it needs neither atomicity, nor
+ * a single writer has no concurrent writer, so it needs neither atomicity, nor
  * release ordering, nor a flip proxy.  Recording it would buy nothing and cost
  * a second edge on every op.  Note this is where the hlist parts ways with the
  * bidir <urcu/rcu-txn-sw-list.h>, whose readers "may iterate in either
@@ -41,8 +41,8 @@
  * The store is EAGER -- at _prepare time, not after commit -- and that is what
  * keeps same-bucket composition correct.  A later _prepare in the same bracket
  * reads its neighbour's pprev RAW and sees the earlier _prepare's value, because
- * under a single updater a plain store is immediately visible to that same
- * updater.  Deferring the pprev write and then reading it raw is the bug: a
+ * under a single writer a plain store is immediately visible to that same
+ * writer.  Deferring the pprev write and then reading it raw is the bug: a
  * later edit would read a STALE slot address, one naming a node the earlier edit
  * already unlinked, and re-point that dead slot instead of the live one.  See
  * urcu_txn_sw_hlist_del_prepare() for the worked adjacent-delete case.
@@ -69,7 +69,7 @@
  * What no _prepare can close is a LATER op failing behind an earlier op's store.
  * So a bracket composing more than one op MUST urcu_txn_sw_reserve() its edge
  * bound up front, before the first _prepare.  A successful reserve makes every
- * later record() append without reallocating and pre-allocates the group block
+ * later record() append without reallocating and pre-allocates the descriptor
  * install() would otherwise take lazily, so commit() cannot then report
  * MEMORY_ERROR -- no failure path is left behind any store.  Checking only
  * commit()'s status, the engine's general model, is NOT enough here.  (Bound the
@@ -82,9 +82,9 @@
  * not the reserve() call itself; see it for why those differ.
  *
  * The single-op _rcu brackets below owe nothing: each records exactly ONE edge,
- * which the engine commits with a lone release store -- no proxy, no group
- * block, no allocation at all (they drive an on-stack urcu_txn_sw_init_inline
- * handle), and so no failure path to protect.
+ * which the engine commits with a lone store-release -- no proxy, no
+ * descriptor, no allocation at all (they drive an on-stack
+ * urcu_txn_sw_init_inline handle), and so no failure path to protect.
  *
  * Composition itself covers cross-structure edits (the intended use, disjoint by
  * construction) AND edits on ONE hlist whose neighbourhoods touch: each _prepare
@@ -100,7 +100,7 @@
  * (2) EVERY ANCHOR MUST STILL BE LIVE AS THIS TRANSACTION LEAVES THE LIST.  An
  * op anchored on a node an EARLIER op of the same bracket deleted is a ghost
  * anchor, and there is nothing here to detect it: unlike the concurrent
- * sibling, a single-updater delete leaves no deletion mark, so a prepare cannot
+ * sibling, a single-writer delete leaves no deletion mark, so a prepare cannot
  * tell a deleted anchor from a live one.  Naming the node up front satisfies
  * obligation (1) and says nothing about this.
  *
@@ -138,7 +138,7 @@
  * the engine's per-record contract ((value & TAG) != TAG for every live value a
  * slot holds).
  *
- * Because there is a single updater there is NO logical-deletion mark (nothing
+ * Because there is a single writer there is NO logical-deletion mark (nothing
  * concurrent to detect): del simply re-points the naming slot.  A removed node's
  * own next/pprev are left intact (ghost), so a reader standing on it still
  * escapes forward into the live chain; the caller reclaims it after a grace
@@ -155,15 +155,15 @@
  * ----------
  * Writers must be mutually excluded.  Each mutator drives a urcu_txn_sw_txn: it
  * records its ONE reader-visible next edge, plain-stores pprev, and commits --
- * for a single op the commit is one release store, with no proxy parked and so
- * no grace period owed.  Include this header AFTER an RCU flavor header.
+ * for a single op the commit is one store-release, with no proxy installed and
+ * so no grace period owed.  Include this header AFTER an RCU flavor header.
  *
  * A mutator returns an int with errors negative, so a source port from the
  * concurrent <urcu/rcu-txn-hlist.h> compiles; the single-op forms below
  * allocate nothing and cannot fail.  THE CONVENTIONS ARE NOT OTHERWISE THE
  * SAME, and a mechanical migration breaks on the differences: there, del()
  * returns 1/0 to say whether THIS call removed the node, and that bit is the
- * reclaim gate -- here there is a single updater, so a delete always removed it
+ * reclaim gate -- here there is a single writer, so a delete always removed it
  * and the forms return 0.  Port a del site that gated call_rcu on a 1 and it
  * either stops reclaiming or double-frees.  The error codes differ too, and the
  * concurrent forms take a struct urcu_txn_domain * these do not.  A caller
@@ -198,14 +198,14 @@ extern "C" {
  * Two constraints, and neither was stated.  Non-zero: with tag 0 every plain
  * value satisfies the proxy predicate, so a reader resolves live pointers as
  * proxies.  Within the low 4 bits: the parked value is (record_address | TAG)
- * and the latch array is only 16-byte aligned, so a wider tag either collides
+ * and the record array is only 16-byte aligned, so a wider tag either collides
  * with an address bit -- making the OR a no-op and the untag reconstruct the
  * wrong address -- or is simply not free.
  */
 urcu_static_assert(URCU_TXN_SW_HLIST_TAG != 0 &&
 			(URCU_TXN_SW_HLIST_TAG & ~0xFUL) == 0,
 		"URCU_TXN_SW_HLIST_TAG must be non-zero and fit the low 4 bits "
-		"left free by the 16-byte latch alignment",
+		"left free by the 16-byte record alignment",
 		urcu_txn_sw_hlist_tag_out_of_range);
 
 struct urcu_txn_sw_hlist_node {
@@ -228,9 +228,9 @@ void urcu_txn_sw_hlist_init(struct urcu_txn_sw_hlist_head *head)
 
 /*
  * Resolve a "next"/head-first slot value to the node it currently denotes: a
- * tagged proxy (all of URCU_TXN_SW_HLIST_TAG's bits set -- the sw engine parks
- * &proxy | tag) resolves through the flip selector, a direct node pointer passes
- * through unchanged.
+ * tagged proxy (all of URCU_TXN_SW_HLIST_TAG's bits set -- the sw engine
+ * installs record_address | tag) resolves through the flip selector, a direct
+ * node pointer passes through unchanged.
  */
 static inline
 struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_resolve(
@@ -257,8 +257,9 @@ struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_next_rcu(
 
 /*
  * True iff the chain is empty.  CALL WITHIN AN RCU READ-SIDE SECTION, like the
- * accessors it is built on: resolving a parked proxy dereferences the writer's
- * group block, which is reclaimed a grace period after that writer commits.
+ * accessors it is built on: resolving an installed proxy dereferences the
+ * writer's descriptor, which is reclaimed a grace period after that writer
+ * commits.
  */
 static inline
 int urcu_txn_sw_hlist_empty(struct urcu_txn_sw_hlist_head *head)
@@ -330,7 +331,7 @@ struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_pending_next(
  * this transaction leaves it, WITHOUT committing.  @slot is &head->first for
  * insert-at-head or &pos->next for insert-after.  Records the reader-visible
  * *slot edge and, when @succ is non-NULL, the writer-only &succ->pprev edge.
- * Always returns 0 (single updater); the int return matches the concurrent
+ * Always returns 0 (single writer); the int return matches the concurrent
  * variant for transition parity.
  *
  * @succ must be the value @slot will hold as this transaction leaves it, not a
@@ -490,9 +491,9 @@ int urcu_txn_sw_hlist_replace_prepare(struct urcu_txn_sw_txn *txn,
  * Convenience brackets: each records its op and commits it.
  *
  * Every op records EXACTLY ONE edge (the reader-visible one; pprev is a plain
- * store), which the engine commits with a lone release store -- no proxy is
- * parked, no group block is allocated, and no grace period is owed.  So these
- * drive a caller-storage handle over a one-latch on-stack buffer
+ * store), which the engine commits with a lone store-release -- no proxy is
+ * installed, no descriptor is allocated, and no grace period is owed.  So these
+ * drive a caller-storage handle over a one-record on-stack buffer
  * (urcu_txn_sw_init_inline, blessed for exactly this lone-edge use): the whole
  * bracket is allocation-free, and a single hlist mutation costs about what a
  * bare rcu_assign_pointer does.

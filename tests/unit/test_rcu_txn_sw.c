@@ -4,12 +4,12 @@
 
 /*
  * Unit test for urcu_txn_sw_txn: the multi-edge transaction layer of the
- * single-updater engine, focusing on the commit() shortcuts -- the single-edge fast path
+ * single-writer engine, focusing on the commit() shortcuts -- the single-edge fast path
  * (no proxy at all) and auto-install -- the explicit-install caveat, and the
  * record-array realloc-grow path.
  *
  * commit() owns reclaim: it frees the txn at once on the single-edge / empty
- * paths and defers it through call_rcu() once proxies are parked.  The test
+ * paths and defers it through call_rcu() once proxies are installed.  The test
  * therefore runs under an RCU flavor (QSBR) and drains the deferred frees with
  * rcu_barrier() before exit.
  */
@@ -32,7 +32,7 @@
 
 #define NR_TESTS 26
 
-/* Per-record tag: bit 0 of the proxy pointer (latches are 16B-aligned). */
+/* Per-record tag: bit 0 of the proxy pointer (records are 16B-aligned). */
 #define TEST_TAG	1UL
 
 static int is_proxy(void *v)
@@ -48,8 +48,8 @@ static void *resolve(void *v)
 static unsigned long reclaim_calls;
 
 /*
- * Counting reclaim deferral: proves commit_flavor() routes the parked group
- * block through the SUPPLIED call_rcu_fn (not a hardcoded call_rcu), then defers
+ * Counting reclaim deferral: proves commit_flavor() routes the descriptor
+ * through the SUPPLIED call_rcu_fn (not a hardcoded call_rcu), then defers
  * the real free so rcu_barrier() drains it.  This is the shape a flavor-agnostic
  * embedder uses (passing its flavor->update_call_rcu).
  */
@@ -62,7 +62,7 @@ static void counting_call_rcu(struct rcu_head *head,
 
 /*
  * Synchronous reclaim: an exclusive (no concurrent reader) embedder frees the
- * group block in place, with no grace period -- what the fractal trie does on
+ * descriptor in place, with no grace period -- what the fractal trie does on
  * its exclusive build.
  */
 static void sync_call_rcu(struct rcu_head *head,
@@ -98,7 +98,7 @@ int main(void)
 		st = urcu_txn_sw_commit(t);		/* single edge: frees now */
 		ok(st == URCU_TXN_STATUS_OK, "single-edge commit returns OK");
 		ok(slot == (void *) 0x200, "single-edge slot holds the new target directly");
-		ok(!is_proxy(slot), "single-edge never parks a proxy");
+		ok(!is_proxy(slot), "single-edge never installs a proxy");
 	}
 
 	/*
@@ -116,16 +116,16 @@ int main(void)
 		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
 		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
 		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x31, TEST_TAG);
-		st = urcu_txn_sw_commit(t);		/* multi-edge: parks proxies */
+		st = urcu_txn_sw_commit(t);		/* multi-edge: installs proxies */
 		ok(st == URCU_TXN_STATUS_OK, "multi-edge commit returns OK");
 		ok(s1 == (void *) 0x11 && s2 == (void *) 0x21 &&
 			s3 == (void *) 0x31, "multi-edge slots all settled to new");
 	}
 
 	/*
-	 * 3. Explicit install + single edge: once install() parks the proxy a
-	 * reader may already hold it, so commit MUST flip the group (the fast path
-	 * is unavailable) and defer reclaim through call_rcu.
+	 * 3. Explicit install + single edge: once install() has installed the
+	 * proxy a reader may already hold it, so commit MUST flip the group
+	 * (the fast path is unavailable) and defer reclaim through call_rcu.
 	 */
 	{
 		void *slot = (void *) 0x100;
@@ -137,7 +137,7 @@ int main(void)
 		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200, TEST_TAG);
 		urcu_txn_sw_install(t);
 		ok(is_proxy(slot) && resolve(slot) == (void *) 0x100,
-			"explicit install parks a proxy resolving to old");
+			"explicit install leaves a proxy resolving to old");
 		st = urcu_txn_sw_commit(t);
 		ok(st == URCU_TXN_STATUS_OK,
 			"explicitly-installed single edge commits OK");
@@ -176,7 +176,7 @@ int main(void)
 
 	/*
 	 * 4b. reserve() honors a bound below URCU_TXN_SW_CAP: the handle gets
-	 * the smallest block that holds the bound, not the capacity an
+	 * the smallest descriptor that holds the bound, not the capacity an
 	 * unreserved handle starts at, and recording up to the bound does not
 	 * move the record array.
 	 */
@@ -235,9 +235,10 @@ int main(void)
 
 	/*
 	 * 5. Inline (caller-storage) lone-edge: urcu_txn_sw_init_inline backs the
-	 * record array with an on-stack latch buffer (no allocation).  A single
-	 * recorded edge takes the fast path -- one direct store, no proxy -- and
-	 * commit_flavor() never touches the reclaim fn or frees the inline buffer.
+	 * record array with an on-stack record buffer (no allocation).  A
+	 * single recorded edge takes the fast path -- one direct store, no
+	 * proxy -- and commit_flavor() never touches the reclaim fn or frees
+	 * the inline buffer.
 	 */
 	{
 		void *slot = (void *) 0x100;
@@ -246,7 +247,7 @@ int main(void)
 		enum urcu_txn_status st;
 
 		ok(((unsigned long) buf & 0xfUL) == 0,
-			"inline latch buffer is 16-byte aligned (tag room)");
+			"inline record buffer is 16-byte aligned (tag room)");
 		urcu_txn_sw_init_inline(t, buf, 1);
 		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200, TEST_TAG);
 		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu, NULL);	/* lone edge: fn unused */
@@ -256,8 +257,9 @@ int main(void)
 	}
 
 	/*
-	 * 6. commit_flavor routes parked-block reclaim through the SUPPLIED fn: a
-	 * multi-edge commit defers exactly one block, through counting_call_rcu,
+	 * 6. commit_flavor routes descriptor reclaim through the SUPPLIED fn: a
+	 * multi-edge commit defers exactly one descriptor, through
+	 * counting_call_rcu,
 	 * which a later rcu_barrier() drains.  Confirms a flavor-agnostic embedder
 	 * controls the deferral rather than the header's compile-time call_rcu.
 	 */
@@ -281,9 +283,9 @@ int main(void)
 
 	/*
 	 * 7. Synchronous (exclusive) reclaim: a multi-edge commit_flavor with an
-	 * in-place reclaim fn frees the group block before returning -- no grace
+	 * in-place reclaim fn frees the descriptor before returning -- no grace
 	 * period owed.  Slots still settle to new; a leak/UAF here would be caught
-	 * by ASAN since no rcu_barrier covers this block.
+	 * by ASAN since no rcu_barrier covers this descriptor.
 	 */
 	{
 		void *s1 = (void *) 0x40, *s2 = (void *) 0x50;
@@ -297,7 +299,7 @@ int main(void)
 		ok(st == URCU_TXN_STATUS_OK,
 			"exclusive (synchronous-reclaim) multi-edge commit returns OK");
 		ok(s1 == (void *) 0x41 && s2 == (void *) 0x51,
-			"exclusive multi-edge slots settled to new, block freed in place");
+			"exclusive multi-edge slots settled to new, descriptor freed in place");
 	}
 
 	rcu_barrier();			/* drain deferred txn reclaim callbacks */

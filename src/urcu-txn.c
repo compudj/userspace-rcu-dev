@@ -6,7 +6,7 @@
  * urcu-txn: shared library state of the RCU transaction engines.
  *
  * The engines themselves -- <urcu/rcu-txn-mcas.h> (concurrent MCAS) and
- * <urcu/rcu-txn-sw.h> (single-updater) -- are header-inline.  What lives here
+ * <urcu/rcu-txn-sw.h> (single-writer) -- are header-inline.  What lives here
  * is their only shared MUTABLE state: one per-CPU size-classed descriptor slab
  * per engine (<urcu/rcu-txn-slab.h>), plus the constructor initializing both.
  *

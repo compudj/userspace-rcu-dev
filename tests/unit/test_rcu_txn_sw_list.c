@@ -319,7 +319,7 @@ static void test_proxy_phases(void)
 		abort();
 	urcu_txn_sw_record(txn, (void **) &head.node.next, A, B, URCU_TXN_SW_LIST_PROXY_TAG);	/* head->next */
 	urcu_txn_sw_record(txn, (void **) &B->prev, A, &head.node, URCU_TXN_SW_LIST_PROXY_TAG);	/* B->prev */
-	urcu_txn_sw_install(txn);		/* park proxies; selector 0 => old */
+	urcu_txn_sw_install(txn);		/* install proxies; selector 0 => old */
 
 	rcu_read_lock();
 	ok(urcu_txn_sw_list_next_rcu(&head.node) == A,
@@ -328,7 +328,7 @@ static void test_proxy_phases(void)
 		"install: backward resolves to old (A still present)");
 	rcu_read_unlock();
 
-	/* Explicit install parked proxies, so commit owns reclaim (call_rcu). */
+	/* Proxies were installed explicitly, so commit owns reclaim (call_rcu). */
 	(void) urcu_txn_sw_commit(txn);	/* one flip switches both edges */
 
 	rcu_read_lock();

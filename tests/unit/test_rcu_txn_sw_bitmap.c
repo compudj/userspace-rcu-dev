@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Test for the single-updater transacted bitmap <urcu/rcu-txn-sw-bitmap.h>: a
+ * Test for the single-writer transacted bitmap <urcu/rcu-txn-sw-bitmap.h>: a
  * fixed-size bitmap over transacted words (63 data bits/word, bit 0 = engine
  * proxy tag) whose set/clear composes into a flip transaction.
  *
@@ -17,15 +17,15 @@
  *    pointer lands both.
  *  - SAME-WORD FUSION -- the reason this header exists in this shape.  63 bits
  *    share a word, and the sw engine has no transactional load and no same-slot
- *    reconcile, so a naive port would record two latches on one word and settle
+ *    reconcile, so a naive port would put two records on one word and settle
  *    them in record order, silently losing the earlier flip (install()'s debug
  *    scan aborts; an NDEBUG build corrupts quietly).  The _prepare forms fuse
  *    instead; these tests pin both the VALUES and the record count, since a
  *    correct-looking value could still hide a duplicate record.
  *  - concurrent PER-WORD ATOMICITY: one writer toggles a two-word range while
  *    readers resolve; each word must read all-clear or all-set, never torn.
- *    This exercises the proxy path (a 2-edge commit parks proxies and flips a
- *    group, where a 1-edge commit is just a release store).
+ *    This exercises the proxy path (a 2-edge commit installs proxies and flips
+ *    a group, where a 1-edge commit is just a store-release).
  *
  * NOT covered, because the engine does not provide it: an atomic MULTI-WORD
  * snapshot.  The concurrent twin gets one from a read-only transaction that
@@ -222,7 +222,7 @@ static void test_compose_single(void)
 /*
  * Each case pins the resulting VALUES *and* txn.nr (captured before commit,
  * which consumes the handle).  The record count is the point: without fusion
- * these cases record two latches on one word, which is the silent-corruption
+ * these cases put two records on one word, which is the silent-corruption
  * bug this header exists to prevent -- and a value check alone can miss it,
  * since last-wins happens to give the right answer for some orderings.
  */
@@ -300,9 +300,9 @@ static uintptr_t t4_bm[URCU_TXN_SW_BITMAP_NR_WORDS(T4_NBITS)];
 static atomic_int t4_stop;
 static atomic_long t4_torn, t4_saw_full, t4_saw_empty, t4_saw_proxy;
 
-/* The one updater: toggle both words between all-clear and all-set.  A
- * two-word range is two edges, so commit parks proxies and flips a group --
- * the path a single-edge commit (a lone release store) would never exercise. */
+/* The one writer: toggle both words between all-clear and all-set.  A
+ * two-word range is two edges, so commit installs proxies and flips a group --
+ * the path a single-edge commit (a lone store-release) would never exercise. */
 static void *t4_writer(void *unused __attribute__((unused)))
 {
 	int it;

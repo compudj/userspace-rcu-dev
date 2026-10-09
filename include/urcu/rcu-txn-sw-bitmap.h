@@ -8,7 +8,7 @@
 /*
  * rcu-txn-sw-bitmap.h
  *
- * The single-updater sibling of <urcu/rcu-txn-bitmap.h>: a fixed-size bitmap
+ * The single-writer sibling of <urcu/rcu-txn-bitmap.h>: a fixed-size bitmap
  * laid over an array of transacted words, so that bit set/clear composes into
  * the SAME flip transaction (<urcu/rcu-txn-sw.h>) as the mutation it
  * accompanies -- e.g. a fractal-trie node's occupancy bit flips atomically with
@@ -16,11 +16,11 @@
  * cds_hlist_*_rcu(); reads are plain RCU (resolve the proxy, mask the bit).
  *
  * ENCODING -- identical to the concurrent twin, deliberately.  The engine owns
- * tag bit 0 of every transacted slot: a settled literal must have
- * (value & URCU_TXN_SW_BITMAP_TAG) != URCU_TXN_SW_BITMAP_TAG, i.e. bit 0 clear, or it is mistaken
- * for a parked proxy.  A bitmap word is all data, so we spend bit 0 as the tag
- * and keep 63 data bits per word (CAA_BITS_PER_LONG - 1): logical bit i lives
- * at PHYSICAL bit i+1, and a settled word always has bit 0 == 0.
+ * tag bit 0 of every transacted slot: a settled literal must have (value &
+ * URCU_TXN_SW_BITMAP_TAG) != URCU_TXN_SW_BITMAP_TAG, i.e. bit 0 clear, or it is
+ * mistaken for an installed proxy.  A bitmap word is all data, so we spend bit
+ * 0 as the tag and keep 63 data bits per word (CAA_BITS_PER_LONG - 1): logical
+ * bit i lives at PHYSICAL bit i+1, and a settled word always has bit 0 == 0.
  *
  *   word  w  = bit / BITS_PER_WORD
  *   phys  p  = 1 + bit % BITS_PER_WORD      (in 1..BITS_PER_WORD)
@@ -44,7 +44,7 @@
  * and that is exactly what makes every live value miss the tag pattern -- and
  * it must fit the low 4 bits, which is the alignment room the parked value
  * (record_address | TAG) has.  Widening does not shrink BITS_PER_WORD: the extra
- * bits are borrowed from the LATCH ADDRESS, not from the word.
+ * bits are borrowed from the RECORD ADDRESS, not from the word.
  *
  * LAYOUT.  The API operates on a caller-provided `uintptr_t *words` (the bitmap
  * is embedded wherever the caller wants -- inside a node, a metadata block, ...)
@@ -53,7 +53,7 @@
  * READS must run inside an RCU read-side critical section of the flavor the
  * transactions use (they resolve proxies, whose lifetime is the RCU grace
  * period) -- exactly like urcu_txn_sw_list_*_rcu().  A reader resolves through
- * urcu_txn_sw_proxy_resolve(): one acquire load of the flip selector, never
+ * urcu_txn_sw_proxy_resolve(): one load-acquire of the flip selector, never
  * blocking and never waiting on anyone.  The concurrent twin's read-policy
  * question ("a pure reader must not wait") simply does not arise -- this engine
  * has no UNDECIDED window at all, so a resolved word is always the flip's
@@ -64,11 +64,11 @@
  * The transacted slot is the WORD, not the bit: 63 logical bits share one
  * physical word, so flips of DISTINCT bit indexes routinely land on the SAME
  * slot.  urcu_txn_sw_record() appends blindly and requires pairwise-distinct
- * slots, so recording each flip with it would park two proxies on one word and
- * settle them in record order, silently losing the earlier flip (install()'s
- * debug scan catches it; an NDEBUG build does not).  For a bitmap that
- * collision is the COMMON case, not a corner, so "compose only slot-disjoint
- * edits" -- the stance of <urcu/rcu-txn-sw-list.h> and
+ * slots, so recording each flip with it would install two proxies on one word
+ * and settle them in record order, silently losing the earlier flip
+ * (install()'s debug scan catches it; an NDEBUG build does not).  For a bitmap
+ * that collision is the COMMON case, not a corner, so "compose only
+ * slot-disjoint edits" -- the stance of <urcu/rcu-txn-sw-list.h> and
  * <urcu/rcu-txn-sw-hlist.h> -- would be close to unusable here.
  *
  * So the _prepare forms below record through the engine's read-your-own-writes
@@ -95,18 +95,18 @@
  * COMPOSITION / rank consistency.  rank()/select() read across several words but
  * a set/clear transacts only the ONE word it changes.  When a compressed-array
  * index (= rank) is folded into a commit, the caller must ensure no bitmap
- * change that would move that rank races it -- under a single updater that is
- * free, since the updater making the commit is the only one that could.
+ * change that would move that rank races it -- under a single writer that is
+ * free, since the writer making the commit is the only one that could.
  *
  * PARITY with <urcu/rcu-txn-bitmap.h>, and where it stops
  * ------------------------------------------------------
  * Same encoding, same accessor set, same _prepare shape, so a caller migrates
  * between the two mechanically.  Two differences are real:
  *
- *   - No ABORT and no escalation domain.  A single updater has no contention,
+ *   - No ABORT and no escalation domain.  A single writer has no contention,
  *     so the _rcu forms take no domain, run no retry loop, and return only OK
  *     or MEMORY_ERROR.  A single-bit _rcu commit is one recorded edge, which
- *     takes the engine's nr == 1 fast path: a lone release store, with no proxy
+ *     takes the engine's nr == 1 fast path: a lone store-release, with no proxy
  *     alloc, no install, no settle and no grace period -- strictly cheaper than
  *     the twin's install/CAS/settle cycle.
  *
@@ -118,28 +118,28 @@
  *     weight, find_*) are per-word hints, not snapshots: they hold no proxy and
  *     resolve each word against its own moment, so a scan can straddle a range
  *     commit.  If you need an atomic multi-word snapshot, use
- *     <urcu/rcu-txn-bitmap.h> even under a single updater.  That means "drive
+ *     <urcu/rcu-txn-bitmap.h> even under a single writer.  That means "drive
  *     the WHOLE bitmap through the twin", not "borrow its snapshot for a
  *     bitmap this engine writes" -- see the handoff rule immediately below.
  *
  * NOT TO BOTH AT ONCE, and here is why.  The layouts are bit-for-bit identical
- * and both engines spend bit 0, but the value they PARK there is not the same
- * kind of thing: the concurrent engine parks a tagged pointer to an MCAS record
- * whose descriptor carries a status word, and this one parks a tagged pointer
- * to a flip latch whose group carries a selector.  A reader resolves whichever
- * it finds through its OWN front-end's resolver, so a word parked by one and
- * resolved by the other is decoded with the wrong layout: it follows a garbage
- * pointer to a status or a selector that was never written.  The install
- * disciplines are incompatible too -- CAS-install against a blind park -- so
- * even the writers cannot arbitrate each other.
+ * and both engines spend bit 0, but the value they INSTALL there is not the
+ * same kind of thing: the concurrent engine installs a tagged pointer to an
+ * MCAS record whose descriptor carries a status word, and this one installs a
+ * tagged pointer to a record whose flip group carries a selector.  A reader
+ * resolves whichever it finds through its OWN front-end's resolver, so a word
+ * parked by one and resolved by the other is decoded with the wrong layout: it
+ * follows a garbage pointer to a status or a selector that was never written.
+ * The install disciplines are incompatible too -- CAS-install against a blind
+ * install -- so even the writers cannot arbitrate each other.
  *
  * THE HANDOFF RULE is therefore quiescence, not interleaving: every commit of
- * the outgoing front-end must have RETURNED (so no proxy is parked and every
+ * the outgoing front-end must have RETURNED (so no proxy is installed and every
  * word holds a settled value) before the first transaction of the incoming one
  * begins.  There is no way to detect a violation at runtime.
  *
  * Include this header AFTER an RCU flavor header (e.g. <urcu-qsbr.h>): commit
- * reclaims parked proxies through that flavor's call_rcu().
+ * reclaims installed proxies through that flavor's call_rcu().
  */
 
 #include <errno.h>			/* ENOMEM */
@@ -164,7 +164,7 @@ urcu_static_assert((URCU_TXN_SW_BITMAP_TAG & 1UL) == 1UL &&
 			(URCU_TXN_SW_BITMAP_TAG & ~0xFUL) == 0,
 		"URCU_TXN_SW_BITMAP_TAG must include bit 0 (which a settled word "
 		"always leaves clear) and fit the low 4 bits left free by the "
-		"16-byte latch alignment",
+		"16-byte record alignment",
 		urcu_txn_sw_bitmap_tag_out_of_range);
 
 #ifdef __cplusplus
@@ -191,7 +191,7 @@ void urcu_txn_sw_bitmap__locate(size_t bit, size_t *word, uintptr_t *mask)
  * Resolved logical value of word @w (physical: bit 0 clear, data in 1..63).
  * Call within an RCU read-side section.
  *
- * A tagged proxy resolves through the flip selector -- one acquire load,
+ * A tagged proxy resolves through the flip selector -- one load-acquire,
  * returning this word's old value until the owning transaction's selector store
  * and its new value after.  A settled literal passes through unchanged.
  */
@@ -343,12 +343,12 @@ int urcu_txn_sw_bitmap__word_edit(struct urcu_txn_sw_txn *txn, uintptr_t *words,
  *
  * @txn MUST BE A DEFAULT HANDLE for that to hold.  The fusion IS the engine's
  * read-your-own-writes pair, and urcu_txn_sw_declare_disjoint() switches it
- * off: the load then returns the committed word and the record blindly
- * appends, so two flips sharing a word are parked and settled in record order
- * and the earlier one is silently lost.  63 logical bits share one physical
- * word, so distinct bit indexes are NOT distinct slots.  Declare disjoint only
- * for a LONE range, or for edits proven to fall in different words, with
- * nothing else in the transaction.
+ * off: the load then returns the committed word and the record blindly appends,
+ * so two flips sharing a word are installed and settled in record order and the
+ * earlier one is silently lost.  63 logical bits share one physical word, so
+ * distinct bit indexes are NOT distinct slots.  Declare disjoint only for a
+ * LONE range, or for edits proven to fall in different words, with nothing else
+ * in the transaction.
  */
 static inline
 int urcu_txn_sw_bitmap_set_prepare(struct urcu_txn_sw_txn *txn, uintptr_t *words,
@@ -422,20 +422,20 @@ int urcu_txn_sw_bitmap_clear_range_prepare(struct urcu_txn_sw_txn *txn,
 }
 
 /*
- * Self-contained set/clear: own init/commit, no retry loop (a single updater
+ * Self-contained set/clear: own init/commit, no retry loop (a single writer
  * has no contention, so commit never returns ABORT) and no escalation domain.
  * For standalone use and tests; the fractal trie composes via the _prepare
  * forms instead.  Returns URCU_TXN_STATUS_OK, or URCU_TXN_STATUS_MEMORY_ERROR.
  *
  * One bit is one edge, so commit takes the engine's nr == 1 fast path: a lone
- * release store to the word, with no proxy, no group block and no grace period.
+ * store-release to the word, with no proxy, no descriptor and no grace period.
  *
- * The one-latch INLINE handle is what makes that claim true end to end.  A
+ * The one-record INLINE handle is what makes that claim true end to end.  A
  * default handle allocates its record array on the first record and frees it at
  * commit, so these wrappers paid a heap or slab round-trip -- and carried a
  * spurious MEMORY_ERROR return -- for a transaction that publishes with a
  * single store.  Caller storage removes both; the engine never grows it,
- * because one edge never overflows a one-latch buffer.  MEMORY_ERROR therefore
+ * because one edge never overflows a one-record buffer.  MEMORY_ERROR therefore
  * cannot happen here any more, and the return is kept only so the signature
  * matches the composable forms.  (Commit uses the compile-time-selected RCU
  * flavor's call_rcu -- include a flavor header first.)
