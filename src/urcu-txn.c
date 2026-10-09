@@ -26,9 +26,6 @@
  * disabled and falls back to exact posix_memalign blocks.)
  */
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE		/* sched_getcpu (rcu-txn-slab.h) */
-#endif
 #ifndef _LGPL_SOURCE
 #define _LGPL_SOURCE
 #endif
@@ -36,8 +33,16 @@
 #include <urcu/rcu-txn-sw.h>
 #include <urcu/rcu-txn-mcas.h>	/* engine layer only (flavor-free) */
 
+#include "compat-getcpu.h"
+
 struct urcu_slab urcu_txn_sw_slab;
 struct urcu_slab urcu_txn_slab;
+
+/* The slab's fallback for the current cpu: see urcu_slab_cpu(). */
+int urcu_slab_getcpu(void)
+{
+	return urcu_sched_getcpu();
+}
 
 /* Byte size per record-count class; filled at init, must outlive the slab. */
 static size_t urcu_txn_sw_slab_bytes[URCU_TXN_SW_SLAB_NCLASS];

@@ -76,7 +76,6 @@
 #endif
 #include <stdint.h>			/* uintptr_t */
 #include <limits.h>			/* ULONG_MAX (batch threshold default) */
-#include <sched.h>			/* sched_getcpu */
 #include <unistd.h>			/* sysconf */
 #include <sys/mman.h>			/* mmap */
 #include <pthread.h>			/* floor bootstrap mutex */
@@ -96,8 +95,8 @@
  * The C library's rseq area, for urcu_slab_cpu().  glibc registers rseq for
  * every thread and exports __rseq_offset since 2.35; the thread pointer comes
  * from a compiler builtin.  Without either, urcu_slab_cpu() calls
- * sched_getcpu() as it always did.  Not used under URCU_SLAB_RSEQ, where
- * librseq supplies the same field.
+ * urcu_slab_getcpu().  Not used under URCU_SLAB_RSEQ, where librseq supplies
+ * the same field.
  */
 #if !defined(URCU_SLAB_RSEQ) && defined(__GLIBC__) && defined(__GLIBC_PREREQ) && \
 	defined(__has_builtin)
@@ -786,10 +785,18 @@ void urcu_slab_stats_dump(void)
  * frame and the stack protector.  So read it here, whichever freelist build
  * this is.  The kernel rewrites cpu_id whenever it moves the thread, hence a
  * relaxed atomic load; a negative value means rseq is not registered for this
- * thread (the tunable is off, or the kernel lacks it) and sched_getcpu()
+ * thread (the tunable is off, or the kernel lacks it) and urcu_slab_getcpu()
  * answers instead.  Either way the value is a hint: the thread can migrate
  * the instant after, and every caller here already tolerates that.
+ *
+ * urcu_slab_getcpu() is sched_getcpu() called from liburcu-common, or -1
+ * where the platform has no equivalent.  It is out of line because the C
+ * library declares sched_getcpu() only under _GNU_SOURCE, which this header
+ * cannot define for a translation unit that has already included a system
+ * header.
  */
+extern int urcu_slab_getcpu(void);
+
 static inline
 int urcu_slab_cpu(void)
 {
@@ -806,7 +813,7 @@ int urcu_slab_cpu(void)
 			return cpu;
 	}
 #endif
-	return sched_getcpu();
+	return urcu_slab_getcpu();
 }
 
 static inline
