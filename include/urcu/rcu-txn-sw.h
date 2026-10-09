@@ -942,8 +942,8 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	 * slot holds @new_ptr directly: were it tagged, every later reader
 	 * would resolve it as a proxy and dereference garbage.
 	 */
-	urcu_assert_debug(!urcu_txn_sw_is_proxy(old_ptr, tag));
-	urcu_assert_debug(!urcu_txn_sw_is_proxy(new_ptr, tag));
+	urcu_assert_debug(!urcu_txn_sw__is_parked(old_ptr, tag));
+	urcu_assert_debug(!urcu_txn_sw__is_parked(new_ptr, tag));
 	/*
 	 * A caller-storage handle takes one record: no commit path accepts it
 	 * with more.  Trap here, at the second record, rather than at the

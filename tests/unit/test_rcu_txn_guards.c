@@ -38,6 +38,11 @@
  *   6. sw cancel() on a handle that commit() consumed.  There is nothing left
  *      to cancel: the transaction is published.
  *
+ * Two controls check that the guards do not fire on a well-formed transaction.
+ * The second is a single record under a zero tag, which is legal because such a
+ * commit installs no proxy, and which the tag guards of record() once rejected
+ * since every value matches a zero tag.
+ *
  * Cases 1-3 are urcu_assert_debug (DEBUG_RCU); 4-6 are urcu_posix_assert
  * (NDEBUG).  This test is compiled with -DDEBUG_RCU (see Makefile.am) so the
  * first group exists whatever the tree's build flags; under NDEBUG every guard
@@ -79,7 +84,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	7
+#define NR_TESTS	8
 
 /* Opaque, bit-0-clear slot values (the engine owns bit 0 as its proxy tag). */
 #define V0	((void *) 0x100)
@@ -227,6 +232,18 @@ static void body_control(void)
 	urcu_txn_end(&txn);
 }
 
+/* Control: sw, one record under a zero tag installs no proxy. */
+static void body_sw_zero_tag_single(void)
+{
+	struct urcu_txn_sw_txn t;
+
+	urcu_txn_sw_init(&t);
+	(void) urcu_txn_sw_record_chain(&t, &g_a,
+			urcu_txn_sw_load(&t, &g_a, 0), VTAGGED, 0);
+	if (urcu_txn_sw_commit(&t) != URCU_TXN_STATUS_OK || g_a != VTAGGED)
+		abort();
+}
+
 int main(void)
 {
 	plan_tests(NR_TESTS);
@@ -261,6 +278,8 @@ int main(void)
 		"sw: cancel() on a handle that commit() consumed aborts");
 	ok(!aborts_in_child(body_control),
 		"control: a well-formed disjoint commit trips no guard");
+	ok(!aborts_in_child(body_sw_zero_tag_single),
+		"control: sw, a single record under a zero tag trips no guard");
 
 	rcu_barrier();			/* drain deferred descriptor frees */
 	rcu_unregister_thread();
