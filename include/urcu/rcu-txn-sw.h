@@ -461,7 +461,7 @@ void urcu_txn_sw__excl_owner(const struct urcu_txn_sw_txn *t, const char *what)
 			(const void *) t, what);
 }
 
-/* @slot must not already be parked by another writer. */
+/* @slot must hold no proxy: it would be another writer's. */
 static inline
 void urcu_txn_sw__excl_slot_free(void **slot, uintptr_t tag, const char *what)
 {
@@ -485,17 +485,18 @@ void urcu_txn_sw__excl_slot_ours(struct urcu_txn_sw_record *r)
 }
 
 /*
- * The single-edge commit installs no proxy, so its only witness is the value:
- * @r's slot must still hold the recorded old.
+ * @r's slot must still hold the recorded old.  This is the only witness of a
+ * single-edge commit, which installs no proxy.
  */
 static inline
-void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_record *r)
+void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_record *r,
+		const char *what)
 {
 	void *v = uatomic_load(r->slot, CMM_RELAXED);
 
 	if (v != r->ptr[0])
-		urcu_txn_sw__excl_abort("slot=%p holds %p at the single-edge commit, but %p was recorded as its old: a concurrent writer changed it\n",
-			(void *) r->slot, v, r->ptr[0]);
+		urcu_txn_sw__excl_abort("slot=%p holds %p at %s, but %p was recorded as its old: a concurrent writer changed it\n",
+			(void *) r->slot, v, what, r->ptr[0]);
 }
 
 /*
@@ -515,24 +516,49 @@ void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_record *r)
 static inline
 void urcu_txn_sw__excl_slot_parkable(struct urcu_txn_sw_record *r)
 {
-	void *v = uatomic_load(r->slot, CMM_RELAXED);
-
-	if (urcu_txn_sw__is_proxy(v, r->tag))
-		urcu_txn_sw__excl_abort("slot=%p already holds an installed proxy (%p) at install: another writer is mid-transaction on it\n",
-			(void *) r->slot, v);
-	if (v != r->ptr[0])
-		urcu_txn_sw__excl_abort("slot=%p holds %p at install, but %p was recorded as its old: a concurrent writer committed over it\n",
-			(void *) r->slot, v, r->ptr[0]);
+	urcu_txn_sw__excl_slot_free(r->slot, r->tag, "install");
+	urcu_txn_sw__excl_slot_unchanged(r, "install");
 }
 
 #else	/* !URCU_TXN_SW_EXCL_VALIDATE */
 
-# define urcu_txn_sw__excl_claim(t)			do { } while (0)
-# define urcu_txn_sw__excl_owner(t, what)		do { } while (0)
-# define urcu_txn_sw__excl_slot_free(slot, tag, what)	do { } while (0)
-# define urcu_txn_sw__excl_slot_parkable(r)		do { } while (0)
-# define urcu_txn_sw__excl_slot_ours(r)			do { } while (0)
-# define urcu_txn_sw__excl_slot_unchanged(r)		do { } while (0)
+static inline
+void urcu_txn_sw__excl_claim(struct urcu_txn_sw_txn *t __attribute__((unused)))
+{
+}
+
+static inline
+void urcu_txn_sw__excl_owner(
+		const struct urcu_txn_sw_txn *t __attribute__((unused)),
+		const char *what __attribute__((unused)))
+{
+}
+
+static inline
+void urcu_txn_sw__excl_slot_free(void **slot __attribute__((unused)),
+		uintptr_t tag __attribute__((unused)),
+		const char *what __attribute__((unused)))
+{
+}
+
+static inline
+void urcu_txn_sw__excl_slot_ours(
+		struct urcu_txn_sw_record *r __attribute__((unused)))
+{
+}
+
+static inline
+void urcu_txn_sw__excl_slot_unchanged(
+		struct urcu_txn_sw_record *r __attribute__((unused)),
+		const char *what __attribute__((unused)))
+{
+}
+
+static inline
+void urcu_txn_sw__excl_slot_parkable(
+		struct urcu_txn_sw_record *r __attribute__((unused)))
+{
+}
 
 #endif	/* URCU_TXN_SW_EXCL_VALIDATE */
 
@@ -1248,7 +1274,8 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 		if (nr == 1) {
 			struct urcu_txn_sw_record *r = &t->records[0];
 
-			urcu_txn_sw__excl_slot_unchanged(r);
+			urcu_txn_sw__excl_slot_unchanged(r,
+					"the single-edge commit");
 			/*
 			 * Store-release of slot pairs with rcu_dereference().
 			 */
