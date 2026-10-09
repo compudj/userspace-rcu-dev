@@ -784,6 +784,31 @@ void urcu_txn_sw_free_rcu(struct rcu_head *head)
 }
 
 /*
+ * Retire the descriptor of a committed transaction.  A reader may still hold
+ * one of its proxies, so it must outlive a grace period.  By default the slab
+ * retires it in a batch, with one call_rcu per batch;
+ * -DURCU_TXN_SLAB_NO_BATCH keeps one call_rcu per descriptor.  Only a slab
+ * descriptor, under @flavor's own deferral, may take the batch route: see
+ * urcu_txn_retire() in <urcu/rcu-txn-mcas.h>.
+ */
+static inline
+void urcu_txn_sw__retire(struct urcu_txn_sw_desc *desc,
+		void (*call_rcu_fn)(struct rcu_head *,
+			void (*)(struct rcu_head *)),
+		const struct rcu_flavor_struct *flavor)
+{
+#ifndef URCU_TXN_SLAB_NO_BATCH
+	if (caa_likely(desc->slab && flavor &&
+			flavor->update_call_rcu == call_rcu_fn) &&
+			urcu_slab_free_pending(desc, flavor))
+		return;
+#else
+	(void) flavor;
+#endif
+	call_rcu_fn(&desc->rcu_head, urcu_txn_sw_free_rcu);
+}
+
+/*
  * Set a record's {old, new, slot, tag}; its group is bound at install.
  */
 static inline
@@ -1263,23 +1288,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 		/* Store-release of slot pairs with rcu_dereference(). */
 		uatomic_store(r->slot, r->ptr[1], CMM_RELEASE);
 	}
-	/*
-	 * A reader may hold a proxy into @desc, so it must not be freed before
-	 * a grace period.  By default the slab retires it in a batch (one
-	 * call_rcu per batch); -DURCU_TXN_SLAB_NO_BATCH keeps one call_rcu per
-	 * descriptor.  Only slab-stamped descriptors, under @flavor's own
-	 * deferral, may take the batch route: see urcu_txn_retire() in
-	 * <urcu/rcu-txn-mcas.h>.
-	 */
-#ifndef URCU_TXN_SLAB_NO_BATCH
-	if (!(caa_likely(desc->slab && flavor &&
-			flavor->update_call_rcu == call_rcu_fn) &&
-			urcu_slab_free_pending(desc, flavor)))
-		call_rcu_fn(&desc->rcu_head, urcu_txn_sw_free_rcu);
-#else
-	(void) flavor;
-	call_rcu_fn(&desc->rcu_head, urcu_txn_sw_free_rcu);
-#endif
+	urcu_txn_sw__retire(desc, call_rcu_fn, flavor);
 	t->desc = NULL;		/* handle consumed */
 	t->records = NULL;
 	t->state = URCU_TXN_SW_DONE;
