@@ -51,6 +51,10 @@
  * commit()'s status, as elsewhere, is not enough here.  A debug build asserts
  * it: see URCU_TXN_SW_HLIST__ASSERT_ROLLBACKABLE.
  *
+ * For the same reason, a transaction must be committed once one of the _prepare
+ * forms below has run: urcu_txn_sw_cancel() drops the records and leaves pprev
+ * advanced.
+ *
  * Composing edits of one hlist
  * ----------------------------
  * Operations whose neighbourhoods touch may share a transaction: each _prepare

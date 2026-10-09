@@ -5,8 +5,8 @@
 /*
  * Unit test for urcu_txn_sw_txn: the multi-edge transaction layer of the
  * single-writer engine, focusing on the commit() shortcuts -- the single-edge fast path
- * (no proxy at all) and auto-install -- the explicit-install caveat, and the
- * record-array realloc-grow path.
+ * (no proxy at all) and auto-install -- the explicit-install caveat, the
+ * record-array realloc-grow path, and cancel().
  *
  * commit() owns reclaim: it frees the txn at once on the single-edge / empty
  * paths and defers it through call_rcu() once proxies are installed.  The test
@@ -30,7 +30,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 27
+#define NR_TESTS 35
 
 /* Per-record tag: bit 0 of the proxy pointer (records are 16B-aligned). */
 #define TEST_TAG	1UL
@@ -305,6 +305,92 @@ int main(void)
 			"exclusive (synchronous-reclaim) multi-edge commit returns OK");
 		ok(s1 == (void *) 0x41 && s2 == (void *) 0x51,
 			"exclusive multi-edge slots settled to new, descriptor freed in place");
+	}
+
+	/*
+	 * 8. Cancel: a transaction dropped before commit publishes nothing,
+	 * frees its descriptor at once and consumes the handle, which commits as
+	 * usual once initialized again.
+	 */
+	{
+		void *s1 = (void *) 0x60, *s2 = (void *) 0x70;
+		struct urcu_txn_sw_record buf[1];
+		struct urcu_txn_sw_txn _t, *t = &_t;
+		enum urcu_txn_status st;
+		uintptr_t prev = 0;
+		bool reused = false, from_slab = false;
+		unsigned int i;
+
+		urcu_txn_sw_init(t);
+		urcu_txn_sw_record(t, &s1, (void *) 0x60, (void *) 0x62, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x70, (void *) 0x72, TEST_TAG);
+		urcu_txn_sw_cancel(t);
+		ok(s1 == (void *) 0x60 && s2 == (void *) 0x70,
+			"a cancelled transaction leaves its slots untouched");
+		ok(!t->desc && !t->records && t->state == URCU_TXN_SW_DONE,
+			"cancel consumes the handle");
+
+		/*
+		 * The slab hands a freed descriptor out again, and never a leaked
+		 * one.  Several rounds, because a descriptor goes back to the cpu
+		 * it came from and the thread may migrate in between.  Without the
+		 * slab (URCU_TXN_NO_CACHE) reuse is up to malloc, and telling a
+		 * leak is a leak checker's job.
+		 */
+		for (i = 0; i < 64 && !reused; i++) {
+			urcu_txn_sw_init(t);
+			urcu_txn_sw_reserve(t, 2);
+			urcu_txn_sw_record(t, &s1, (void *) 0x60, (void *) 0x62, TEST_TAG);
+			from_slab = t->desc && t->desc->slab;
+			reused = (uintptr_t) t->desc == prev;
+			prev = (uintptr_t) t->desc;
+			urcu_txn_sw_cancel(t);
+		}
+		if (from_slab)
+			ok(reused, "cancel frees the descriptor");
+		else
+			skip(1, "descriptors come from malloc: reuse is the allocator's");
+
+		urcu_txn_sw_init(t);
+		urcu_txn_sw_cancel(t);
+		ok(t->state == URCU_TXN_SW_DONE,
+			"cancel accepts a handle that recorded nothing");
+
+		urcu_txn_sw_init_inline(t, buf, 1);
+		urcu_txn_sw_record(t, &s1, (void *) 0x60, (void *) 0x62, TEST_TAG);
+		urcu_txn_sw_cancel(t);
+		ok(s1 == (void *) 0x60 && t->state == URCU_TXN_SW_DONE,
+			"cancel on caller storage publishes nothing");
+
+		/*
+		 * The sticky OOM state, set by hand: no allocation of this size
+		 * fails on demand.
+		 */
+		urcu_txn_sw_init(t);
+		urcu_txn_sw_record(t, &s1, (void *) 0x60, (void *) 0x62, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x70, (void *) 0x72, TEST_TAG);
+		t->state = URCU_TXN_SW_OOM;
+		urcu_txn_sw_cancel(t);
+		ok(!t->desc && t->state == URCU_TXN_SW_DONE &&
+			s1 == (void *) 0x60 && s2 == (void *) 0x70,
+			"cancel accepts a handle in the sticky OOM state");
+
+		urcu_txn_sw_init(t);
+		urcu_txn_sw_record(t, &s1, (void *) 0x60, (void *) 0x62, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x70, (void *) 0x72, TEST_TAG);
+		t->state = URCU_TXN_SW_OOM;
+		st = urcu_txn_sw_commit(t);
+		ok(st == URCU_TXN_STATUS_MEMORY_ERROR && !t->desc &&
+			s1 == (void *) 0x60 && s2 == (void *) 0x70,
+			"commit in the sticky OOM state reports MEMORY_ERROR and publishes nothing");
+
+		urcu_txn_sw_init(t);
+		urcu_txn_sw_record(t, &s1, (void *) 0x60, (void *) 0x62, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x70, (void *) 0x72, TEST_TAG);
+		st = urcu_txn_sw_commit(t);
+		ok(st == URCU_TXN_STATUS_OK && s1 == (void *) 0x62 &&
+			s2 == (void *) 0x72,
+			"the same slots commit after the cancelled attempts");
 	}
 
 	rcu_barrier();			/* drain deferred txn reclaim callbacks */

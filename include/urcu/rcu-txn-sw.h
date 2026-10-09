@@ -151,6 +151,9 @@ extern "C" {
  *   - nr <= 1 / sticky OOM (no proxy ever published): the transaction
  *     descriptor is freed at once.
  *
+ * cancel() drops the record set instead of publishing it, and frees the
+ * descriptor at once.  A handle ends in commit() or in cancel().
+ *
  * OOM is sticky: a reserve()/record() that cannot allocate a descriptor
  * causes the following reserve()/record() operations to be no-ops, and the
  * later commit() to report MEMORY_ERROR and to free the descriptor, so an
@@ -168,7 +171,7 @@ enum urcu_txn_sw_state {
 	URCU_TXN_SW_PREPARE = 0,
 	URCU_TXN_SW_OOM,		/* sticky: commit -> MEMORY_ERROR */
 	/*
-	 * Terminal: commit() consumed the handle.  Reusing it without
+	 * Terminal: commit() or cancel() consumed the handle.  Reusing it without
 	 * initializing it again trips an assertion, where it would otherwise
 	 * store through a stale record array.
 	 */
@@ -1140,6 +1143,29 @@ bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
 }
 
 /*
+ * Cancel: drop the transaction instead of committing it.  No proxy was
+ * installed, so nothing is published and the descriptor is freed at once, with
+ * no grace period.  Like commit(), it consumes the handle, which must be
+ * initialized again before it is reused.
+ *
+ * A handle ends in commit() or in cancel(): one that is merely dropped leaks
+ * its descriptor.  A handle in the sticky OOM state may be cancelled as well.
+ *
+ * Only the records are dropped.  What an embedder changed outside the
+ * transaction as it recorded is not rolled back, so such a transaction must be
+ * committed: see <urcu/rcu-txn-sw-hlist.h>.
+ */
+static inline
+void urcu_txn_sw_cancel(struct urcu_txn_sw_txn *t)
+{
+	urcu_txn_sw__excl_owner(t, "cancel()");
+	/* A consumed handle must be initialized again before reuse. */
+	urcu_posix_assert(t->state != URCU_TXN_SW_DONE);
+	urcu_txn_sw__free_records(t);	/* no proxy: free now */
+	t->state = URCU_TXN_SW_DONE;
+}
+
+/*
  * Commit: install every record's proxy, flip the group so that every proxy
  * resolves to new atomically, then settle each slot to its new value.  commit()
  * owns reclaim and consumes the handle, which must be initialized again before
@@ -1187,8 +1213,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	/* A consumed handle must be initialized again before reuse. */
 	urcu_posix_assert(t->state != URCU_TXN_SW_DONE);
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM)) {
-		urcu_txn_sw__free_records(t);
-		t->state = URCU_TXN_SW_DONE;
+		urcu_txn_sw_cancel(t);
 		return URCU_TXN_STATUS_MEMORY_ERROR;
 	}
 	if (nr <= 1) {

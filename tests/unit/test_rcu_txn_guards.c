@@ -35,8 +35,10 @@
  *      the record that breaks the contract.
  *   5. sw reserve() on a handle that commit() consumed.  The handle no longer
  *      owns a record array, and must be initialized again before it is reused.
+ *   6. sw cancel() on a handle that commit() consumed.  There is nothing left
+ *      to cancel: the transaction is published.
  *
- * Cases 1-3 are urcu_assert_debug (DEBUG_RCU); 4-5 are urcu_posix_assert
+ * Cases 1-3 are urcu_assert_debug (DEBUG_RCU); 4-6 are urcu_posix_assert
  * (NDEBUG).  This test is compiled with -DDEBUG_RCU (see Makefile.am) so the
  * first group exists whatever the tree's build flags; under NDEBUG every guard
  * compiles out and the whole set is skipped.
@@ -77,7 +79,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	6
+#define NR_TESTS	7
 
 /* Opaque, bit-0-clear slot values (the engine owns bit 0 as its proxy tag). */
 #define V0	((void *) 0x100)
@@ -198,6 +200,18 @@ static void body_sw_reserve_after_commit(void)
 	(void) urcu_txn_sw_reserve(&t, 64);	/* not initialized again: illegal */
 }
 
+/* 6. sw: cancel() on a handle that commit() consumed. */
+static void body_sw_cancel_after_commit(void)
+{
+	struct urcu_txn_sw_txn t;
+
+	urcu_txn_sw_init(&t);
+	(void) urcu_txn_sw_record(&t, &g_a, NULL, V0, URCU_TXN_TAG);
+	(void) urcu_txn_sw_record(&t, &g_b, NULL, V1, URCU_TXN_TAG);
+	(void) urcu_txn_sw_commit(&t);
+	urcu_txn_sw_cancel(&t);		/* already published: illegal */
+}
+
 /* Control: a well-formed disjoint transaction must NOT trip any guard. */
 static void body_control(void)
 {
@@ -243,6 +257,8 @@ int main(void)
 		"sw: a second record on an inline-storage handle aborts at the record, before commit");
 	ok(aborts_in_child(body_sw_reserve_after_commit),
 		"sw: reserve() on a handle that commit() consumed aborts");
+	ok(aborts_in_child(body_sw_cancel_after_commit),
+		"sw: cancel() on a handle that commit() consumed aborts");
 	ok(!aborts_in_child(body_control),
 		"control: a well-formed disjoint commit trips no guard");
 
