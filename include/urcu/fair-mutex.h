@@ -42,7 +42,7 @@
 #include <urcu/uatomic.h>
 #include <urcu/wait-ladder.h>
 #include <urcu/futex.h>
-#include <sched.h>
+#include <urcu/getcpu.h>
 
 #include <urcu/compiler.h>
 #include <urcu/arch.h>
@@ -82,13 +82,13 @@ enum cds_fair_mutex_state {
 struct cds_fair_mutex {
 	struct __cds_wfcq_head head;	/* non-locking head */
 	struct cds_wfcq_tail tail;
-	int owner_cpu;			/* sched_getcpu() of the current holder, or -1 */
+	int owner_cpu;			/* urcu_getcpu() of the current holder, or -1 */
 };
 
 struct cds_fair_mutex_node {
 	struct cds_wfcq_node node;
 	int32_t state;			/* enum cds_fair_mutex_state */
-	int cpu;			/* sched_getcpu() at lock time; the granter
+	int cpu;			/* urcu_getcpu() at lock time; the granter
 					 * publishes it into owner_cpu at hand-off so
 					 * owner_cpu names the INCOMING holder, never a
 					 * departed one's stale CPU. */
@@ -147,7 +147,7 @@ void cds_fair_mutex_park(struct cds_fair_mutex *t, struct cds_fair_mutex_node *w
 	 * core it needs to finish and hand off -- park at once and yield.  Any
 	 * other case (remote or unknown holder) uses the normal spin budget.
 	 */
-	attempts = (owner >= 0 && owner == sched_getcpu())
+	attempts = (owner >= 0 && owner == urcu_getcpu())
 			? 0 : CDS_FAIR_MUTEX_WAIT_ATTEMPTS;
 
 	cmm_smp_rmb();
@@ -216,7 +216,7 @@ granted:
 static inline
 void cds_fair_mutex_lock(struct cds_fair_mutex *t, struct cds_fair_mutex_node *w)
 {
-	int mycpu = sched_getcpu();
+	int mycpu = urcu_getcpu();
 
 	cds_wfcq_node_init(&w->node);
 	uatomic_store(&w->state, CDS_FAIR_MUTEX_WAITING, CMM_RELAXED);
