@@ -693,8 +693,17 @@ static void *bc_freer_thr(void *v)
 	int i;
 
 	pin_to(arg->cpu);
-	for (i = 0; i < arg->n; i++)
+	/*
+	 * A close is armed with call_rcu(), which QSBR allows only from a
+	 * registered thread.  Quiesce after each free, so that grace periods
+	 * still complete while the freers run: see batch_concurrent_test().
+	 */
+	rcu_register_thread();
+	for (i = 0; i < arg->n; i++) {
 		urcu_slab_free_pending(arg->blk[i], &rcu_flavor);
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
 	return NULL;
 }
 
