@@ -12,6 +12,7 @@ tests/unit/test_build
 tests/unit/test_build_cxx
 tests/unit/test_build_dynlink
 tests/unit/test_build_dynlink_cxx
+tests/unit/test_build_no_gnu_source
 tests/unit/test_uatomic
 tests/unit/test_uatomic_cxx
 tests/unit/test_flip_latch

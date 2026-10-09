@@ -64,7 +64,8 @@ noinst_PROGRAMS = \
 	test_build \
 	test_build_cxx \
 	test_build_dynlink \
-	test_build_dynlink_cxx
+	test_build_dynlink_cxx \
+	test_build_no_gnu_source
 
 dist_noinst_SCRIPTS = \
 	test_get_cpu_mask_from_sysfs \
@@ -126,7 +127,8 @@ TESTS = \
 	test_build \
 	test_build_cxx \
 	test_build_dynlink \
-	test_build_dynlink_cxx
+	test_build_dynlink_cxx \
+	test_build_no_gnu_source
 
 noinst_HEADERS = test_urcu_multiflavor.h
 
@@ -356,3 +358,9 @@ test_build_dynlink_cxx_SOURCES = \
 	test_build_cxx.cpp
 test_build_dynlink_cxx_CXXFLAGS = -DDYNAMIC_LINK_TEST $(AM_CXXFLAGS)
 test_build_dynlink_cxx_LDADD = $(URCU_LIB) $(URCU_COMMON_LIB) $(URCU_CDS_LIB) $(TAP_LIB)
+
+# An implicit declaration is how a function the C library hides without
+# _GNU_SOURCE shows up, and older compilers only warn about it.
+test_build_no_gnu_source_SOURCES = test_build_no_gnu_source.c
+test_build_no_gnu_source_CFLAGS = $(AM_CFLAGS) -Werror=implicit-function-declaration
+test_build_no_gnu_source_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
