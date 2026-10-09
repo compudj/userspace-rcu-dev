@@ -26,8 +26,10 @@ lib_LTLIBRARIES = liburcu-common.la \
 # as futex fallbacks.  urcu-txn.c holds the transaction engines' shared
 # state (the single strong definition of the per-CPU descriptor slabs the
 # header-inline engines in <urcu/rcu-txn-mcas.h> / <urcu/rcu-txn-sw.h> use).
+# getcpu.c holds the one function <urcu/getcpu.h> does not inline.
 #
-liburcu_common_la_SOURCES = wfqueue.c wfcqueue.c wfstack.c urcu-txn.c $(COMPAT)
+liburcu_common_la_SOURCES = wfqueue.c wfcqueue.c wfstack.c getcpu.c \
+		urcu-txn.c $(COMPAT)
 
 liburcu_la_SOURCES = urcu.c urcu-pointer.c $(COMPAT)
 liburcu_la_CFLAGS = -DRCU_MEMBARRIER $(AM_CFLAGS)

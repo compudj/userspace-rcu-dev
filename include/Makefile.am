@@ -37,6 +37,7 @@ nobase_include_HEADERS = \
 	urcu/rcu-txn-status.h \
 	urcu/rcu-txn.h \
 	urcu/futex.h \
+	urcu/getcpu.h \
 	urcu/hlist.h \
 	urcu/lfstack.h \
 	urcu/list.h \

@@ -85,25 +85,11 @@
 #include <urcu/lfstack.h>		/* freelist: link-before-publish push, LF pop */
 #include <urcu/call-rcu.h>		/* struct rcu_head: the drain schedules itself */
 #include <urcu/flavor.h>		/* batches are per flavor: keyed and deferred by it */
+#include <urcu/getcpu.h>
 #ifdef URCU_SLAB_RSEQ
 #include <rseq/rseq.h>
 #include <syscall.h>
 #include <linux/membarrier.h>
-#endif
-
-/*
- * The C library's rseq area, for urcu_slab_cpu().  glibc registers rseq for
- * every thread and exports __rseq_offset since 2.35; the thread pointer comes
- * from a compiler builtin.  Without either, urcu_slab_cpu() calls
- * urcu_slab_getcpu().  Not used under URCU_SLAB_RSEQ, where librseq supplies
- * the same field.
- */
-#if !defined(URCU_SLAB_RSEQ) && defined(__GLIBC__) && defined(__GLIBC_PREREQ) && \
-	defined(__has_builtin)
-# if __GLIBC_PREREQ(2, 35) && __has_builtin(__builtin_thread_pointer)
-#  include <sys/rseq.h>
-#  define URCU_SLAB_LIBC_RSEQ	1
-# endif
 #endif
 
 #ifdef __cplusplus
@@ -776,44 +762,18 @@ void urcu_slab_stats_dump(void)
 #endif
 
 /*
- * Current cpu.  rseq's cpu_id is an inlined TLS load (~0.3 ns) against
- * sched_getcpu's un-inlinable PLT call (~3.1 ns); the value is the same.
- *
- * That load does not need librseq, nor the rseq freelists.  A C library that
- * registers rseq for every thread (glibc >= 2.35) publishes where the area is,
- * and its own sched_getcpu() returns this very field -- behind the PLT, a
- * frame and the stack protector.  So read it here, whichever freelist build
- * this is.  The kernel rewrites cpu_id whenever it moves the thread, hence a
- * relaxed atomic load; a negative value means rseq is not registered for this
- * thread (the tunable is off, or the kernel lacks it) and urcu_slab_getcpu()
- * answers instead.  Either way the value is a hint: the thread can migrate
- * the instant after, and every caller here already tolerates that.
- *
- * urcu_slab_getcpu() is sched_getcpu() called from liburcu-common, or -1
- * where the platform has no equivalent.  It is out of line because the C
- * library declares sched_getcpu() only under _GNU_SOURCE, which this header
- * cannot define for a translation unit that has already included a system
- * header.
+ * Current cpu, as a hint every caller here tolerates being stale: see
+ * <urcu/getcpu.h>.  Under URCU_SLAB_RSEQ, ask librseq first: it has the rseq
+ * area even where the C library does not register one.
  */
-extern int urcu_slab_getcpu(void);
-
 static inline
 int urcu_slab_cpu(void)
 {
 #ifdef URCU_SLAB_RSEQ
 	if (caa_likely(rseq_registered()))
 		return rseq_current_cpu_raw();
-#elif defined(URCU_SLAB_LIBC_RSEQ)
-	{
-		struct rseq *abi = (struct rseq *)
-			((char *) __builtin_thread_pointer() + __rseq_offset);
-		int cpu = (int) uatomic_load(&abi->cpu_id, CMM_RELAXED);
-
-		if (caa_likely(cpu >= 0))
-			return cpu;
-	}
 #endif
-	return urcu_slab_getcpu();
+	return urcu_getcpu();
 }
 
 static inline
