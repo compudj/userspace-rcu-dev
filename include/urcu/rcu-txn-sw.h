@@ -660,6 +660,39 @@ void urcu_txn_sw__desc_free(struct urcu_txn_sw_desc *desc)
 }
 
 /*
+ * Move the handle's records to a new descriptor holding at least @cap of them.
+ * PREPARE only: no proxy is installed yet, so the records may move.  There is
+ * no aligned realloc: allocate a new descriptor, copy, free the old one.
+ * Returns false on OOM, leaving the handle in the sticky URCU_TXN_SW_OOM state.
+ */
+static inline
+bool urcu_txn_sw__resize(struct urcu_txn_sw_txn *t, unsigned int cap)
+{
+	struct urcu_txn_sw_desc *desc;
+
+	desc = urcu_txn_sw__desc_alloc(cap);
+	if (!desc) {
+		t->state = URCU_TXN_SW_OOM;	/* sticky */
+		return false;
+	}
+	if (t->nr)		/* @records is NULL until first allocated */
+		memcpy(desc->records, t->records,
+				(size_t) t->nr * sizeof(*desc->records));
+	urcu_txn_sw__desc_free(t->desc);	/* NULL if it had none */
+	t->desc = desc;
+	t->records = desc->records;
+	t->cap = desc->cap;
+	/*
+	 * The storage now belongs to the engine.  The flag can still be set
+	 * here in an NDEBUG build, where the assert of urcu_txn_sw__grow() is
+	 * compiled out and an oversized caller-storage handle migrates to the
+	 * heap.  Clear it, or the new descriptor would never be freed.
+	 */
+	t->records_inline = false;
+	return true;
+}
+
+/*
  * Pre-size the record array to hold at least @cap records.
  *
  * Optional: record() grows the array on demand and fails cleanly on OOM.  An
@@ -683,50 +716,22 @@ void urcu_txn_sw__desc_free(struct urcu_txn_sw_desc *desc)
 static inline
 bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 {
-	struct urcu_txn_sw_desc *desc;
-
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;		/* sticky: an earlier alloc failed */
 	/*
-	 * PREPARE only, like record().  With proxies installed, the grow path
+	 * PREPARE only, like record().  With proxies installed, the resize
 	 * below would free the descriptor that live slots point into.
 	 */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	urcu_txn_sw__excl_owner(t, "reserve()");
-	if (t->records) {
-		if (cap <= t->cap)
-			return true;		/* already large enough */
-		if (t->records_inline) {
-			/* Fixed caller storage: a sizing bug, not an OOM. */
-			urcu_assert_debug(!t->records_inline);
-			return false;
-		}
-		/*
-		 * Already buffering: grow to fit @cap.  No proxy is installed
-		 * in PREPARE, so the records may move to a new descriptor.
-		 */
-		desc = urcu_txn_sw__desc_alloc(cap);
-		if (!desc) {
-			t->state = URCU_TXN_SW_OOM;	/* sticky */
-			return false;
-		}
-		memcpy(desc->records, t->records,
-				(size_t) t->nr * sizeof(*desc->records));
-		urcu_txn_sw__desc_free(t->desc);
-		t->desc = desc;
-		t->records = desc->records;
-		t->cap = desc->cap;
-		return true;
-	}
-	desc = urcu_txn_sw__desc_alloc(cap);
-	if (!desc) {
-		t->state = URCU_TXN_SW_OOM;	/* sticky */
+	if (t->records && cap <= t->cap)
+		return true;		/* already large enough */
+	if (t->records_inline) {
+		/* Fixed caller storage: a sizing bug, not an OOM. */
+		urcu_assert_debug(!t->records_inline);
 		return false;
 	}
-	t->desc = desc;
-	t->records = desc->records;		/* inline in the descriptor */
-	t->cap = desc->cap;			/* physical class capacity */
-	return true;
+	return urcu_txn_sw__resize(t, cap);
 }
 
 /*
@@ -899,37 +904,12 @@ struct urcu_txn_sw_record *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
 static __attribute__((noinline, unused))
 bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
 {
-	unsigned int newcap = t->cap ? t->cap * 2 : URCU_TXN_SW_CAP;
-	struct urcu_txn_sw_desc *new_desc;
-
 	/*
 	 * Caller-owned (inline) storage must never grow: overflowing it is an
 	 * embedder sizing bug.
 	 */
 	urcu_posix_assert(!t->records_inline);
-	/*
-	 * No proxy is installed yet, so the records may move.  There is no
-	 * aligned realloc: allocate a new descriptor, copy, free the old one.
-	 */
-	new_desc = urcu_txn_sw__desc_alloc(newcap);
-	if (!new_desc) {
-		t->state = URCU_TXN_SW_OOM;	/* sticky */
-		return false;
-	}
-	memcpy(new_desc->records, t->records,
-			(size_t) t->nr * sizeof(*new_desc->records));
-	urcu_txn_sw__desc_free(t->desc);	/* NULL on the first grow */
-	t->desc = new_desc;
-	t->records = new_desc->records;
-	t->cap = new_desc->cap;
-	/*
-	 * The storage now belongs to the engine.  The flag can still be set
-	 * here in an NDEBUG build, where the assert above is compiled out and
-	 * an oversized caller-storage handle migrates to the heap.  Clear it,
-	 * or the new descriptor would never be freed.
-	 */
-	t->records_inline = false;
-	return true;
+	return urcu_txn_sw__resize(t, t->cap ? t->cap * 2 : URCU_TXN_SW_CAP);
 }
 
 /*
