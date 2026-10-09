@@ -721,6 +721,12 @@ bool urcu_txn_sw__resize(struct urcu_txn_sw_txn *t, unsigned int cap)
 {
 	struct urcu_txn_sw_desc *desc;
 
+	/*
+	 * Caller storage is never outgrown: needing more is the embedder's
+	 * sizing bug.  An NDEBUG build lets it through, and the records move to
+	 * a descriptor.
+	 */
+	urcu_posix_assert(!t->records_inline);
 	desc = urcu_txn_sw__desc_alloc(cap);
 	if (!desc) {
 		t->state = URCU_TXN_SW_OOM;	/* sticky */
@@ -733,13 +739,7 @@ bool urcu_txn_sw__resize(struct urcu_txn_sw_txn *t, unsigned int cap)
 	t->desc = desc;
 	t->records = desc->records;
 	t->cap = desc->cap;
-	/*
-	 * The storage now belongs to the engine.  The flag can still be set
-	 * here in an NDEBUG build, where the assert of urcu_txn_sw__grow() is
-	 * compiled out and an oversized caller-storage handle migrates to the
-	 * heap.  Clear it, or the new descriptor would never be freed.
-	 */
-	t->records_inline = false;
+	t->records_inline = false;	/* the descriptor is the engine's to free */
 	return true;
 }
 
@@ -774,11 +774,10 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 	urcu_txn_sw__excl_owner(t, "reserve()");
 	if (t->records && cap <= t->cap)
 		return true;		/* already large enough */
-	if (t->records_inline) {
-		/* Fixed caller storage: a sizing bug, not an OOM. */
-		urcu_assert_debug(!t->records_inline);
+	/* Fixed caller storage: a sizing bug, not an OOM. */
+	urcu_assert_debug(!t->records_inline);
+	if (t->records_inline)
 		return false;
-	}
 	return urcu_txn_sw__resize(t, cap);
 }
 
@@ -953,11 +952,6 @@ struct urcu_txn_sw_record *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
 static __attribute__((noinline, unused))
 bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
 {
-	/*
-	 * Caller-owned (inline) storage must never grow: overflowing it is an
-	 * embedder sizing bug.
-	 */
-	urcu_posix_assert(!t->records_inline);
 	return urcu_txn_sw__resize(t, t->cap ? t->cap * 2 : URCU_TXN_SW_CAP);
 }
 
