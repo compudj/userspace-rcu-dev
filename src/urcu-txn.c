@@ -9,6 +9,8 @@
  * <urcu/rcu-txn-sw.h> (single-writer) -- are header-inline.  What lives here
  * is their only shared MUTABLE state: one per-CPU size-classed descriptor slab
  * per engine (<urcu/rcu-txn-slab.h>), plus the constructor initializing both.
+ * The single-writer engine also keeps its two slow paths here, out of line: the
+ * commit that installs proxies and the growth of a full handle.
  *
  * Defining the instances once, in liburcu-common, makes every TU that includes
  * an engine header share one slab per engine: freelists recycle blocks across
@@ -33,8 +35,44 @@
 #include <urcu/rcu-txn-sw.h>
 #include <urcu/rcu-txn-mcas.h>	/* engine layer only (flavor-free) */
 
+#include "rcu-txn-sw-internal.h"
+
 struct urcu_slab urcu_txn_sw_slab;
 struct urcu_slab urcu_txn_slab;
+
+/*
+ * The commit of a single-writer transaction that installs proxies: see
+ * <urcu/rcu-txn-sw.h>.
+ */
+void urcu_txn_sw__commit_desc(struct urcu_txn_sw_desc *desc, unsigned int nr,
+		void (*call_rcu_fn)(struct rcu_head *,
+			void (*)(struct rcu_head *)),
+		const struct rcu_flavor_struct *flavor)
+{
+	struct urcu_txn_sw_record *records = desc->records;
+	unsigned int i;
+
+	urcu_txn_sw__assert_distinct_slots(records, nr);
+	/* Install: readers still resolve to old, the selector being 0. */
+	for (i = 0; i < nr; i++) {
+		urcu_txn_sw__excl_slot_parkable(&records[i]);
+		urcu_txn_sw__record_install(&desc->group, &records[i]);
+	}
+	/* Flip: every proxy resolves to new. */
+	urcu_txn_sw__group_commit(&desc->group);
+	/* Settle. */
+	for (i = 0; i < nr; i++) {
+		urcu_txn_sw__excl_slot_ours(&records[i]);
+		urcu_txn_sw__record_settle(&records[i]);
+	}
+	urcu_txn_sw__retire(desc, call_rcu_fn, flavor);
+}
+
+/* See <urcu/rcu-txn-sw.h>. */
+bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
+{
+	return urcu_txn_sw__resize(t, t->cap ? t->cap * 2 : URCU_TXN_SW_CAP);
+}
 
 /* Byte size per record-count class; filled at init, must outlive the slab. */
 static size_t urcu_txn_sw_slab_bytes[URCU_TXN_SW_SLAB_NCLASS];

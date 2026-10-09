@@ -267,16 +267,20 @@ struct urcu_txn_sw_txn {
 	bool records_inline;			/* @records is caller storage */
 	bool disjoint;				/* declared slot-disjoint */
 	bool bloom_live;			/* @ryw_bloom is armed */
-#ifdef URCU_TXN_SW_EXCL_VALIDATE
-	/* Thread that initialized the handle, and must drive it end to end. */
-	pthread_t excl_owner;
-#endif
 	/*
-	 * Last, after the conditional member, so that init clears everything
-	 * before it in one memset and leaves these 128 bytes alone: the filter
-	 * is armed lazily (urcu_txn_sw__bloom_arm).
+	 * After everything init clears, in one memset that leaves these 128
+	 * bytes alone: the filter is armed lazily (urcu_txn_sw__bloom_arm).
 	 */
 	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];  /* RYW certain-miss filter */
+#ifdef URCU_TXN_SW_EXCL_VALIDATE
+	/*
+	 * Thread that initialized the handle, and must drive it end to end.
+	 * Last: liburcu-common is handed the handle (urcu_txn_sw__grow()) and
+	 * may be built without it, so no other member's offset may depend on
+	 * it.
+	 */
+	pthread_t excl_owner;
+#endif
 };
 
 /*
@@ -363,29 +367,15 @@ void *urcu_txn_sw_resolve(void *v, uintptr_t tag)
  * Flip-group and record primitives
  * ================================
  *
- * The steps urcu_txn_sw_commit() is made of.  They are internal: nothing else
- * calls them, apart from tests that stage a transaction between two steps.
+ * What the inline paths need: the allocation of a descriptor, record(), and
+ * the commit of a single record.  A record is installed and a group committed
+ * in liburcu-common: see urcu_txn_sw__commit_desc().
  */
 
 static inline
 void urcu_txn_sw__group_init(struct urcu_txn_sw_group *group)
 {
 	group->selector = 0;
-}
-
-/*
- * Commit the flip group: switch every record in the transaction from old to new
- * with a single store-release.  Must be called after the new targets are fully
- * built.
- */
-static inline
-void urcu_txn_sw__group_commit(struct urcu_txn_sw_group *group)
-{
-	/*
-	 * Store-release (B) pairs with the load-acquire (A) of
-	 * urcu_txn_sw__proxy_resolve().
-	 */
-	uatomic_store(&group->selector, 1, CMM_RELEASE);
 }
 
 /*
@@ -399,31 +389,6 @@ void urcu_txn_sw__record_set(struct urcu_txn_sw_record *r,
 	r->ptr[1] = new_ptr;
 	r->slot = slot;
 	r->tag = tag;
-}
-
-/*
- * Install record @r's tagged proxy into its slot, bound to flip group @group.
- * Readers resolve it to old until the group commits.  The parked value is @r's
- * address OR'd with the record's tag.
- */
-static inline
-void urcu_txn_sw__record_install(struct urcu_txn_sw_group *group,
-		struct urcu_txn_sw_record *r)
-{
-	/*
-	 * Installing requires a non-zero tag within URCU_TXN_SW_TAG_MASK, none
-	 * of whose bits is set in the record's address.  Under a zero tag
-	 * every plain value passes urcu_txn_sw_is_proxy(), and readers would
-	 * resolve live values as proxies.  With a tag bit already set in the
-	 * address, the OR changes nothing and urcu_txn_sw__untag() subtracts to
-	 * a wrong address.
-	 */
-	urcu_assert_debug(r->tag && !(r->tag & ~URCU_TXN_SW_TAG_MASK));
-	urcu_assert_debug(!((uintptr_t) r & r->tag));
-	r->group = group;
-	/* Store-release of slot pairs with rcu_dereference(). */
-	uatomic_store(r->slot,
-			(void *) ((uintptr_t) r | r->tag), CMM_RELEASE);
 }
 
 /*
@@ -462,6 +427,10 @@ void urcu_txn_sw__record_settle(struct urcu_txn_sw_record *r)
  *     writer is mid-transaction on that very slot right now.
  *     Symmetrically, at settle each slot must still hold this writer's
  *     proxy; anything else means a concurrent writer overwrote it.
+ *
+ * The install and settle checks run in liburcu-common, and so only in a library
+ * that was itself built with -DURCU_TXN_SW_EXCL_VALIDATE.  The others run in
+ * the file that defines it.
  */
 
 #ifdef URCU_TXN_SW_EXCL_VALIDATE
@@ -501,18 +470,6 @@ void urcu_txn_sw__excl_slot_free(void **slot, uintptr_t tag, const char *what)
 			(void *) slot, v, what);
 }
 
-/* At settle, @r's slot must still hold the proxy this writer installed. */
-static inline
-void urcu_txn_sw__excl_slot_ours(struct urcu_txn_sw_record *r)
-{
-	void *want = (void *) ((uintptr_t) r | r->tag);
-	void *v = uatomic_load(r->slot, CMM_RELAXED);
-
-	if (v != want)
-		urcu_txn_sw__excl_abort("slot=%p holds %p at settle, expected our installed proxy %p: a concurrent writer overwrote it\n",
-			(void *) r->slot, v, want);
-}
-
 /*
  * @r's slot must still hold the recorded old.  This is the only witness of a
  * single-edge commit, which installs no proxy.
@@ -526,27 +483,6 @@ void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_record *r,
 	if (v != r->ptr[0])
 		urcu_txn_sw__excl_abort("slot=%p holds %p at %s, but %p was recorded as its old: a concurrent writer changed it\n",
 			(void *) r->slot, v, what, r->ptr[0]);
-}
-
-/*
- * At the multi-edge install, @r's slot must hold no proxy and must still hold
- * the recorded old.
- *
- * The value check catches a racing writer that ran a complete transaction on
- * the slot -- install, flip, settle -- between this transaction's record() and
- * its install.  That writer leaves a plain value behind, so the slot looks
- * free; installing over it would publish a stale old to readers, then settle
- * over the other writer's committed value.
- *
- * A correct single-writer program never trips it: this transaction has not
- * written the slot yet, the writer's earlier transactions settled before
- * returning, and chaining keeps the committed old in ptr[0].
- */
-static inline
-void urcu_txn_sw__excl_slot_parkable(struct urcu_txn_sw_record *r)
-{
-	urcu_txn_sw__excl_slot_free(r->slot, r->tag, "install");
-	urcu_txn_sw__excl_slot_unchanged(r, "install");
 }
 
 #else	/* !URCU_TXN_SW_EXCL_VALIDATE */
@@ -571,21 +507,9 @@ void urcu_txn_sw__excl_slot_free(void **slot __attribute__((unused)),
 }
 
 static inline
-void urcu_txn_sw__excl_slot_ours(
-		struct urcu_txn_sw_record *r __attribute__((unused)))
-{
-}
-
-static inline
 void urcu_txn_sw__excl_slot_unchanged(
 		struct urcu_txn_sw_record *r __attribute__((unused)),
 		const char *what __attribute__((unused)))
-{
-}
-
-static inline
-void urcu_txn_sw__excl_slot_parkable(
-		struct urcu_txn_sw_record *r __attribute__((unused)))
 {
 }
 
@@ -695,44 +619,6 @@ void urcu_txn_sw__desc_free(struct urcu_txn_sw_desc *desc)
 		urcu_slab_free(desc);
 	else
 		free(desc);
-}
-
-/*
- * call_rcu callback: free a committed transaction's descriptor once the grace
- * period guarantees no reader still holds one of its proxies.
- */
-static inline
-void urcu_txn_sw__free_rcu(struct rcu_head *head)
-{
-	struct urcu_txn_sw_desc *desc = caa_container_of(head,
-			struct urcu_txn_sw_desc, rcu_head);
-
-	urcu_txn_sw__desc_free(desc);
-}
-
-/*
- * Retire the descriptor of a committed transaction.  A reader may still hold
- * one of its proxies, so it must outlive a grace period.  By default the slab
- * retires it in a batch, with one call_rcu per batch;
- * -DURCU_TXN_SLAB_NO_BATCH keeps one call_rcu per descriptor.  Only a slab
- * descriptor, under @flavor's own deferral, may take the batch route: see
- * urcu_txn_retire() in <urcu/rcu-txn-mcas.h>.
- */
-static inline
-void urcu_txn_sw__retire(struct urcu_txn_sw_desc *desc,
-		void (*call_rcu_fn)(struct rcu_head *,
-			void (*)(struct rcu_head *)),
-		const struct rcu_flavor_struct *flavor)
-{
-#ifndef URCU_TXN_SLAB_NO_BATCH
-	if (caa_likely(desc->slab && flavor &&
-			flavor->update_call_rcu == call_rcu_fn) &&
-			urcu_slab_free_pending(desc, flavor))
-		return;
-#else
-	(void) flavor;
-#endif
-	call_rcu_fn(&desc->rcu_head, urcu_txn_sw__free_rcu);
 }
 
 /*
@@ -980,16 +866,11 @@ struct urcu_txn_sw_record *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
  * Grow a full handle: double its capacity, or give an unreserved handle its
  * first URCU_TXN_SW_CAP records.  Returns false on OOM.
  *
- * Out of line on purpose: with this path in its body, the compiler does not
- * inline urcu_txn_sw_record(), and every recorded edge pays a call for an
- * append that is five stores.  `unused` because a translation unit that only
- * reads never records.
+ * In liburcu-common: with this path in its body, the compiler does not inline
+ * urcu_txn_sw_record(), and every recorded edge pays a call for an append that
+ * is five stores.
  */
-static __attribute__((noinline, unused))
-bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
-{
-	return urcu_txn_sw__resize(t, t->cap ? t->cap * 2 : URCU_TXN_SW_CAP);
-}
+extern bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t);
 
 /*
  * Record one edge {*slot: old -> new}.  @tag is OR'd into the proxy value
@@ -1002,7 +883,7 @@ bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
  * Records must target pairwise-distinct slots.  record() appends without
  * looking for an earlier record of the same slot; recording a slot twice
  * installs two proxies on it and settles both in record order, so the earlier
- * edit is lost.  A debug build asserts against it at install.  Use
+ * edit is lost.  A debug build of liburcu asserts against it at install.  Use
  * urcu_txn_sw_record_chain() when the same slot may be written twice.
  *
  * Returns false on OOM, the only failure, which is sticky.
@@ -1240,19 +1121,19 @@ void urcu_txn_sw_cancel(struct urcu_txn_sw_txn *t)
 }
 
 /*
- * Records must target pairwise-distinct slots: see urcu_txn_sw_record().  They
- * are in record order, hence the pairwise scan.  A debug build only.
+ * Install, flip, settle and retire the first @nr records of @desc: the commit
+ * of a transaction that installs proxies, which takes two records or more.
+ *
+ * In liburcu-common.  URCU_TXN_SW_EXCL_VALIDATE, DEBUG_RCU and
+ * URCU_TXN_SLAB_NO_BATCH therefore apply to it as the library was built, not as
+ * the calling file is.  See urcu_txn_sw_commit_flavor() for @call_rcu_fn and
+ * @flavor.
  */
-static inline
-void urcu_txn_sw__assert_distinct_slots(
-		const struct urcu_txn_sw_record *records, unsigned int nr)
-{
-	unsigned int i, j;
-
-	for (i = 1; i < nr; i++)
-		for (j = 0; j < i; j++)
-			urcu_assert_debug(records[i].slot != records[j].slot);
-}
+extern void urcu_txn_sw__commit_desc(struct urcu_txn_sw_desc *desc,
+		unsigned int nr,
+		void (*call_rcu_fn)(struct rcu_head *,
+			void (*)(struct rcu_head *)),
+		const struct rcu_flavor_struct *flavor);
 
 /*
  * Commit: install every record's proxy, flip the group so that every proxy
@@ -1269,8 +1150,8 @@ void urcu_txn_sw__assert_distinct_slots(
  * thus needs no install, settle or deferred reclaim.  An empty transaction
  * publishes nothing.
  *
- * With two or more records, the descriptor's reclaim is deferred: a reader may
- * still hold a proxy.
+ * With two or more records, urcu_txn_sw__commit_desc() does the work, and the
+ * descriptor's reclaim is deferred: a reader may still hold a proxy.
  *
  * @call_rcu_fn defers that reclaim, and is called only with two or more
  * records.  It has the signature of a flavor's call_rcu(), so an embedder
@@ -1280,9 +1161,8 @@ void urcu_txn_sw__assert_distinct_slots(
  * back synchronously.
  *
  * @flavor names the flavor whose readers may hold a proxy, so that the
- * descriptor can be retired in that flavor's batches (the default;
- * -DURCU_TXN_SLAB_NO_BATCH opts out).  It is used only when @call_rcu_fn is
- * @flavor->update_call_rcu, and may be NULL.
+ * descriptor can be retired in that flavor's batches.  It is used only when
+ * @call_rcu_fn is @flavor->update_call_rcu, and may be NULL.
  */
 static inline
 enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
@@ -1290,14 +1170,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 			void (*)(struct rcu_head *)),
 		const struct rcu_flavor_struct *flavor)
 {
-	/*
-	 * Read once: the install and settle stores go through record->slot, so
-	 * the compiler must assume each may change the handle.
-	 */
-	struct urcu_txn_sw_record *const records = t->records;
-	struct urcu_txn_sw_desc *const desc = t->desc;
 	const unsigned int nr = t->nr;
-	unsigned int i;
 
 	urcu_txn_sw__excl_owner(t, "commit()");
 	/* A consumed handle must be initialized again before reuse. */
@@ -1306,36 +1179,22 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 		urcu_txn_sw_cancel(t);
 		return URCU_TXN_STATUS_MEMORY_ERROR;
 	}
-	if (nr == 1) {
-		/* One record: its settle store is the whole commit. */
-		urcu_txn_sw__excl_slot_unchanged(&records[0],
-				"the single-edge commit");
-		urcu_txn_sw__record_settle(&records[0]);
-	}
 	if (nr <= 1) {
+		if (nr == 1) {
+			/* One record: its settle store is the whole commit. */
+			urcu_txn_sw__excl_slot_unchanged(&t->records[0],
+					"the single-edge commit");
+			urcu_txn_sw__record_settle(&t->records[0]);
+		}
 		urcu_txn_sw__release_desc(t);	/* no proxy: free now */
-		urcu_txn_sw__done(t);
-		return URCU_TXN_STATUS_OK;
+	} else {
+		/*
+		 * The proxies live in the descriptor, which is reclaimed after
+		 * a grace period: a caller-storage handle has none.
+		 */
+		urcu_posix_assert(!t->records_inline);
+		urcu_txn_sw__commit_desc(t->desc, nr, call_rcu_fn, flavor);
 	}
-	/*
-	 * The proxies live in the descriptor, which is reclaimed after a grace
-	 * period: a caller-storage handle has none.
-	 */
-	urcu_posix_assert(!t->records_inline);
-	urcu_txn_sw__assert_distinct_slots(records, nr);
-	/* Install: readers still resolve to old, the selector being 0. */
-	for (i = 0; i < nr; i++) {
-		urcu_txn_sw__excl_slot_parkable(&records[i]);
-		urcu_txn_sw__record_install(&desc->group, &records[i]);
-	}
-	/* Flip: every proxy resolves to new. */
-	urcu_txn_sw__group_commit(&desc->group);
-	/* Settle. */
-	for (i = 0; i < nr; i++) {
-		urcu_txn_sw__excl_slot_ours(&records[i]);
-		urcu_txn_sw__record_settle(&records[i]);
-	}
-	urcu_txn_sw__retire(desc, call_rcu_fn, flavor);
 	urcu_txn_sw__done(t);
 	return URCU_TXN_STATUS_OK;
 }

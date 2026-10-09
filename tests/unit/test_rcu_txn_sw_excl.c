@@ -25,6 +25,11 @@
  * writer's proxy is parked in the slot by hand, with the flip-group primitives,
  * as a real race would leave it -- so the test is reproducible rather than
  * timing-dependent.
+ *
+ * The install and settle checks belong to the part of commit that runs in
+ * liburcu-common, where they are active only in a library built with the
+ * validator.  The test therefore calls them itself, on the record a second
+ * writer would install or settle.
  * A control case checks a well-formed single-writer transaction is untouched.
  *
  * QSBR flavor (the commit defers reclaim through call_rcu).
@@ -50,6 +55,8 @@
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
 #include <urcu/rcu-txn-sw.h>
+
+#include "rcu-txn-sw-internal.h"	/* the steps of a commit */
 
 #include "tap.h"
 
@@ -153,18 +160,12 @@ static void body_record_over_parked(void)
  */
 static void body_park_over_parked(void)
 {
-	struct urcu_txn_sw_txn t;
+	struct urcu_txn_sw_record rec;
 
 	g_a = V0;
-	g_b = V0;
-	urcu_txn_sw_init(&t);			/* records first, installs last */
-	(void) urcu_txn_sw_record(&t, &g_a, V0, V2, TAG);
-	(void) urcu_txn_sw_record(&t, &g_b, V0, V2, TAG);
-
-	park_by_hand(0, &g_a, V0, V1);		/* writer 1 parks both slots */
-	park_by_hand(1, &g_b, V0, V1);
-
-	(void) urcu_txn_sw_commit(&t);		/* would clobber its proxies */
+	urcu_txn_sw__record_set(&rec, &g_a, V0, V2, TAG);	/* while plain */
+	park_by_hand(0, &g_a, V0, V1);		/* writer 1 parks the slot */
+	urcu_txn_sw__excl_slot_parkable(&rec);	/* would clobber its proxy */
 }
 
 /*
@@ -207,15 +208,12 @@ static void body_single_edge_changed(void)
  */
 static void body_park_over_settled(void)
 {
-	struct urcu_txn_sw_txn t;
+	struct urcu_txn_sw_record rec;
 
-	g_a = V0;
 	g_b = V0;
-	urcu_txn_sw_init(&t);
-	(void) urcu_txn_sw_record(&t, &g_a, V0, V1, TAG);
-	(void) urcu_txn_sw_record(&t, &g_b, V0, V1, TAG);
+	urcu_txn_sw__record_set(&rec, &g_b, V0, V1, TAG);
 	uatomic_store(&g_b, V2, CMM_RELEASE);	/* a peer committed V0 -> V2 */
-	(void) urcu_txn_sw_commit(&t);		/* our install would lose it */
+	urcu_txn_sw__excl_slot_parkable(&rec);	/* our install would lose it */
 }
 
 /* Control: a well-formed single-writer transaction trips nothing. */

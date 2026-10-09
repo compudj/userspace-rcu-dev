@@ -30,6 +30,8 @@
 #include <urcu-call-rcu.h>
 #include <urcu/rcu-txn-sw-list.h>
 
+#include "rcu-txn-sw-internal.h"	/* the steps of a commit */
+
 #include "tap.h"
 
 #define NR_TESTS	30

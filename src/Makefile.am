@@ -9,7 +9,7 @@ AM_CPPFLAGS += -I$(top_srcdir)/src
 AM_LDFLAGS=-version-info $(URCU_LIBRARY_VERSION) $(LT_NO_UNDEFINED)
 
 dist_noinst_HEADERS = urcu-die.h urcu-wait.h compat-getcpu.h \
-	urcu-utils.h compat-smp.h
+	urcu-utils.h compat-smp.h rcu-txn-sw-internal.h
 
 COMPAT = compat_futex.c
 
