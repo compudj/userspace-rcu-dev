@@ -8,39 +8,36 @@
 /*
  * rcu-txn-bloom.h
  *
- * The read-your-own-writes lookup filter shared by the transaction engines:
- * <urcu/rcu-txn.h> (concurrent/MCAS) and <urcu/rcu-txn-sw.h> (single-updater).
- * Mechanism only -- who maintains it, when it is reset, and whether it is worth
- * maintaining at all are POLICY, and each engine states its own; see the RYW
- * sections of those headers.
+ * The RCU pseudo-transaction read-your-own-writes Bloom filter, shared by
+ * the transaction engines: <urcu/rcu-txn.h> (concurrent/MCAS) and
+ * <urcu/rcu-txn-sw.h> (single-writer).  This is the mechanism only: who
+ * maintains the filter and when it is reset is each engine's policy; see
+ * the RYW sections of those headers.
  *
- * The problem it solves is common to both.  An engine with read-your-own-writes
- * must decide, per access, whether a slot is already in this transaction's write
- * set.  The authoritative test is a linear scan of the records, so a write set
- * of n slots costs O(n) per access and O(n^2) to build -- and the scan is pure
- * overhead on the dominant case, the MISS.
+ * An RCU pseudo-transaction with read-your-own-writes must decide, per
+ * access, whether a slot is already in this transaction's write set.
+ * The authoritative test is a linear scan of the records, so a write
+ * set of n slots costs O(n) per access and O(n^2) to build -- and the
+ * scan is pure overhead on the dominant case, the lookup miss.
  *
- * This filter answers the miss in O(1) and never lies about it: a clear bit
- * means the slot is DEFINITELY absent, so the scan is skipped outright.  All k
- * bits set means present OR a false positive, which falls through to the
- * authoritative find.  It can therefore only ever save the scan, never change a
- * returned value.
+ * This Bloom filter is an optimisation to answer the miss in O(1)
+ * without false negatives: a clear bit means the slot is DEFINITELY
+ * absent, so the scan is skipped outright.  All k bits set means
+ * present OR a false positive, which falls through to the authoritative
+ * find.
  *
- * PRECISELY WHICH HALF IS FREE.  Correctness never depends on the filter's
- * PRESENCE, WIDTH or k: a false positive costs the find, or at age 0 one extra
- * attempt, and nothing else.  That is what lets each engine adopt, skip or A/B
- * it freely.  It does depend, load-bearingly, on the filter never lying about a
- * MISS -- read-your-own-writes is skipped outright on a clear bit, so a false
- * negative silently returns a committed value where a pending one was due.
- * Two things keep that true, and both are obligations on the engine: the hash
- * is deterministic and shared by set and test, and the filter must be set for
- * EVERY slot recorded while it is live (arming rebuilds it from all records
- * precisely so this holds from the moment it goes live).
+ * Correctness never depends on the filter's presence, width or k: a
+ * false positive costs the find, or at age 0 one extra attempt.  It does
+ * depend on the absence of false negatives, which is an obligation on
+ * the engine: the filter must be set for every slot recorded while it is
+ * live (arming rebuilds it from all records, so this holds from the
+ * moment it goes live).
  *
- * The state is the caller's: an engine declares its own uint64_t
- * [URCU_TXN_BLOOM_WORDS] array wherever it wants it (an on-stack handle,
- * typically -- never in a slab-sized descriptor whose size is baked into an
- * allocator) and owns zeroing it.  These helpers are pure functions over it.
+ * The state belongs to the caller: an RCU pseudo-transaction declares
+ * its own uint64_t [URCU_TXN_BLOOM_WORDS] array (an on-stack handle,
+ * typically -- never in a slab-sized descriptor whose size is baked
+ * into an allocator) and owns zeroing it.  These helpers are pure
+ * functions over it.
  */
 
 #include <stdbool.h>
@@ -52,30 +49,22 @@ extern "C" {
 
 /*
  * URCU_TXN_BLOOM_WORDS sets the filter width (64 bits each; default 16 = 1024
- * bits).  Widening it cuts the sparse false-positive rate by ~2^k per doubling
- * -- the model is (1 - e^{-kn/m})^k, which for a sparse filter is (kn/m)^k; see
- * URCU_TXN_BLOOM_K below for the single statement of it.
+ * bits).  With k bits over m = 64*WORDS bits and n recorded slots the
+ * false-positive rate is ~(1 - e^{-kn/m})^k, which for a sparse filter is
+ * (kn/m)^k: doubling the width divides it by ~2^k.
  *
  * Both width and k are compile-time tunables that only ever trade filter cost
  * against the false-positive rate: correctness never depends on either.  The
- * 16-word / k=3 default sits at the false-positive knee and wins across every
- * workload measured for <urcu/rcu-txn.h>.
+ * 16-word / k=3 default is based on experimental workload measurements.
  */
 #ifndef URCU_TXN_BLOOM_WORDS
 # define URCU_TXN_BLOOM_WORDS	16
 #endif
+
 /*
  * URCU_TXN_BLOOM_K sets the number of hash BITS a slot maps to (default 3).
- * With k bits over m = 64*WORDS bits and n recorded slots the false-positive
- * rate is ~(1 - e^{-kn/m})^k, which for a sparse filter falls off as (kn/m)^k.
- * Both knobs are strong and neither dominates: doubling m divides the rate by
- * ~2^k, while raising k by one multiplies it by the fill factor kn/m (a win
- * only while the filter is sparse, which is why k has a knee).  The filter is a
- * double-hashed k-bit filter built from two
- * INDEPENDENT avalanche hashes h1,h2 (position i = h1 + i*h2); the age-0/age-1
- * study used k as the lever to drive the filter-FP escalation component toward
- * zero and isolate the genuine-RYW rate.  A degenerate k=1 is valid too (one
- * position).
+ * Raising k by one multiplies the false-positive rate by the fill factor kn/m:
+ * a win only while the filter is sparse.
  */
 #ifndef URCU_TXN_BLOOM_K
 # define URCU_TXN_BLOOM_K	3
@@ -96,6 +85,7 @@ extern "C" {
 #endif
 
 #define URCU_TXN_BLOOM_BITS	(64ULL * URCU_TXN_BLOOM_WORDS)
+
 /*
  * Two INDEPENDENT hashes of the slot.  A single multiply leaves the k derived
  * positions correlated (slot addresses are aligned and clustered).
@@ -122,8 +112,9 @@ void urcu_txn_bloom_h1h2(void **slot, uint64_t *h1, uint64_t *h2)
 	x ^= x >> 27; x *= 0x94d049bb133111ebULL;
 	x ^= x >> 31;
 	*h1 = x & 0xffffffffULL;		/* low lane */
-	*h2 = (x >> 32) | 1;		/* high lane, odd stride */
+	*h2 = (x >> 32) | 1;			/* high lane, odd stride */
 }
+
 static inline
 bool urcu_txn_bloom_test(const uint64_t *bloom, void **slot)
 {
@@ -139,6 +130,7 @@ bool urcu_txn_bloom_test(const uint64_t *bloom, void **slot)
 	}
 	return true;			/* all k bits set: present (or a false positive) */
 }
+
 static inline
 void urcu_txn_bloom_set(uint64_t *bloom, void **slot)
 {
@@ -152,6 +144,7 @@ void urcu_txn_bloom_set(uint64_t *bloom, void **slot)
 		bloom[idx >> 6] |= (uint64_t) 1 << (idx & 63);
 	}
 }
+
 static inline
 bool urcu_txn_bloom_test_and_set(uint64_t *bloom, void **slot)
 {
