@@ -132,13 +132,13 @@ int main(void)
 		struct urcu_txn_sw_group group;
 		struct urcu_txn_sw_record rec;
 
-		urcu_txn_sw_group_init(&group);
-		urcu_txn_sw_record_set(&rec, &slot, (void *) 0x100,
+		urcu_txn_sw__group_init(&group);
+		urcu_txn_sw__record_set(&rec, &slot, (void *) 0x100,
 				(void *) 0x200, TEST_TAG);
-		urcu_txn_sw_record_install(&group, &rec);
+		urcu_txn_sw__record_install(&group, &rec);
 		ok(is_proxy(slot) && resolve(slot) == (void *) 0x100,
 			"an installed proxy resolves to old");
-		urcu_txn_sw_group_commit(&group);
+		urcu_txn_sw__group_commit(&group);
 		ok(is_proxy(slot) && resolve(slot) == (void *) 0x200,
 			"the flip makes the installed proxy resolve to new");
 		uatomic_store(rec.slot, rec.ptr[1], CMM_RELEASE);

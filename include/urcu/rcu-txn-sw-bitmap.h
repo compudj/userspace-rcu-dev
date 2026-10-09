@@ -53,7 +53,7 @@
  * READS must run inside an RCU read-side critical section of the flavor the
  * transactions use (they resolve proxies, whose lifetime is the RCU grace
  * period) -- exactly like urcu_txn_sw_list_*_rcu().  A reader resolves through
- * urcu_txn_sw_proxy_resolve(): one load-acquire of the flip selector, never
+ * urcu_txn_sw_resolve(): one load-acquire of the flip selector, never
  * blocking and never waiting on anyone.  The concurrent twin's read-policy
  * question ("a pure reader must not wait") simply does not arise -- this engine
  * has no UNDECIDED window at all, so a resolved word is always the flip's

@@ -66,7 +66,7 @@ void urcu_txn_slab_ctor(void)
 #endif
 	for (i = 0; i < URCU_TXN_SW_SLAB_NCLASS; i++)
 		urcu_txn_sw_slab_bytes[i] =
-				urcu_txn_sw_descsize(urcu_txn_sw_slab_rc[i]);
+				urcu_txn_sw__desc_size(urcu_txn_sw_slab_rc[i]);
 	/*
 	 * Link the slab's lists through each block's rcu_head, never offset 0:
 	 * a block enters the pending list at commit, a grace period before

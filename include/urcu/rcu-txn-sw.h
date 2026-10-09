@@ -64,10 +64,10 @@
  *     with the reader's rcu_dereference() of that slot.  It orders the
  *     writer's earlier stores to the transaction descriptor, which are the
  *     record's {old, new, group} and the selector's initialization to 0,
- *     before their respective loads by urcu_txn_sw_proxy_resolve().
+ *     before their respective loads by urcu_txn_sw__proxy_resolve().
  *
  *   - Commit and settle.  The store-release of the selector (0 -> 1) pairs
- *     with the load-acquire of the selector in urcu_txn_sw_proxy_resolve().
+ *     with the load-acquire of the selector in urcu_txn_sw__proxy_resolve().
  *     The store-release of the new target into the slot pairs with the
  *     reader's rcu_dereference() of that slot.  Each orders the writer's
  *     earlier stores to the new data being published before their respective
@@ -184,8 +184,8 @@ enum urcu_txn_sw_state {
 /*
  * Shared selector for a flip group.  selector == 0 -> records resolve to
  * old_ptr; selector == 1 -> new_ptr.  Written once (0 -> 1) with a
- * store-release by urcu_txn_sw_group_commit(); read with a load-acquire by
- * urcu_txn_sw_proxy_resolve().
+ * store-release by urcu_txn_sw__group_commit(); read with a load-acquire by
+ * urcu_txn_sw__proxy_resolve().
  */
 struct urcu_txn_sw_group {
 	unsigned long selector;
@@ -280,7 +280,7 @@ struct urcu_txn_sw_txn {
 };
 
 static inline
-void urcu_txn_sw_group_init(struct urcu_txn_sw_group *group)
+void urcu_txn_sw__group_init(struct urcu_txn_sw_group *group)
 {
 	group->selector = 0;
 }
@@ -318,7 +318,7 @@ bool urcu_txn_sw__is_parked(const void *v, uintptr_t tag)
  * loads.
  */
 static inline
-struct urcu_txn_sw_record *urcu_txn_sw_untag(void *v, uintptr_t tag)
+struct urcu_txn_sw_record *urcu_txn_sw__untag(void *v, uintptr_t tag)
 {
 	urcu_assert_debug(urcu_txn_sw_is_proxy(v, tag));
 	return (struct urcu_txn_sw_record *) ((uintptr_t) v - tag);
@@ -335,11 +335,11 @@ struct urcu_txn_sw_record *urcu_txn_sw_untag(void *v, uintptr_t tag)
  * dependency rather than a conditional branch.
  */
 static inline
-void *urcu_txn_sw_proxy_resolve(const struct urcu_txn_sw_record *proxy)
+void *urcu_txn_sw__proxy_resolve(const struct urcu_txn_sw_record *proxy)
 {
 	/*
 	 * Load-acquire (A) pairs with the store-release (B) of
-	 * urcu_txn_sw_group_commit().
+	 * urcu_txn_sw__group_commit().
 	 */
 	return proxy->ptr[uatomic_load(&proxy->group->selector, CMM_ACQUIRE)];
 }
@@ -354,7 +354,7 @@ void *urcu_txn_sw_resolve(void *v, uintptr_t tag)
 {
 	if (caa_likely(!urcu_txn_sw_is_proxy(v, tag)))
 		return v;
-	return urcu_txn_sw_proxy_resolve(urcu_txn_sw_untag(v, tag));
+	return urcu_txn_sw__proxy_resolve(urcu_txn_sw__untag(v, tag));
 }
 
 /*
@@ -363,11 +363,11 @@ void *urcu_txn_sw_resolve(void *v, uintptr_t tag)
  * built.
  */
 static inline
-void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
+void urcu_txn_sw__group_commit(struct urcu_txn_sw_group *group)
 {
 	/*
 	 * Store-release (B) pairs with the load-acquire (A) of
-	 * urcu_txn_sw_proxy_resolve().
+	 * urcu_txn_sw__proxy_resolve().
 	 */
 	uatomic_store(&group->selector, 1, CMM_RELEASE);
 }
@@ -572,9 +572,13 @@ void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
 	urcu_txn_sw__init(t, buf, cap);
 }
 
-#define urcu_txn_sw_descsize(cap)				\
-	(sizeof(struct urcu_txn_sw_desc) +			\
-	 (size_t) (cap) * sizeof(struct urcu_txn_sw_record))
+/* Size in bytes of a descriptor holding @cap records. */
+static inline
+size_t urcu_txn_sw__desc_size(unsigned int cap)
+{
+	return sizeof(struct urcu_txn_sw_desc) +
+			(size_t) cap * sizeof(struct urcu_txn_sw_record);
+}
 
 /*
  * Transaction descriptors come from the per-CPU size-classed slab of
@@ -600,7 +604,7 @@ extern struct urcu_slab urcu_txn_sw_slab;
 
 /* Smallest class that fits @req records, or -1 if none does. */
 static inline
-int urcu_txn_sw_slab_class_of(unsigned int req)
+int urcu_txn_sw__slab_class_of(unsigned int req)
 {
 	int i;
 
@@ -623,7 +627,7 @@ struct urcu_txn_sw_desc *urcu_txn_sw__desc_alloc(unsigned int cap)
 	int cl = -1;
 
 	if (urcu_slab_enabled(&urcu_txn_sw_slab))
-		cl = urcu_txn_sw_slab_class_of(cap);
+		cl = urcu_txn_sw__slab_class_of(cap);
 	if (cl >= 0) {
 		desc = (struct urcu_txn_sw_desc *)
 				urcu_slab_alloc(&urcu_txn_sw_slab, cl);
@@ -642,12 +646,12 @@ struct urcu_txn_sw_desc *urcu_txn_sw__desc_alloc(unsigned int cap)
 		 * serve it with an exact allocation.
 		 */
 		if (posix_memalign(&p, URCU_TXN_SW_RECORD_ALIGN,
-				urcu_txn_sw_descsize(cap)))
+				urcu_txn_sw__desc_size(cap)))
 			return NULL;
 		desc = (struct urcu_txn_sw_desc *) p;
 		desc->slab = 0;
 	}
-	urcu_txn_sw_group_init(&desc->group);
+	urcu_txn_sw__group_init(&desc->group);
 	desc->cap = cap;
 	return desc;
 }
@@ -775,7 +779,7 @@ void urcu_txn_sw__release_desc(struct urcu_txn_sw_txn *t)
  * period guarantees no reader still holds one of its proxies.
  */
 static inline
-void urcu_txn_sw_free_rcu(struct rcu_head *head)
+void urcu_txn_sw__free_rcu(struct rcu_head *head)
 {
 	struct urcu_txn_sw_desc *desc = caa_container_of(head,
 			struct urcu_txn_sw_desc, rcu_head);
@@ -805,14 +809,14 @@ void urcu_txn_sw__retire(struct urcu_txn_sw_desc *desc,
 #else
 	(void) flavor;
 #endif
-	call_rcu_fn(&desc->rcu_head, urcu_txn_sw_free_rcu);
+	call_rcu_fn(&desc->rcu_head, urcu_txn_sw__free_rcu);
 }
 
 /*
  * Set a record's {old, new, slot, tag}; its group is bound at install.
  */
 static inline
-void urcu_txn_sw_record_set(struct urcu_txn_sw_record *r,
+void urcu_txn_sw__record_set(struct urcu_txn_sw_record *r,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	r->ptr[0] = old_ptr;
@@ -827,7 +831,7 @@ void urcu_txn_sw_record_set(struct urcu_txn_sw_record *r,
  * address OR'd with the record's tag.
  */
 static inline
-void urcu_txn_sw_record_install(struct urcu_txn_sw_group *group,
+void urcu_txn_sw__record_install(struct urcu_txn_sw_group *group,
 		struct urcu_txn_sw_record *r)
 {
 	/*
@@ -835,7 +839,7 @@ void urcu_txn_sw_record_install(struct urcu_txn_sw_group *group,
 	 * of whose bits is set in the record's address.  Under a zero tag
 	 * every plain value passes urcu_txn_sw_is_proxy(), and readers would
 	 * resolve live values as proxies.  With a tag bit already set in the
-	 * address, the OR changes nothing and urcu_txn_sw_untag() subtracts to
+	 * address, the OR changes nothing and urcu_txn_sw__untag() subtracts to
 	 * a wrong address.
 	 */
 	urcu_assert_debug(r->tag && !(r->tag & ~URCU_TXN_SW_TAG_MASK));
@@ -980,7 +984,7 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	if (caa_unlikely(t->nr == t->cap) && !urcu_txn_sw__grow(t))
 		return false;			/* OOM, now sticky */
 	r = &t->records[t->nr++];
-	urcu_txn_sw_record_set(r, slot, old_ptr, new_ptr, tag);
+	urcu_txn_sw__record_set(r, slot, old_ptr, new_ptr, tag);
 	if (caa_unlikely(t->bloom_live))	/* armed: keep it current */
 		urcu_txn_bloom_set(t->ryw_bloom, slot);
 	return true;
@@ -1276,10 +1280,10 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 		struct urcu_txn_sw_record *r = &desc->records[i];
 
 		urcu_txn_sw__excl_slot_parkable(r);
-		urcu_txn_sw_record_install(&desc->group, r);
+		urcu_txn_sw__record_install(&desc->group, r);
 	}
 	/* Flip: every proxy resolves to new. */
-	urcu_txn_sw_group_commit(&desc->group);
+	urcu_txn_sw__group_commit(&desc->group);
 	/* Settle. */
 	for (i = 0; i < nr; i++) {
 		struct urcu_txn_sw_record *r = &desc->records[i];

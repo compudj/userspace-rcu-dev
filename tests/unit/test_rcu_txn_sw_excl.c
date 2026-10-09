@@ -124,9 +124,9 @@ static struct urcu_txn_sw_record g_parked[2];
 static void park_by_hand(unsigned int i, void **slot, void *old_ptr,
 		void *new_ptr)
 {
-	urcu_txn_sw_group_init(&g_parked_group);
-	urcu_txn_sw_record_set(&g_parked[i], slot, old_ptr, new_ptr, TAG);
-	urcu_txn_sw_record_install(&g_parked_group, &g_parked[i]);
+	urcu_txn_sw__group_init(&g_parked_group);
+	urcu_txn_sw__record_set(&g_parked[i], slot, old_ptr, new_ptr, TAG);
+	urcu_txn_sw__record_install(&g_parked_group, &g_parked[i]);
 }
 
 /*
