@@ -106,7 +106,7 @@
 extern "C" {
 #endif
 
-#define URCU_TXN_SW_CAP	8	/* first record-array capacity of an UNRESERVED handle */
+#define URCU_TXN_SW_CAP	8	/* first record-array capacity of an unreserved handle */
 
 /*
  * RCU pseudo-transaction (urcu_txn_sw_txn)
@@ -127,7 +127,7 @@ extern "C" {
  *
  * record() appends a record {slot, old, new} into the record array but
  * does not install any proxy address, so the array grows by realloc.
- * The record set is FROZEN once proxies are installed (which commit()
+ * The record set is frozen once proxies are installed (which commit()
  * does internally), so record() must precede commit().  Records must
  * target pairwise-distinct slots.
  *
@@ -161,15 +161,9 @@ enum urcu_txn_sw_state {
 	URCU_TXN_SW_INSTALLED,	/* internal: set once proxies are installed */
 	URCU_TXN_SW_OOM,		/* sticky: commit -> MEMORY_ERROR */
 	/*
-	 * Terminal: commit() consumed the handle.  It exists so that reusing a
-	 * consumed handle is a NAMED abort rather than a wild store.  Without
-	 * it, a handle that committed a SINGLE edge kept state == PREPARE with
-	 * nr == 1, cap == 8 and records == NULL, so a second record() passed
-	 * every guard and wrote through &t->records[1] off a NULL base -- a raw
-	 * SIGSEGV near address 0x30 with nothing to say it was a lifecycle bug.
-	 * (The multi-edge case already trapped, via state == INSTALLED.)
-	 * Clearing nr/cap instead would let stale reuse silently WORK, which
-	 * hides the mistake rather than reporting it.
+	 * Terminal: commit() consumed the handle.  Reusing it without
+	 * initializing it again trips an assertion, where it would otherwise
+	 * store through a stale record array.
 	 */
 	URCU_TXN_SW_DONE,
 };
@@ -205,7 +199,7 @@ struct urcu_txn_sw_record {
 /*
  * Transaction descriptor: the single allocation that carries a committed
  * transaction across its grace period.  It holds the flip group every installed
- * proxy reads, the rcu_head that defers reclaim, and the record array INLINE
+ * proxy reads, the rcu_head that defers reclaim, and the record array inline
  * (the proxies themselves live there).  Allocated on the first
  * record()/reserve() from the shared per-CPU slab and grown in PREPARE (no
  * proxy is live yet, so it may move); delayed-reclaimed after settle or
@@ -213,28 +207,22 @@ struct urcu_txn_sw_record {
  * 16-byte aligned so each tagged proxy has its low 4 bits free.  @cap is the
  * physical capacity; @slab (stamped at alloc) is the descriptor's origin, so it
  * is freed on the path that allocated it even if the slab enables in between.
- * The INLINE path (urcu_txn_sw_init_inline, nr <= 1) never allocates a
+ * The inline path (urcu_txn_sw_init_inline, nr <= 1) never allocates a
  * descriptor.
  */
 struct urcu_txn_sw_desc {
 	struct urcu_txn_sw_group group;		/* selector; installed proxies read &desc->group */
 	/*
-	 * POSITION IS LOAD-BEARING, despite this being cold data touched only
-	 * at reclaim.  The slab threads its pending list through this field --
-	 * urcu_slab_init() is handed offsetof(struct urcu_txn_sw_desc, rcu_head) as
-	 * @link_off -- and overlays a closed batch's metadata just past it, so
-	 * the smallest usable size class is
+	 * Keep @rcu_head at this offset.  The slab threads its pending list
+	 * through it and lays a closed batch's metadata just past it, so the
+	 * smallest usable size class is
 	 *
-	 *   link_off + sizeof(struct rcu_head) + sizeof(struct urcu_slab_batch)
+	 *   offsetof(rcu_head) + sizeof(struct rcu_head)
+	 *			+ sizeof(struct urcu_slab_batch)
 	 *
-	 * which at the current offset is 8 + 16 + 8 = 32 bytes.  Moving it
-	 * later to pack the hot fields tighter would raise that floor and
-	 * invalidate the smallest class; the slab checks and disables itself
-	 * rather than corrupt anything, so the symptom would be a silent loss
-	 * of the cache, not a crash.
-	 *
-	 * It also cannot move to offset 0: that is @group, which installed
-	 * proxies point at.
+	 * which is 8 + 16 + 8 = 32 bytes.  Moving it later raises that floor,
+	 * and the slab would disable itself without a word.  It cannot be first
+	 * either: installed proxies point at @group.
 	 */
 	struct rcu_head rcu_head;		/* deferred-free handle */
 	unsigned int cap;			/* physical capacity */
@@ -245,7 +233,7 @@ struct urcu_txn_sw_desc {
 						 * the pad that keeps records[]
 						 * 16-byte aligned.
 						 */
-	struct urcu_txn_sw_record records[];	/* INLINE record array (frozen at install) */
+	struct urcu_txn_sw_record records[];	/* inline record array (frozen at install) */
 };
 
 urcu_static_assert(!(offsetof(struct urcu_txn_sw_desc, records) % 16),
@@ -267,12 +255,9 @@ urcu_static_assert(!(offsetof(struct urcu_txn_sw_desc, records) % 16),
  */
 struct urcu_txn_sw_txn {
 	/*
-	 * Ordered by access, and packed: laid out as declared before, this had
-	 * a 4-byte hole after @state and a 5-byte one after the flags.  The
-	 * whole hot set now fits the first cache line with no holes at all.
-	 * The handle is single-writer by construction and never published, so
-	 * nothing here is touched by another thread -- no false sharing to
-	 * avoid, unlike struct urcu_txn's queue node.
+	 * Ordered by access and packed: what every record() uses fits the
+	 * first cache line, without holes.  The handle is private to one
+	 * writer, so there is no false sharing to avoid.
 	 */
 	struct urcu_txn_sw_record *records;	/* record array (realloc-grown, or caller-owned if @records_inline) */
 	struct urcu_txn_sw_desc *desc;	/* heap path: single allocation (records inline); NULL until first record */
@@ -292,11 +277,9 @@ struct urcu_txn_sw_txn {
 						 */
 #endif
 	/*
-	 * DEAD LAST, past the conditional member too, so init's single clear
-	 * covers everything that needs zeroing without ever touching these 128
-	 * bytes.  The filter is armed lazily (urcu_txn_sw__bloom_arm), so
-	 * clearing it per transaction would cost a `rep stos` that the lazy
-	 * arming exists to avoid.
+	 * Last, after the conditional member, so that init clears everything
+	 * before it in one memset and leaves these 128 bytes alone: the filter
+	 * is armed lazily (urcu_txn_sw__bloom_arm).
 	 */
 	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];  /* RYW certain-miss filter */
 };
@@ -308,9 +291,9 @@ void urcu_txn_sw_group_init(struct urcu_txn_sw_group *group)
 }
 
 /*
- * Does @v carry ALL of @tag's bits -- i.e. is it an installed proxy rather than
- * a live value?  The engine's tag contract (see urcu_txn_sw_record) is that no
- * live value an embedder stores in a transacted slot may do so.
+ * Does @v carry all of @tag's bits, i.e. is it an installed proxy rather than a
+ * live value?  No live value an embedder stores in a transacted slot may carry
+ * them: see urcu_txn_sw_record().
  */
 static inline
 int urcu_txn_sw_is_proxy(const void *v, uintptr_t tag)
@@ -321,20 +304,15 @@ int urcu_txn_sw_is_proxy(const void *v, uintptr_t tag)
 /*
  * Recover the proxy address from a parked slot value.
  *
- * SUBTRACT the tag rather than masking it off.  The two are exactly equivalent
- * here: untag is only ever reached once urcu_txn_sw_is_proxy() has proven every
- * tag bit SET in @v, and the tag bits are CLEAR in the proxy address (records
- * are 16-byte aligned and the tag lives in the low 4 bits), so the tag bits are
- * precisely the difference between the two.
+ * Subtract the tag rather than masking it off.  The two are equivalent here:
+ * urcu_txn_sw_is_proxy() has shown every tag bit set in @v, and those bits are
+ * clear in the proxy address (records are 16-byte aligned, and the tag is
+ * within the low 4 bits).
  *
- * The subtraction generates better code.  With a compile-time-constant @tag the
- * compiler folds it into the DISPLACEMENT of the loads that follow -- the
- * proxy->group load becomes one mov at [v + (offsetof(group) - tag)] -- so the
- * head of the resolve's load-to-use chain issues straight off the raw tagged
- * value.  The AND cannot fold: it is a real ALU op sitting between the slot
- * load and the first dependent load, adding a cycle to a chain that is already
- * three dependent loads deep (proxy -> group -> selector -> ptr[sel]).  Same
- * trick, same reason, as the fractal trie's FT_NODE_SUB_TAG.
+ * The subtraction generates better code.  With a constant @tag the compiler
+ * folds it into the displacement of the loads that follow, where a mask is one
+ * more operation in the reader's chain of dependent loads (proxy -> group ->
+ * selector -> ptr[sel]).
  */
 static inline
 struct urcu_txn_sw_record *urcu_txn_sw_untag(void *v, uintptr_t tag)
@@ -364,11 +342,9 @@ void *urcu_txn_sw_proxy_resolve(const struct urcu_txn_sw_record *proxy)
 }
 
 /*
- * Resolve a value loaded from a slot transacted under @tag: a plain value
- * passes through untouched, an installed proxy resolves through its flip
- * selector.
- * The typed reader accessors of the sw embedders (list, hlist, bitmap) are
- * wrappers over this; it mirrors urcu_txn_resolve() on the MCAS side.
+ * Resolve a value loaded from a slot transacted under @tag: a plain value is
+ * returned as is, an installed proxy resolves through its flip group's
+ * selector.  The embedders' reader accessors are wrappers over this.
  */
 static inline
 void *urcu_txn_sw_resolve(void *v, uintptr_t tag)
@@ -403,17 +379,17 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
  * There is no per-structure object to claim an owner on, so the
  * validator claims the two things that do exist:
  *
- *   - the HANDLE.  Its owner is the thread that initialized it, and
+ *   - the handle.  Its owner is the thread that initialized it, and
  *     reserve / record / install / commit must all run on that thread.
  *     Catches a transaction handed between threads mid-flight.
  *
- *   - the SLOT, which is what two racing writers actually share, and so is
+ *   - the slot, which is what two racing writers actually share, and so is
  *     where the real violation is visible.  In a correct single-writer
- *     program a slot being recorded or parked CANNOT already hold an
+ *     program a slot being recorded or parked cannot already hold an
  *     installed proxy.  A proxy sitting there therefore means another
  *     writer is mid-transaction on that very slot right now.
- *     Symmetrically, at settle each slot must still hold OUR proxy;
- *     anything else means a concurrent writer overwrote it.
+ *     Symmetrically, at settle each slot must still hold this writer's
+ *     proxy; anything else means a concurrent writer overwrote it.
  */
 
 #ifdef URCU_TXN_SW_EXCL_VALIDATE

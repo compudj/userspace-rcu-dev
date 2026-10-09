@@ -21,9 +21,9 @@
  * scan is pure overhead on the dominant case, the lookup miss.
  *
  * This Bloom filter is an optimisation to answer the miss in O(1)
- * without false negatives: a clear bit means the slot is DEFINITELY
+ * without false negatives: a clear bit means the slot is definitely
  * absent, so the scan is skipped outright.  All k bits set means
- * present OR a false positive, which falls through to the authoritative
+ * present or a false positive, which falls through to the authoritative
  * find.
  *
  * Correctness never depends on the filter's presence, width or k: a
@@ -62,7 +62,7 @@ extern "C" {
 #endif
 
 /*
- * URCU_TXN_BLOOM_K sets the number of hash BITS a slot maps to (default 3).
+ * URCU_TXN_BLOOM_K sets the number of hash bits a slot maps to (default 3).
  * Raising k by one multiplies the false-positive rate by the fill factor kn/m:
  * a win only while the filter is sparse.
  */
@@ -73,10 +73,10 @@ extern "C" {
 /*
  * URCU_TXN_BLOOM_MIN is the write-set size below which the filter is not built
  * at all: an exact scan of that many records is cheaper than zeroing the filter
- * and hashing into it, and it is EXACT, so it also spares the caller the
+ * and hashing into it, and it is exact, so it also spares the caller the
  * spurious escalations a false positive would cause.  Only above this does the
  * filter start paying.  Correctness never depends on the value -- it selects
- * which of two answers-agreeing paths runs.  The sw engine keeps its OWN knob
+ * which of two answers-agreeing paths runs.  The sw engine keeps its own knob
  * with the same default and the same rationale (URCU_TXN_SW_BLOOM_MIN); it is
  * an independent define, so overriding this one does not move it.
  */
@@ -87,9 +87,9 @@ extern "C" {
 #define URCU_TXN_BLOOM_BITS	(64ULL * URCU_TXN_BLOOM_WORDS)
 
 /*
- * Two INDEPENDENT hashes of the slot.  A single multiply leaves the k derived
+ * Two independent hashes of the slot.  A single multiply leaves the k derived
  * positions correlated (slot addresses are aligned and clustered).
- * Minimal-cost Kirsch-Mitzenmacher: run ONE SplitMix64 avalanche (two
+ * Minimal-cost Kirsch-Mitzenmacher: run one SplitMix64 avalanche (two
  * multiplies) and split its fully-mixed 64 bits into two independent 32-bit
  * lanes -- one hash yields both h1,h2, half the cost of two separate hashes and
  * far cheaper than a multiply-free chain (Thomas Wang) whose long dependency
