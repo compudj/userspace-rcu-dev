@@ -635,28 +635,28 @@ int urcu_txn_sw_slab_class_of(unsigned int req)
 static inline
 struct urcu_txn_sw_desc *urcu_txn_sw__desc_alloc(unsigned int cap)
 {
-	struct urcu_txn_sw_desc *desc;
-	int cl;
+	struct urcu_txn_sw_desc *desc = NULL;
+	int cl = -1;
 
-	desc = NULL;
-	if (urcu_slab_enabled(&urcu_txn_sw_slab) &&
-			(cl = urcu_txn_sw_slab_class_of(cap)) >= 0) {
+	if (urcu_slab_enabled(&urcu_txn_sw_slab))
+		cl = urcu_txn_sw_slab_class_of(cap);
+	if (cl >= 0) {
 		desc = (struct urcu_txn_sw_desc *)
 				urcu_slab_alloc(&urcu_txn_sw_slab, cl);
 		if (caa_likely(desc != NULL)) {
 			cap = urcu_txn_sw_slab_rc[cl];	/* physical class cap */
 			desc->slab = 1;
 		}
-		/*
-		 * NULL means the arena hit its footprint cap, or OOM: fall
-		 * through to the exact allocator.  Superblocks are never
-		 * unmapped, so the cap bounds what a burst makes permanent,
-		 * and the burst still has to complete.
-		 */
 	}
 	if (!desc) {
 		void *p;
 
+		/*
+		 * No class holds @cap, or the arena hit its footprint cap.
+		 * Superblocks are never unmapped, so the cap bounds what a
+		 * burst makes permanent, and the burst still has to complete:
+		 * serve it with an exact allocation.
+		 */
 		if (posix_memalign(&p, 16, urcu_txn_sw_descsize(cap)))
 			return NULL;
 		desc = (struct urcu_txn_sw_desc *) p;
@@ -1075,8 +1075,11 @@ void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 	urcu_txn_sw__excl_owner(t, "load()");
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE ||
 			t->state == URCU_TXN_SW_OOM);
-	if (!t->disjoint && (r = urcu_txn_sw__find_ryw(t, slot)) != NULL)
-		return r->ptr[1];		/* our own pending write */
+	if (!t->disjoint) {
+		r = urcu_txn_sw__find_ryw(t, slot);
+		if (r)
+			return r->ptr[1];	/* our own pending write */
+	}
 #ifdef URCU_TXN_SW_DEBUG_DISJOINT
 	/*
 	 * The load side of the disjoint declaration.  On a disjoint handle a
