@@ -279,11 +279,13 @@ struct urcu_txn_sw_txn {
 	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];  /* RYW certain-miss filter */
 };
 
-static inline
-void urcu_txn_sw__group_init(struct urcu_txn_sw_group *group)
-{
-	group->selector = 0;
-}
+/*
+ * Reader side
+ * ===========
+ *
+ * A reader loads a transacted slot with rcu_dereference() and passes the value
+ * to urcu_txn_sw_resolve().
+ */
 
 /*
  * Does @v carry all of @tag's bits, i.e. is it an installed proxy rather than a
@@ -358,6 +360,20 @@ void *urcu_txn_sw_resolve(void *v, uintptr_t tag)
 }
 
 /*
+ * Flip-group and record primitives
+ * ================================
+ *
+ * The steps urcu_txn_sw_commit() is made of.  They are internal: nothing else
+ * calls them, apart from tests that stage a transaction between two steps.
+ */
+
+static inline
+void urcu_txn_sw__group_init(struct urcu_txn_sw_group *group)
+{
+	group->selector = 0;
+}
+
+/*
  * Commit the flip group: switch every record in the transaction from old to new
  * with a single store-release.  Must be called after the new targets are fully
  * built.
@@ -370,6 +386,56 @@ void urcu_txn_sw__group_commit(struct urcu_txn_sw_group *group)
 	 * urcu_txn_sw__proxy_resolve().
 	 */
 	uatomic_store(&group->selector, 1, CMM_RELEASE);
+}
+
+/*
+ * Set a record's {old, new, slot, tag}; its group is bound at install.
+ */
+static inline
+void urcu_txn_sw__record_set(struct urcu_txn_sw_record *r,
+		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
+{
+	r->ptr[0] = old_ptr;
+	r->ptr[1] = new_ptr;
+	r->slot = slot;
+	r->tag = tag;
+}
+
+/*
+ * Install record @r's tagged proxy into its slot, bound to flip group @group.
+ * Readers resolve it to old until the group commits.  The parked value is @r's
+ * address OR'd with the record's tag.
+ */
+static inline
+void urcu_txn_sw__record_install(struct urcu_txn_sw_group *group,
+		struct urcu_txn_sw_record *r)
+{
+	/*
+	 * Installing requires a non-zero tag within URCU_TXN_SW_TAG_MASK, none
+	 * of whose bits is set in the record's address.  Under a zero tag
+	 * every plain value passes urcu_txn_sw_is_proxy(), and readers would
+	 * resolve live values as proxies.  With a tag bit already set in the
+	 * address, the OR changes nothing and urcu_txn_sw__untag() subtracts to
+	 * a wrong address.
+	 */
+	urcu_assert_debug(r->tag && !(r->tag & ~URCU_TXN_SW_TAG_MASK));
+	urcu_assert_debug(!((uintptr_t) r & r->tag));
+	r->group = group;
+	/* Store-release of slot pairs with rcu_dereference(). */
+	uatomic_store(r->slot,
+			(void *) ((uintptr_t) r | r->tag), CMM_RELEASE);
+}
+
+/*
+ * Settle record @r's slot: store its new target there, over the proxy.  For a
+ * transaction of one record, which installs no proxy, this store is the whole
+ * commit.
+ */
+static inline
+void urcu_txn_sw__record_settle(struct urcu_txn_sw_record *r)
+{
+	/* Store-release of slot pairs with rcu_dereference(). */
+	uatomic_store(r->slot, r->ptr[1], CMM_RELEASE);
 }
 
 /*
@@ -526,51 +592,9 @@ void urcu_txn_sw__excl_slot_parkable(
 #endif	/* URCU_TXN_SW_EXCL_VALIDATE */
 
 /*
- * Common body of the two public initializers.  @buf == NULL selects the
- * heap-growing form.
- *
- * Clears everything up to, and not including, @ryw_bloom: the filter is armed
- * lazily, and zeroing its 128 bytes per transaction would cost what the lazy
- * arming saves.  This is why @ryw_bloom is the last member.
+ * Descriptor allocation and reclaim
+ * =================================
  */
-static inline
-void urcu_txn_sw__init(struct urcu_txn_sw_txn *t,
-		struct urcu_txn_sw_record *buf, unsigned int cap)
-{
-	memset(t, 0, offsetof(struct urcu_txn_sw_txn, ryw_bloom));
-	t->state = URCU_TXN_SW_PREPARE;
-	t->records = buf;
-	t->cap = cap;
-	t->records_inline = (buf != NULL);
-	urcu_txn_sw__excl_claim(t);
-}
-
-/*
- * Initialize a transaction handle.  Allocates nothing, so it cannot fail.
- */
-static inline
-void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
-{
-	urcu_txn_sw__init(t, NULL, 0);
-}
-
-/*
- * Initialize a transaction whose records live in caller storage @buf, holding
- * @cap records.  Allocates nothing, so it cannot fail.  record() never grows
- * @buf and commit() never frees it.
- *
- * Use it only for a transaction of at most one record.  Such a commit installs
- * no proxy and owes no grace period, so nothing references the handle or @buf
- * once commit() returns.  A transaction that installs proxies (nr >= 2) must
- * use urcu_txn_sw_init(): its records have to outlive a grace period.  record()
- * and commit() both assert it.
- */
-static inline
-void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
-		struct urcu_txn_sw_record *buf, unsigned int cap)
-{
-	urcu_txn_sw__init(t, buf, cap);
-}
 
 /* Size in bytes of a descriptor holding @cap records. */
 static inline
@@ -671,6 +695,98 @@ void urcu_txn_sw__desc_free(struct urcu_txn_sw_desc *desc)
 		urcu_slab_free(desc);
 	else
 		free(desc);
+}
+
+/*
+ * call_rcu callback: free a committed transaction's descriptor once the grace
+ * period guarantees no reader still holds one of its proxies.
+ */
+static inline
+void urcu_txn_sw__free_rcu(struct rcu_head *head)
+{
+	struct urcu_txn_sw_desc *desc = caa_container_of(head,
+			struct urcu_txn_sw_desc, rcu_head);
+
+	urcu_txn_sw__desc_free(desc);
+}
+
+/*
+ * Retire the descriptor of a committed transaction.  A reader may still hold
+ * one of its proxies, so it must outlive a grace period.  By default the slab
+ * retires it in a batch, with one call_rcu per batch;
+ * -DURCU_TXN_SLAB_NO_BATCH keeps one call_rcu per descriptor.  Only a slab
+ * descriptor, under @flavor's own deferral, may take the batch route: see
+ * urcu_txn_retire() in <urcu/rcu-txn-mcas.h>.
+ */
+static inline
+void urcu_txn_sw__retire(struct urcu_txn_sw_desc *desc,
+		void (*call_rcu_fn)(struct rcu_head *,
+			void (*)(struct rcu_head *)),
+		const struct rcu_flavor_struct *flavor)
+{
+#ifndef URCU_TXN_SLAB_NO_BATCH
+	if (caa_likely(desc->slab && flavor &&
+			flavor->update_call_rcu == call_rcu_fn) &&
+			urcu_slab_free_pending(desc, flavor))
+		return;
+#else
+	(void) flavor;
+#endif
+	call_rcu_fn(&desc->rcu_head, urcu_txn_sw__free_rcu);
+}
+
+/*
+ * Writer side
+ * ===========
+ *
+ * The handle's contract is stated under "RCU pseudo-transaction" above.
+ */
+
+/*
+ * Common body of the two public initializers.  @buf == NULL selects the
+ * heap-growing form.
+ *
+ * Clears everything up to, and not including, @ryw_bloom: the filter is armed
+ * lazily, and zeroing its 128 bytes per transaction would cost what the lazy
+ * arming saves.  This is why @ryw_bloom is the last member.
+ */
+static inline
+void urcu_txn_sw__init(struct urcu_txn_sw_txn *t,
+		struct urcu_txn_sw_record *buf, unsigned int cap)
+{
+	memset(t, 0, offsetof(struct urcu_txn_sw_txn, ryw_bloom));
+	t->state = URCU_TXN_SW_PREPARE;
+	t->records = buf;
+	t->cap = cap;
+	t->records_inline = (buf != NULL);
+	urcu_txn_sw__excl_claim(t);
+}
+
+/*
+ * Initialize a transaction handle.  Allocates nothing, so it cannot fail.
+ */
+static inline
+void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
+{
+	urcu_txn_sw__init(t, NULL, 0);
+}
+
+/*
+ * Initialize a transaction whose records live in caller storage @buf, holding
+ * @cap records.  Allocates nothing, so it cannot fail.  record() never grows
+ * @buf and commit() never frees it.
+ *
+ * Use it only for a transaction of at most one record.  Such a commit installs
+ * no proxy and owes no grace period, so nothing references the handle or @buf
+ * once commit() returns.  A transaction that installs proxies (nr >= 2) must
+ * use urcu_txn_sw_init(): its records have to outlive a grace period.  record()
+ * and commit() both assert it.
+ */
+static inline
+void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
+		struct urcu_txn_sw_record *buf, unsigned int cap)
+{
+	urcu_txn_sw__init(t, buf, cap);
 }
 
 /*
@@ -782,94 +898,6 @@ void urcu_txn_sw__done(struct urcu_txn_sw_txn *t)
 	t->desc = NULL;
 	t->records = NULL;
 	t->state = URCU_TXN_SW_DONE;
-}
-
-/*
- * call_rcu callback: free a committed transaction's descriptor once the grace
- * period guarantees no reader still holds one of its proxies.
- */
-static inline
-void urcu_txn_sw__free_rcu(struct rcu_head *head)
-{
-	struct urcu_txn_sw_desc *desc = caa_container_of(head,
-			struct urcu_txn_sw_desc, rcu_head);
-
-	urcu_txn_sw__desc_free(desc);
-}
-
-/*
- * Retire the descriptor of a committed transaction.  A reader may still hold
- * one of its proxies, so it must outlive a grace period.  By default the slab
- * retires it in a batch, with one call_rcu per batch;
- * -DURCU_TXN_SLAB_NO_BATCH keeps one call_rcu per descriptor.  Only a slab
- * descriptor, under @flavor's own deferral, may take the batch route: see
- * urcu_txn_retire() in <urcu/rcu-txn-mcas.h>.
- */
-static inline
-void urcu_txn_sw__retire(struct urcu_txn_sw_desc *desc,
-		void (*call_rcu_fn)(struct rcu_head *,
-			void (*)(struct rcu_head *)),
-		const struct rcu_flavor_struct *flavor)
-{
-#ifndef URCU_TXN_SLAB_NO_BATCH
-	if (caa_likely(desc->slab && flavor &&
-			flavor->update_call_rcu == call_rcu_fn) &&
-			urcu_slab_free_pending(desc, flavor))
-		return;
-#else
-	(void) flavor;
-#endif
-	call_rcu_fn(&desc->rcu_head, urcu_txn_sw__free_rcu);
-}
-
-/*
- * Set a record's {old, new, slot, tag}; its group is bound at install.
- */
-static inline
-void urcu_txn_sw__record_set(struct urcu_txn_sw_record *r,
-		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
-{
-	r->ptr[0] = old_ptr;
-	r->ptr[1] = new_ptr;
-	r->slot = slot;
-	r->tag = tag;
-}
-
-/*
- * Install record @r's tagged proxy into its slot, bound to flip group @group.
- * Readers resolve it to old until the group commits.  The parked value is @r's
- * address OR'd with the record's tag.
- */
-static inline
-void urcu_txn_sw__record_install(struct urcu_txn_sw_group *group,
-		struct urcu_txn_sw_record *r)
-{
-	/*
-	 * Installing requires a non-zero tag within URCU_TXN_SW_TAG_MASK, none
-	 * of whose bits is set in the record's address.  Under a zero tag
-	 * every plain value passes urcu_txn_sw_is_proxy(), and readers would
-	 * resolve live values as proxies.  With a tag bit already set in the
-	 * address, the OR changes nothing and urcu_txn_sw__untag() subtracts to
-	 * a wrong address.
-	 */
-	urcu_assert_debug(r->tag && !(r->tag & ~URCU_TXN_SW_TAG_MASK));
-	urcu_assert_debug(!((uintptr_t) r & r->tag));
-	r->group = group;
-	/* Store-release of slot pairs with rcu_dereference(). */
-	uatomic_store(r->slot,
-			(void *) ((uintptr_t) r | r->tag), CMM_RELEASE);
-}
-
-/*
- * Settle record @r's slot: store its new target there, over the proxy.  For a
- * transaction of one record, which installs no proxy, this store is the whole
- * commit.
- */
-static inline
-void urcu_txn_sw__record_settle(struct urcu_txn_sw_record *r)
-{
-	/* Store-release of slot pairs with rcu_dereference(). */
-	uatomic_store(r->slot, r->ptr[1], CMM_RELEASE);
 }
 
 /*
