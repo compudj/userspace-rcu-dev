@@ -291,9 +291,21 @@ void urcu_txn_sw_group_init(struct urcu_txn_sw_group *group)
  * them: see urcu_txn_sw_record().
  */
 static inline
-int urcu_txn_sw_is_proxy(const void *v, uintptr_t tag)
+bool urcu_txn_sw_is_proxy(const void *v, uintptr_t tag)
 {
 	return ((uintptr_t) v & tag) == tag;
+}
+
+/*
+ * Does @v, loaded from a slot transacted under @tag, show the slot parked?
+ * Unlike urcu_txn_sw_is_proxy(), this answers false under a zero tag, which
+ * every value matches and which marks no proxy.  A zero tag is legal for a
+ * transaction that installs none.
+ */
+static inline
+bool urcu_txn_sw__is_parked(const void *v, uintptr_t tag)
+{
+	return tag && urcu_txn_sw_is_proxy(v, tag);
 }
 
 /*
@@ -396,17 +408,6 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
 		abort();						\
 	} while (0)
 
-/*
- * urcu_txn_sw_is_proxy() with tag == 0 excluded: under a zero tag the bare
- * predicate is true for every value, and the validator would abort on a clean
- * slot.
- */
-static inline
-int urcu_txn_sw__is_proxy(const void *v, uintptr_t tag)
-{
-	return tag != 0 && urcu_txn_sw_is_proxy(v, tag);
-}
-
 static inline
 void urcu_txn_sw__excl_claim(struct urcu_txn_sw_txn *t)
 {
@@ -429,7 +430,7 @@ void urcu_txn_sw__excl_slot_free(void **slot, uintptr_t tag, const char *what)
 {
 	void *v = uatomic_load(slot, CMM_RELAXED);
 
-	if (urcu_txn_sw__is_proxy(v, tag))
+	if (urcu_txn_sw__is_parked(v, tag))
 		urcu_txn_sw__excl_abort("slot=%p already holds an installed proxy (%p) at %s: another writer is mid-transaction on it\n",
 			(void *) slot, v, what);
 }
@@ -1085,11 +1086,7 @@ void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 	}
 	urcu_txn_sw__disjoint_check(t, slot, "load()");
 	v = uatomic_load(slot, CMM_RELAXED);
-	/*
-	 * A zero tag is legal for a transaction that installs no proxy, and
-	 * every value would match it: skip the check.
-	 */
-	urcu_assert_debug(!tag || ((uintptr_t) v & tag) != tag);
+	urcu_assert_debug(!urcu_txn_sw__is_parked(v, tag));
 	return v;
 }
 
