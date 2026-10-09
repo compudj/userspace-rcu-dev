@@ -1055,6 +1055,39 @@ void urcu_txn_sw_declare_disjoint(struct urcu_txn_sw_txn *t)
 }
 
 /*
+ * URCU_TXN_SW_DEBUG_DISJOINT: on a handle declared disjoint, abort the process
+ * when a load or a record names a slot the transaction has already recorded.
+ * The load would return the committed value where its caller expects the
+ * pending one, and the record would install a second proxy on the slot.  Off by
+ * default.
+ */
+#ifdef URCU_TXN_SW_DEBUG_DISJOINT
+
+static inline
+void urcu_txn_sw__disjoint_check(const struct urcu_txn_sw_txn *t, void **slot,
+		const char *what)
+{
+	if (!t->disjoint || !urcu_txn_sw__scan(t, slot))
+		return;
+	fprintf(stderr, "urcu-txn-sw disjoint violation: slot=%p is already recorded at %s, on a handle declared disjoint\n",
+		(void *) slot, what);
+	fflush(stderr);
+	abort();
+}
+
+#else	/* !URCU_TXN_SW_DEBUG_DISJOINT */
+
+static inline
+void urcu_txn_sw__disjoint_check(
+		const struct urcu_txn_sw_txn *t __attribute__((unused)),
+		void **slot __attribute__((unused)),
+		const char *what __attribute__((unused)))
+{
+}
+
+#endif	/* URCU_TXN_SW_DEBUG_DISJOINT */
+
+/*
  * Load @slot as this transaction will leave it: the pending new value of its
  * record for @slot if it has one, else the slot's current value.
  *
@@ -1080,24 +1113,7 @@ void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 		if (r)
 			return r->ptr[1];	/* our own pending write */
 	}
-#ifdef URCU_TXN_SW_DEBUG_DISJOINT
-	/*
-	 * The load side of the disjoint declaration.  On a disjoint handle a
-	 * load of a recorded slot returns the committed value; the caller then
-	 * computes its next edge from pre-transaction state, and since every
-	 * slot it records is distinct, nothing else traps.
-	 */
-	if (t->disjoint && urcu_txn_sw__scan(t, slot) != NULL) {
-		fprintf(stderr, "urcu-txn-sw: disjoint-contract violation: "
-			"slot %p is read after this transaction recorded it, but the "
-			"handle declared its write set disjoint via "
-			"urcu_txn_sw_declare_disjoint(), so this load returns the "
-			"COMMITTED value and not the pending one.  Anything computed "
-			"from it names pre-transaction state.  Use the default (do not "
-			"declare disjoint) for a composed bracket.\n", (void *) slot);
-		abort();
-	}
-#endif
+	urcu_txn_sw__disjoint_check(t, slot, "load()");
 	v = uatomic_load(slot, CMM_RELAXED);
 	/*
 	 * A zero tag is legal for a transaction that installs no proxy, and
@@ -1148,19 +1164,7 @@ bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	urcu_txn_sw__excl_owner(t, "record_chain()");
 	if (t->disjoint) {		/* no slot repeats: skip the lookup */
-#ifdef URCU_TXN_SW_DEBUG_DISJOINT
-		if (urcu_txn_sw__scan(t, slot) != NULL) {
-			fprintf(stderr, "urcu-txn-sw: disjoint-contract violation: "
-				"slot %p is already recorded in this transaction, but the "
-				"handle declared its write set disjoint via "
-				"urcu_txn_sw_declare_disjoint().  The blind append would "
-				"install a second proxy on it and settle both in record order, "
-				"silently losing the earlier edit.  Use the default (do not "
-				"declare disjoint) for a mutator whose composed edges can "
-				"alias a slot.\n", (void *) slot);
-			abort();
-		}
-#endif
+		urcu_txn_sw__disjoint_check(t, slot, "record_chain()");
 		return urcu_txn_sw_record(t, slot, old_ptr, new_ptr, tag);
 	}
 	return urcu_txn_sw__chain(t, slot, old_ptr, new_ptr, tag);
