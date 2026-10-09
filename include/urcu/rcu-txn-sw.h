@@ -141,60 +141,42 @@ extern "C" {
  * RCU pseudo-transaction (urcu_txn_sw_txn)
  * ========================================
  *
- * A growable transaction over a set of slots.  The handle is a small
- * on-stack object the embedder declares and inits with urcu_txn_sw_init();
- * nothing is allocated until edges are recorded, so the init step has
- * no failure mode.
+ * A growable transaction over a set of slots.  The handle is a small on-stack
+ * object the embedder declares and initializes with urcu_txn_sw_init().
+ * Nothing is allocated before the first record() or reserve(), so init cannot
+ * fail.
  *
- *   init --> PREPARE --record--> PREPARE --commit--> committed (handle done)
- *              |                            |
- *              | record()/reserve() OOM     | commit owns reclaim:
- *              v (sticky URCU_TXN_SW_OOM)   | call_rcu txn descriptor
- *        commit reports MEMORY_ERROR        | or immediate record-array free
- *        and frees the record array         v (no proxy: empty/single)
- *                                         freed
+ *   init() --> PREPARE --commit() or cancel()--> DONE
+ *                 |                               ^
+ *                 | reserve() or record()         |
+ *                 | cannot allocate               |
+ *                 v                               |
+ *                OOM ---commit() or cancel()------+
  *
- * record() appends a record {slot, old, new} into the record array but
- * does not install any proxy address, so the array grows by realloc.
- * The record set is frozen once proxies are installed (which commit()
- * does internally), so record() must precede commit().  Records must
- * target pairwise-distinct slots.
+ * record() appends a record {slot, old, new} to the transaction's descriptor
+ * and installs nothing, so the descriptor may still move as it grows.  The
+ * record set is frozen once commit() installs the proxies.  Records must target
+ * pairwise-distinct slots: see urcu_txn_sw_record().
  *
- * commit() publishes the whole set atomically: it installs every
- * record's tagged proxy (readers still resolve to old; selector == 0),
- * flips the group's selector with one store-release (every proxy
- * resolves to new at once), then settles each slot to its direct new
- * value.  commit() owns reclaim:
- *   - nr >= 2 (proxies installed): a reader may hold a proxy, whose old/new
- *     targets and selector live in the transaction descriptor.  The
- *     transaction descriptor is reclaimed through call_rcu() (after a grace
- *     period).
- *   - nr <= 1 / sticky OOM (no proxy ever published): the transaction
- *     descriptor is freed at once.
+ * A handle ends in commit(), which publishes the record set, or in cancel(),
+ * which drops it.  Either consumes the handle, which must be initialized again
+ * before it is reused.
  *
- * cancel() drops the record set instead of publishing it, and frees the
- * descriptor at once.  A handle ends in commit() or in cancel().
+ * OOM is sticky.  Once a reserve() or a record() has failed to allocate, later
+ * ones do nothing and commit() publishes nothing and reports MEMORY_ERROR.  An
+ * embedder may therefore ignore their return values and test only commit()'s.
  *
- * OOM is sticky: a reserve()/record() that cannot allocate a descriptor
- * causes the following reserve()/record() operations to be no-ops, and the
- * later commit() to report MEMORY_ERROR and to free the descriptor, so an
- * embedder may ignore the bool returns of reserve()/record() and test only
- * commit() -- matching the concurrent front-end's contract.
- *
- * Each recorded edge carries its own tag (urcu_txn_sw_record's @tag): the bits
- * OR'd into that slot's installed proxy value so its readers recognise the
- * proxy (e.g. a reserved type code).  The record array is allocated 16-byte
- * aligned, so each record -- hence each tagged proxy -- has its low 4 bits
- * free for the embedder's tag.
+ * Each record carries its own tag: the bits OR'd into the proxy value installed
+ * in its slot, by which the slot's readers recognise a proxy (a reserved type
+ * code, for instance).  It must be within URCU_TXN_SW_TAG_MASK.
  */
 
 enum urcu_txn_sw_state {
 	URCU_TXN_SW_PREPARE = 0,
 	URCU_TXN_SW_OOM,		/* sticky: commit -> MEMORY_ERROR */
 	/*
-	 * Terminal: commit() or cancel() consumed the handle.  Reusing it without
-	 * initializing it again trips an assertion, where it would otherwise
-	 * store through a stale record array.
+	 * Terminal: commit() or cancel() consumed the handle.  Using it again
+	 * without initializing it trips an assertion.
 	 */
 	URCU_TXN_SW_DONE,
 };
@@ -221,30 +203,21 @@ struct urcu_txn_sw_record {
 	void *ptr[2];			/* [0] old, [1] new; selector-indexed */
 	struct urcu_txn_sw_group *group;
 	void **slot;			/* install / settle target */
-	uintptr_t tag;			/*
-					 * Embedder tag bits OR'd into this
-					 * slot's proxy value at install (see
-					 * urcu_txn_sw_record).  Per-record so
-					 * heterogeneous slots -- e.g. a
-					 * 0xF-tagged structural edge and a
-					 * bit-0 list edge -- can share one
-					 * transaction.
-					 */
+	/*
+	 * Tag bits OR'd into the proxy value installed in @slot.  Per record,
+	 * so that slots tagged differently (a 0xF type code, a list's bit 0)
+	 * can share one transaction.
+	 */
+	uintptr_t tag;
 } __attribute__((aligned(URCU_TXN_SW_RECORD_ALIGN)));
 
 /*
  * Transaction descriptor: the single allocation that carries a committed
  * transaction across its grace period.  It holds the flip group every installed
- * proxy reads, the rcu_head that defers reclaim, and the record array inline
- * (the proxies themselves live there).  Allocated on the first
- * record()/reserve() from the shared per-CPU slab and grown in PREPARE (no
- * proxy is live yet, so it may move); delayed-reclaimed after settle or
- * reclaimed immediately on commit failure.  The 32-byte header keeps records[]
- * 16-byte aligned so each tagged proxy has its low 4 bits free.  @cap is the
- * physical capacity; @slab (stamped at alloc) is the descriptor's origin, so it
- * is freed on the path that allocated it even if the slab enables in between.
- * The inline path (urcu_txn_sw_init_inline, nr <= 1) never allocates a
- * descriptor.
+ * proxy reads, the rcu_head that defers its reclaim, and the records, which are
+ * the proxies.  The first record() or reserve() allocates it, and it may move
+ * as it grows in PREPARE, no proxy being installed yet.  A caller-storage
+ * handle (urcu_txn_sw_init_inline()) has none.
  */
 struct urcu_txn_sw_desc {
 	struct urcu_txn_sw_group group;		/* read by installed proxies */
@@ -261,14 +234,13 @@ struct urcu_txn_sw_desc {
 	 * either: installed proxies point at @group.
 	 */
 	struct rcu_head rcu_head;		/* deferred-free handle */
-	unsigned int cap;			/* physical capacity */
-	unsigned int slab;			/*
-						 * Descriptor origin: slab (1) /
-						 * exact malloc (0); the free
-						 * discriminator, doubling as
-						 * the pad that keeps records[]
-						 * 16-byte aligned.
-						 */
+	unsigned int cap;			/* records it can hold */
+	/*
+	 * Origin: 1 from the slab, 0 from posix_memalign().  The free path
+	 * goes by it.  It also pads the header, so that @records keeps the
+	 * alignment of a record.
+	 */
+	unsigned int slab;
 	struct urcu_txn_sw_record records[];	/* frozen at install */
 };
 
@@ -278,25 +250,16 @@ urcu_static_assert(!(offsetof(struct urcu_txn_sw_desc, records) %
 		urcu_txn_sw_desc_records_aligned);
 
 /*
- * Transaction handle: a small on-stack object with no allocation of its own.
- * The record array @records grows in PREPARE -- safe because no proxy is
- * installed yet (no slot points into it) -- and is frozen once commit()
- * installs proxies.  @desc is the transaction descriptor (NULL until the first
- * record()/reserve()); it carries @records inline, so a held proxy and its
- * selector are reclaimed together after a grace period.  The tag room that
- * matters is on the tagged proxies stored in slots; those live in @records,
- * allocated 16-byte aligned (posix_memalign) so each record -- hence each
- * tagged proxy -- keeps its low 4 bits free, letting a low-4-bit
- * pointer-tagging embedder (e.g. the fractal trie) route its slots through this
- * engine.
+ * Transaction handle: a small on-stack object, private to one writer.
+ * @records points into @desc, or at caller storage for a handle initialized
+ * with urcu_txn_sw_init_inline(), which has no descriptor.
  */
 struct urcu_txn_sw_txn {
 	/*
 	 * Ordered by access and packed: what every record() uses fits the
-	 * first cache line, without holes.  The handle is private to one
-	 * writer, so there is no false sharing to avoid.
+	 * first cache line, without holes.
 	 */
-	struct urcu_txn_sw_record *records;	/* grown, or caller storage */
+	struct urcu_txn_sw_record *records;	/* @desc's, or caller storage */
 	struct urcu_txn_sw_desc *desc;		/* NULL until first allocated */
 	unsigned int nr;
 	unsigned int cap;
@@ -334,17 +297,13 @@ int urcu_txn_sw_is_proxy(const void *v, uintptr_t tag)
 }
 
 /*
- * Recover the proxy address from a parked slot value.
+ * Recover the record's address from a parked slot value.
  *
- * Subtract the tag rather than masking it off.  The two are equivalent here:
- * urcu_txn_sw_is_proxy() has shown every tag bit set in @v, and those bits are
- * clear in the proxy address (records are 16-byte aligned, and the tag is
- * within the low 4 bits).
- *
- * The subtraction generates better code.  With a constant @tag the compiler
- * folds it into the displacement of the loads that follow, where a mask is one
- * more operation in the reader's chain of dependent loads (proxy -> group ->
- * selector -> ptr[sel]).
+ * Subtracting the tag is equivalent to masking it off, since
+ * urcu_txn_sw_is_proxy() has shown every tag bit set in @v.  It lets the
+ * compiler fold a constant @tag into the displacement of the loads that follow,
+ * where a mask would be one more operation in the reader's chain of dependent
+ * loads.
  */
 static inline
 struct urcu_txn_sw_record *urcu_txn_sw_untag(void *v, uintptr_t tag)
@@ -356,14 +315,11 @@ struct urcu_txn_sw_record *urcu_txn_sw_untag(void *v, uintptr_t tag)
 /*
  * Resolve a proxy to its current target.
  *
- * @proxy must have been obtained by dereferencing (rcu_dereference) the slot
- * that holds the tagged proxy pointer, so the dependency chain makes the
- * proxy's immutable fields (old_ptr, new_ptr, group) visible.  The selector is
- * the only mutable field: load it with acquire so the new target's contents --
- * published before urcu_txn_sw_group_commit()'s store-release -- are visible
- * whenever selector == 1 is observed.
+ * @proxy must come from an rcu_dereference() of the slot that holds it.  What
+ * orders the loads below is described under "Store-release / load-acquire
+ * pairs" at the top of this file.
  *
- * The selector indexes proxy->ptr[] directly, so resolution is a pure data
+ * The selector indexes proxy->ptr[] directly, so resolution is a data
  * dependency rather than a conditional branch.
  */
 static inline
@@ -418,7 +374,7 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
  * validator claims the two things that do exist:
  *
  *   - the handle.  Its owner is the thread that initialized it, and
- *     reserve / record / load / commit must all run on that thread.
+ *     reserve / record / load / commit / cancel must all run on that thread.
  *     Catches a transaction handed between threads mid-flight.
  *
  *   - the slot, which is what two racing writers actually share, and so is
@@ -589,9 +545,7 @@ void urcu_txn_sw__init(struct urcu_txn_sw_txn *t,
 }
 
 /*
- * Initialize an on-stack transaction handle.  Allocates nothing, so it cannot
- * fail: the first record()/reserve() is the first OOM checkpoint, and that
- * failure is sticky (commit reports MEMORY_ERROR).
+ * Initialize a transaction handle.  Allocates nothing, so it cannot fail.
  */
 static inline
 void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
@@ -600,12 +554,9 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
 }
 
 /*
- * Initialize a transaction whose record array is caller-provided storage @buf,
- * holding @cap records.  struct urcu_txn_sw_record is aligned(16), so an
- * on-stack array of it keeps each tagged proxy's low 4 bits free.
- *
- * Allocates nothing, so it cannot fail.  record() never grows the array and
- * commit() never frees it.
+ * Initialize a transaction whose records live in caller storage @buf, holding
+ * @cap records.  Allocates nothing, so it cannot fail.  record() never grows
+ * @buf and commit() never frees it.
  *
  * Use it only for a transaction of at most one record.  Such a commit installs
  * no proxy and owes no grace period, so nothing references the handle or @buf
@@ -659,11 +610,10 @@ int urcu_txn_sw_slab_class_of(unsigned int req)
 }
 
 /*
- * Allocate a transaction descriptor for at least @cap records, 16-byte aligned
- * so that every tagged proxy keeps its low 4 bits free.  It comes from the slab
- * when the request fits a class, and its capacity is then the class size;
- * otherwise from posix_memalign.  Initializes the flip group.  Returns NULL on
- * OOM.
+ * Allocate a transaction descriptor for at least @cap records.  It comes from
+ * the slab when the request fits a class, and its capacity is then the
+ * class's; otherwise from posix_memalign().  Initializes the flip group.
+ * Returns NULL on OOM.
  */
 static inline
 struct urcu_txn_sw_desc *urcu_txn_sw__desc_alloc(unsigned int cap)
@@ -722,7 +672,7 @@ void urcu_txn_sw__desc_free(struct urcu_txn_sw_desc *desc)
  * Move the handle's records to a new descriptor holding at least @cap of them.
  * PREPARE only: no proxy is installed yet, so the records may move.  There is
  * no aligned realloc: allocate a new descriptor, copy, free the old one.
- * Returns false on OOM, leaving the handle in the sticky URCU_TXN_SW_OOM state.
+ * Returns false on OOM, leaving the handle in the URCU_TXN_SW_OOM state.
  */
 static inline
 bool urcu_txn_sw__resize(struct urcu_txn_sw_txn *t, unsigned int cap)
@@ -747,17 +697,17 @@ bool urcu_txn_sw__resize(struct urcu_txn_sw_txn *t, unsigned int cap)
 	t->desc = desc;
 	t->records = desc->records;
 	t->cap = desc->cap;
-	t->records_inline = false;	/* the descriptor is the engine's to free */
+	t->records_inline = false;	/* now the engine's to free */
 	return true;
 }
 
 /*
- * Pre-size the record array to hold at least @cap records.
+ * Give the handle a descriptor that holds at least @cap records.
  *
- * Optional: record() grows the array on demand and fails cleanly on OOM.  An
- * embedder whose record count is bounded can reserve that bound up front, where
- * a failure is easy to handle; every later record() then appends without
- * allocating and cannot fail.
+ * Optional: record() grows the descriptor on demand.  An embedder whose record
+ * count is bounded can reserve that bound up front, where a failure is easy to
+ * handle; every later record() then appends without allocating and cannot
+ * fail.
  *
  * The descriptor comes from the smallest slab class that holds @cap.
  * URCU_TXN_SW_CAP is not a floor: it is only where an unreserved handle starts.
@@ -767,16 +717,15 @@ bool urcu_txn_sw__resize(struct urcu_txn_sw_txn *t, unsigned int cap)
  * Call after init and before commit.  A handle that already buffers records
  * grows to fit @cap.
  *
- * Returns false on OOM.  The failure is sticky, so the caller may ignore the
- * return and let commit() report MEMORY_ERROR.  It also returns false, without
- * becoming sticky, when a caller-storage (init_inline) handle is asked for more
- * than its buffer holds: that is a sizing bug, not a memory failure.
+ * Returns false on OOM, which is sticky.  It also returns false, without
+ * becoming sticky, when a caller-storage handle is asked for more than its
+ * buffer holds: that is a sizing bug, not a memory failure.
  */
 static inline
 bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 {
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
-		return false;		/* sticky: an earlier alloc failed */
+		return false;		/* sticky */
 	/* PREPARE only, like record(): commit() consumed the handle. */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	urcu_txn_sw__excl_owner(t, "reserve()");
@@ -794,12 +743,12 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
  * owns, and so cannot fail.  A reserve() covering the transaction's record
  * bound is the deliberate way to make this hold; an unreserved handle also
  * satisfies it after its first record(), until URCU_TXN_SW_CAP records are
- * used.
+ * used.  A handle in the OOM state answers false.
  *
- * For embedders that change state outside the transaction as they record, such
- * as <urcu/rcu-txn-sw-hlist.h>'s writer-only pprev, a plain store that cannot
- * be rolled back.  They are safe only while no later record of the same
- * transaction can fail.  A handle in URCU_TXN_SW_OOM answers false.
+ * This is for embedders that change state outside the transaction as they
+ * record, with a plain store that cannot be rolled back, such as the
+ * writer-only pprev of <urcu/rcu-txn-sw-hlist.h>.  They are safe only while no
+ * later record of the same transaction can fail.
  */
 static inline
 bool urcu_txn_sw_append_is_infallible(const struct urcu_txn_sw_txn *t)
@@ -849,19 +798,19 @@ void urcu_txn_sw_record_set(struct urcu_txn_sw_record *r,
 /*
  * Install record @r's tagged proxy into its slot, bound to flip group @group.
  * Readers resolve it to old until the group commits.  The parked value is @r's
- * address OR'd with the record's tag; records are 16-byte aligned, so the
- * address has its low 4 bits free.
+ * address OR'd with the record's tag.
  */
 static inline
 void urcu_txn_sw_record_install(struct urcu_txn_sw_group *group,
 		struct urcu_txn_sw_record *r)
 {
 	/*
-	 * Installing requires a non-zero tag within the low 4 bits, none of
-	 * which is set in the record's address.  Under a zero tag every plain
-	 * value passes urcu_txn_sw_is_proxy(), and readers would resolve live
-	 * values as proxies.  With a tag bit already set in the address, the OR
-	 * changes nothing and urcu_txn_sw_untag() subtracts to a wrong address.
+	 * Installing requires a non-zero tag within URCU_TXN_SW_TAG_MASK, none
+	 * of whose bits is set in the record's address.  Under a zero tag
+	 * every plain value passes urcu_txn_sw_is_proxy(), and readers would
+	 * resolve live values as proxies.  With a tag bit already set in the
+	 * address, the OR changes nothing and urcu_txn_sw_untag() subtracts to
+	 * a wrong address.
 	 */
 	urcu_assert_debug(r->tag && !(r->tag & ~URCU_TXN_SW_TAG_MASK));
 	urcu_assert_debug(!((uintptr_t) r & r->tag));
@@ -875,7 +824,7 @@ void urcu_txn_sw_record_install(struct urcu_txn_sw_group *group,
  * Scan this transaction's records for @slot, or NULL.  Linear, so O(nr)
  * per call and O(nr^2) to build a write set -- urcu_txn_sw__find_ryw()
  * below is what keeps that off the hot path.  The returned pointer is
- * invalidated by the next record() (a grow may move the array), so use
+ * invalidated by the next record() (a grow may move the records), so use
  * it before recording again.
  */
 static inline
@@ -928,7 +877,7 @@ void urcu_txn_sw__bloom_arm(struct urcu_txn_sw_txn *t)
 /*
  * urcu_txn_sw__scan() behind the filter: a clear bit means the slot is not
  * recorded, and the scan is skipped.  All k bits set falls through to the scan,
- * which settles a false positive.  The filter never changes the answer.
+ * which rules out a false positive.  The filter never changes the answer.
  */
 static inline
 struct urcu_txn_sw_record *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
@@ -948,9 +897,8 @@ struct urcu_txn_sw_record *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
 }
 
 /*
- * Grow a full record array: double it, or give an unreserved handle its first
- * URCU_TXN_SW_CAP records.  Returns false on OOM, leaving the handle in the
- * sticky URCU_TXN_SW_OOM state.
+ * Grow a full handle: double its capacity, or give an unreserved handle its
+ * first URCU_TXN_SW_CAP records.  Returns false on OOM.
  *
  * Out of line on purpose: with this path in its body, the compiler does not
  * inline urcu_txn_sw_record(), and every recorded edge pays a call for an
@@ -977,8 +925,7 @@ bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
  * edit is lost.  A debug build asserts against it at install.  Use
  * urcu_txn_sw_record_chain() when the same slot may be written twice.
  *
- * Returns false on OOM, the only failure.  It is sticky, so the caller may
- * ignore the return and let commit() report MEMORY_ERROR.
+ * Returns false on OOM, the only failure, which is sticky.
  */
 static inline
 bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
@@ -987,7 +934,7 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	struct urcu_txn_sw_record *r;
 
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
-		return false;		/* sticky: an earlier alloc failed */
+		return false;		/* sticky */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	/*
 	 * Neither value may look like a proxy under @tag.  After settle the
@@ -1012,7 +959,6 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 		urcu_txn_bloom_set(t->ryw_bloom, slot);
 	return true;
 }
-
 
 /*
  * Read-your-own-writes pair (urcu_txn_sw_load / urcu_txn_sw_record_chain)
@@ -1042,13 +988,11 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
  * traversal also reads through urcu_txn_sw_load().  See
  * urcu_txn_sw_list_add_after_prepare().
  *
- * After a sticky OOM the pair no longer reads its own writes.  The failed
- * reserve()/record() appended nothing, so a later load() of that slot returns
- * the committed value, while slots recorded earlier still return pending ones.
- * commit() reports MEMORY_ERROR and publishes nothing, but an embedder that
- * changes state outside the transaction as it records (sw-hlist's writer-only
- * pprev) would derive those changes from a mixed view.  Such an embedder must
- * gate on urcu_txn_sw_append_is_infallible(), or check every record() return.
+ * After an OOM the pair no longer reads its own writes: the failed record()
+ * appended nothing, so a later load() of that slot returns the committed value.
+ * commit() then publishes nothing, but an embedder that changes state outside
+ * the transaction as it records must not derive it from such a load: see
+ * urcu_txn_sw_append_is_infallible().
  */
 
 /*
@@ -1062,15 +1006,13 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
  * 63 logical bits into one word, so distinct bit indexes are not distinct
  * slots.
  *
- * The lookup costs O(nr) per recorded edge, so O(n^2) for n edges.  Declaring
- * disjoint was measured as worth about nothing up to 8 edges, 1.6 times at 32
- * and 18 times at 800.  urcu_txn_sw_bitmap_set_range_prepare() alone in its
- * transaction is the typical case: it touches each word once.
+ * This skips a lookup among the records so far on every load and record, which
+ * pays off only past a few dozen edges.  urcu_txn_sw_bitmap_set_range_prepare()
+ * alone in its transaction is the typical case: it touches each word once.
  *
- * If a store does hit a recorded slot, two proxies are installed on it and
- * both new values are settled in record order: the earlier edit is lost and
- * commit() still reports OK.  A debug build traps the duplicate at install.
- * -DURCU_TXN_SW_DEBUG_DISJOINT traps earlier, at the offending record or load.
+ * Recording a slot twice on such a handle breaks the rule of
+ * urcu_txn_sw_record(), with the consequence stated there.
+ * -DURCU_TXN_SW_DEBUG_DISJOINT traps it at the offending record or load.
  *
  * Call after init and before the first record().
  */
@@ -1188,7 +1130,7 @@ bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
-		return false;		/* sticky: an earlier alloc failed */
+		return false;		/* sticky */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	urcu_txn_sw__excl_owner(t, "record_chain()");
 	if (t->disjoint) {		/* no slot repeats: skip the lookup */
@@ -1205,7 +1147,7 @@ bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
  * initialized again before it is reused.
  *
  * A handle ends in commit() or in cancel(): one that is merely dropped leaks
- * its descriptor.  A handle in the sticky OOM state may be cancelled as well.
+ * its descriptor.  A handle in the OOM state may be cancelled as well.
  *
  * Only the records are dropped.  What an embedder changed outside the
  * transaction as it recorded is not rolled back, so such a transaction must be
