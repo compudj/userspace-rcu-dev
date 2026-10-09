@@ -1103,11 +1103,9 @@ void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 
 /*
  * The read-your-own-writes half of urcu_txn_sw_record_chain(): chain onto this
- * transaction's record for @slot, or append one if it has none.  Out of line
- * for the same reason as urcu_txn_sw__grow(): a handle declared disjoint never
- * reaches it.
+ * transaction's record for @slot, or append one if it has none.
  */
-static __attribute__((noinline, unused))
+static inline
 bool urcu_txn_sw__chain(struct urcu_txn_sw_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
