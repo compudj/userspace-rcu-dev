@@ -770,8 +770,18 @@ void urcu_txn_sw__release_desc(struct urcu_txn_sw_txn *t)
 {
 	if (!t->records_inline)
 		urcu_txn_sw__desc_free(t->desc);
+}
+
+/*
+ * Mark the handle consumed, by commit() or by cancel(): it no longer owns a
+ * descriptor, and must be initialized again before it is reused.
+ */
+static inline
+void urcu_txn_sw__done(struct urcu_txn_sw_txn *t)
+{
 	t->desc = NULL;
 	t->records = NULL;
+	t->state = URCU_TXN_SW_DONE;
 }
 
 /*
@@ -848,6 +858,18 @@ void urcu_txn_sw__record_install(struct urcu_txn_sw_group *group,
 	/* Store-release of slot pairs with rcu_dereference(). */
 	uatomic_store(r->slot,
 			(void *) ((uintptr_t) r | r->tag), CMM_RELEASE);
+}
+
+/*
+ * Settle record @r's slot: store its new target there, over the proxy.  For a
+ * transaction of one record, which installs no proxy, this store is the whole
+ * commit.
+ */
+static inline
+void urcu_txn_sw__record_settle(struct urcu_txn_sw_record *r)
+{
+	/* Store-release of slot pairs with rcu_dereference(). */
+	uatomic_store(r->slot, r->ptr[1], CMM_RELEASE);
 }
 
 /*
@@ -1186,7 +1208,22 @@ void urcu_txn_sw_cancel(struct urcu_txn_sw_txn *t)
 	/* A consumed handle must be initialized again before reuse. */
 	urcu_posix_assert(t->state != URCU_TXN_SW_DONE);
 	urcu_txn_sw__release_desc(t);	/* no proxy: free now */
-	t->state = URCU_TXN_SW_DONE;
+	urcu_txn_sw__done(t);
+}
+
+/*
+ * Records must target pairwise-distinct slots: see urcu_txn_sw_record().  They
+ * are in record order, hence the pairwise scan.  A debug build only.
+ */
+static inline
+void urcu_txn_sw__assert_distinct_slots(
+		const struct urcu_txn_sw_record *records, unsigned int nr)
+{
+	unsigned int i, j;
+
+	for (i = 1; i < nr; i++)
+		for (j = 0; j < i; j++)
+			urcu_assert_debug(records[i].slot != records[j].slot);
 }
 
 /*
@@ -1225,13 +1262,14 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 			void (*)(struct rcu_head *)),
 		const struct rcu_flavor_struct *flavor)
 {
-	struct urcu_txn_sw_desc *desc;
-	unsigned int i;
 	/*
 	 * Read once: the install and settle stores go through record->slot, so
-	 * the compiler must assume each may change it.
+	 * the compiler must assume each may change the handle.
 	 */
+	struct urcu_txn_sw_record *const records = t->records;
+	struct urcu_txn_sw_desc *const desc = t->desc;
 	const unsigned int nr = t->nr;
+	unsigned int i;
 
 	urcu_txn_sw__excl_owner(t, "commit()");
 	/* A consumed handle must be initialized again before reuse. */
@@ -1240,62 +1278,37 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 		urcu_txn_sw_cancel(t);
 		return URCU_TXN_STATUS_MEMORY_ERROR;
 	}
+	if (nr == 1) {
+		/* One record: its settle store is the whole commit. */
+		urcu_txn_sw__excl_slot_unchanged(&records[0],
+				"the single-edge commit");
+		urcu_txn_sw__record_settle(&records[0]);
+	}
 	if (nr <= 1) {
-		if (nr == 1) {
-			struct urcu_txn_sw_record *r = &t->records[0];
-
-			urcu_txn_sw__excl_slot_unchanged(r,
-					"the single-edge commit");
-			/*
-			 * Store-release of slot pairs with rcu_dereference().
-			 */
-			uatomic_store(r->slot, r->ptr[1], CMM_RELEASE);
-		}
-		/* nr == 0: empty txn, nothing published. */
 		urcu_txn_sw__release_desc(t);	/* no proxy: free now */
-		t->state = URCU_TXN_SW_DONE;
+		urcu_txn_sw__done(t);
 		return URCU_TXN_STATUS_OK;
 	}
-
 	/*
 	 * The proxies live in the descriptor, which is reclaimed after a grace
-	 * period and so must be heap-owned: a caller-storage handle has none.
+	 * period: a caller-storage handle has none.
 	 */
 	urcu_posix_assert(!t->records_inline);
-	desc = t->desc;
-	/*
-	 * Records must target pairwise-distinct slots: see
-	 * urcu_txn_sw_record().  Debug-only check; the array is in record
-	 * order, hence the pairwise scan.
-	 */
-	for (i = 1; i < nr; i++) {
-		unsigned int j;
-
-		for (j = 0; j < i; j++)
-			urcu_assert_debug(desc->records[i].slot !=
-					desc->records[j].slot);
-	}
+	urcu_txn_sw__assert_distinct_slots(records, nr);
 	/* Install: readers still resolve to old, the selector being 0. */
 	for (i = 0; i < nr; i++) {
-		struct urcu_txn_sw_record *r = &desc->records[i];
-
-		urcu_txn_sw__excl_slot_parkable(r);
-		urcu_txn_sw__record_install(&desc->group, r);
+		urcu_txn_sw__excl_slot_parkable(&records[i]);
+		urcu_txn_sw__record_install(&desc->group, &records[i]);
 	}
 	/* Flip: every proxy resolves to new. */
 	urcu_txn_sw__group_commit(&desc->group);
 	/* Settle. */
 	for (i = 0; i < nr; i++) {
-		struct urcu_txn_sw_record *r = &desc->records[i];
-
-		urcu_txn_sw__excl_slot_ours(r);
-		/* Store-release of slot pairs with rcu_dereference(). */
-		uatomic_store(r->slot, r->ptr[1], CMM_RELEASE);
+		urcu_txn_sw__excl_slot_ours(&records[i]);
+		urcu_txn_sw__record_settle(&records[i]);
 	}
 	urcu_txn_sw__retire(desc, call_rcu_fn, flavor);
-	t->desc = NULL;		/* handle consumed */
-	t->records = NULL;
-	t->state = URCU_TXN_SW_DONE;
+	urcu_txn_sw__done(t);
 	return URCU_TXN_STATUS_OK;
 }
 
