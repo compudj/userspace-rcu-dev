@@ -123,25 +123,26 @@ int main(void)
 	}
 
 	/*
-	 * 3. Explicit install + single edge: once install() has installed the
-	 * proxy a reader may already hold it, so commit MUST flip the group
-	 * (the fast path is unavailable) and defer reclaim through call_rcu.
+	 * 3. The three steps of a commit, by hand on the flip-group primitives:
+	 * an installed proxy resolves to old, the flip makes it resolve to new,
+	 * and the settle leaves the new target in the slot.
 	 */
 	{
 		void *slot = (void *) 0x100;
-		struct urcu_txn_sw_txn _t, *t = &_t;
-		enum urcu_txn_status st;
+		struct urcu_txn_sw_group group;
+		struct urcu_txn_sw_record rec;
 
-		urcu_txn_sw_init(t);
-		urcu_txn_sw_reserve(t, 4);
-		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200, TEST_TAG);
-		urcu_txn_sw_install(t);
+		urcu_txn_sw_group_init(&group);
+		urcu_txn_sw_record_set(&rec, &slot, (void *) 0x100,
+				(void *) 0x200, TEST_TAG);
+		urcu_txn_sw_record_install(&group, &rec);
 		ok(is_proxy(slot) && resolve(slot) == (void *) 0x100,
-			"explicit install leaves a proxy resolving to old");
-		st = urcu_txn_sw_commit(t);
-		ok(st == URCU_TXN_STATUS_OK,
-			"explicitly-installed single edge commits OK");
-		ok(slot == (void *) 0x200, "explicitly-installed slot settles to new");
+			"an installed proxy resolves to old");
+		urcu_txn_sw_group_commit(&group);
+		ok(is_proxy(slot) && resolve(slot) == (void *) 0x200,
+			"the flip makes the installed proxy resolve to new");
+		uatomic_store(rec.slot, rec.ptr[1], CMM_RELEASE);
+		ok(slot == (void *) 0x200, "the settled slot holds new directly");
 	}
 
 	/*

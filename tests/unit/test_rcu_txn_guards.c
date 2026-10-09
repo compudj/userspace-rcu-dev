@@ -28,17 +28,13 @@
  *      for one of its parked records and a resolver fabricates a record pointer
  *      out of it.  Caught at the store that introduces it -- on the new value
  *      and on the old -- rather than as a wild dereference in a later resolve.
- *   4. sw install of a CALLER-storage (init_inline) handle carrying records.
- *      Such a handle owns no descriptor to hang a group off, and install's "no
- *      record" branch would repoint its record array at a fresh descriptor --
- *      discarding the caller's records -- then install proxies through that
- *      descriptor's UNINITIALIZED slot pointers: wild stores to garbage
- *      addresses.
- *   5. sw reserve() after install().  install() is a documented public entry,
- *      so a white-box caller can reach reserve() with proxies already
- *      installed; the grow path would then free the descriptor those live slots
- *      still point into -- a reader use-after-free.  The record set is frozen
- *      once installed.
+ *   4. sw: a second record on a CALLER-storage (init_inline) handle.  Two
+ *      records make commit() install proxies, and such a handle owns no
+ *      descriptor to hold them across a grace period: readers would resolve
+ *      through caller storage that is gone once commit() returns.  Caught at
+ *      the record that breaks the contract.
+ *   5. sw reserve() on a handle that commit() consumed.  The handle no longer
+ *      owns a record array, and must be initialized again before it is reused.
  *
  * Cases 1-3 are urcu_assert_debug (DEBUG_RCU); 4-5 are urcu_posix_assert
  * (NDEBUG).  This test is compiled with -DDEBUG_RCU (see Makefile.am) so the
@@ -96,8 +92,8 @@ static void *g_a, *g_b;
  * A checkpoint the child sets at a point it must NOT reach.  Shared with the
  * parent (the child dies, so it cannot report anything else), which is what lets
  * a case assert WHERE the guard fired, not merely THAT the process died: see
- * body_sw_inline_install(), whose whole point is that the abort must precede the
- * wild stores rather than follow them.
+ * body_sw_inline_two_records(), where the abort must come from the offending
+ * record() and not from the commit() after it.
  */
 static int *g_reached;
 
@@ -169,39 +165,37 @@ static void body_tagged_old(void)
 	urcu_txn_end(&txn);
 }
 
-/* 4. sw: an inline (caller-storage) handle carrying records reaches install. */
-static void body_sw_inline_install(void)
+/* 4. sw: an inline (caller-storage) handle is given a second record. */
+static void body_sw_inline_two_records(void)
 {
 	struct urcu_txn_sw_record buf[4] __attribute__((aligned(16)));
 	struct urcu_txn_sw_txn t;
 
 	urcu_txn_sw_init_inline(&t, buf, 4);
 	(void) urcu_txn_sw_record(&t, &g_a, NULL, V0, URCU_TXN_TAG);
+	/* nr >= 2 on inline storage: illegal */
 	(void) urcu_txn_sw_record(&t, &g_b, NULL, V1, URCU_TXN_TAG);
-	urcu_txn_sw_install(&t);		/* nr >= 2 on inline storage: illegal */
 	/*
-	 * Unreachable: install() must REJECT the handle, not fix it up.
-	 * Reaching here means it ran the install loop -- i.e. it already
-	 * store-released proxies through the fresh descriptor's UNINITIALIZED
-	 * slot pointers.  The checkpoint is what pins "aborts BEFORE
-	 * installing"; SIGABRT alone would not (commit() has a late
-	 * records_inline assert that fires after the damage).
+	 * Unreachable: the second record() must REJECT the handle.  Two
+	 * records install proxies, and proxies into caller storage do not
+	 * outlive the commit.  commit() asserts the same contract, so SIGABRT
+	 * alone would not tell the two apart; the checkpoint pins the abort
+	 * to the call that broke the contract.
 	 */
 	*g_reached = 1;
 	(void) urcu_txn_sw_commit(&t);
 }
 
-/* 5. sw: reserve() after install() -- would free a descriptor with installed proxies. */
-static void body_sw_reserve_after_install(void)
+/* 5. sw: reserve() on a handle that commit() consumed. */
+static void body_sw_reserve_after_commit(void)
 {
 	struct urcu_txn_sw_txn t;
 
 	urcu_txn_sw_init(&t);
 	(void) urcu_txn_sw_record(&t, &g_a, NULL, V0, URCU_TXN_TAG);
 	(void) urcu_txn_sw_record(&t, &g_b, NULL, V1, URCU_TXN_TAG);
-	urcu_txn_sw_install(&t);		/* proxies now installed in g_a, g_b */
-	(void) urcu_txn_sw_reserve(&t, 64);	/* the record set is frozen: illegal */
 	(void) urcu_txn_sw_commit(&t);
+	(void) urcu_txn_sw_reserve(&t, 64);	/* not initialized again: illegal */
 }
 
 /* Control: a well-formed disjoint transaction must NOT trip any guard. */
@@ -241,14 +235,14 @@ int main(void)
 	ok(aborts_in_child(body_tagged_old),
 		"a stored OLD value carrying the slot's tag bits aborts at the store");
 	/*
-	 * Note the second half: it must abort BEFORE the install loop.  A late
-	 * assert (as the pre-fix engine had, in commit()) also kills the process,
-	 * so SIGABRT alone would pass while memory was already scribbled on.
+	 * Note the second half: the record() must be what aborts.  commit()
+	 * asserts the same contract and also kills the process, so SIGABRT
+	 * alone would pass with the trap at the wrong call.
 	 */
-	ok(aborts_in_child(body_sw_inline_install) && !*g_reached,
-		"sw: installing an inline-storage handle that holds records aborts BEFORE installing anything");
-	ok(aborts_in_child(body_sw_reserve_after_install),
-		"sw: reserve() after install() aborts (would free a descriptor with installed proxies)");
+	ok(aborts_in_child(body_sw_inline_two_records) && !*g_reached,
+		"sw: a second record on an inline-storage handle aborts at the record, before commit");
+	ok(aborts_in_child(body_sw_reserve_after_commit),
+		"sw: reserve() on a handle that commit() consumed aborts");
 	ok(!aborts_in_child(body_control),
 		"control: a well-formed disjoint commit trips no guard");
 

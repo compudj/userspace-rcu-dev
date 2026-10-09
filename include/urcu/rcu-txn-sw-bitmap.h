@@ -66,7 +66,7 @@
  * slot.  urcu_txn_sw_record() appends blindly and requires pairwise-distinct
  * slots, so recording each flip with it would install two proxies on one word
  * and settle them in record order, silently losing the earlier flip
- * (install()'s debug scan catches it; an NDEBUG build does not).  For a bitmap
+ * (commit()'s debug scan catches it; an NDEBUG build does not).  For a bitmap
  * that collision is the COMMON case, not a corner, so "compose only
  * slot-disjoint edits" -- the stance of <urcu/rcu-txn-sw-list.h> and
  * <urcu/rcu-txn-sw-hlist.h> -- would be close to unusable here.

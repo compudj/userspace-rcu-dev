@@ -54,6 +54,8 @@
  *      direct new target (idempotent for readers, since the proxy already
  *      resolves to new), then call_rcu() the transaction descriptor.
  *
+ * urcu_txn_sw_commit() performs steps 2 to 4.
+ *
  * Ordering / monotonicity
  * ------------------------
  * The selector is written exactly once (0 -> 1) and never back, so a
@@ -164,7 +166,6 @@ extern "C" {
 
 enum urcu_txn_sw_state {
 	URCU_TXN_SW_PREPARE = 0,
-	URCU_TXN_SW_INSTALLED,	/* internal: set once proxies are installed */
 	URCU_TXN_SW_OOM,		/* sticky: commit -> MEMORY_ERROR */
 	/*
 	 * Terminal: commit() consumed the handle.  Reusing it without
@@ -387,7 +388,7 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
  * validator claims the two things that do exist:
  *
  *   - the handle.  Its owner is the thread that initialized it, and
- *     reserve / record / install / commit must all run on that thread.
+ *     reserve / record / load / commit must all run on that thread.
  *     Catches a transaction handed between threads mid-flight.
  *
  *   - the slot, which is what two racing writers actually share, and so is
@@ -554,7 +555,7 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
  * no proxy and owes no grace period, so nothing references the handle or @buf
  * once commit() returns.  A transaction that installs proxies (nr >= 2) must
  * use urcu_txn_sw_init(): its records have to outlive a grace period.  record()
- * and install() both assert it.
+ * and commit() both assert it.
  */
 static inline
 void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
@@ -705,7 +706,7 @@ bool urcu_txn_sw__resize(struct urcu_txn_sw_txn *t, unsigned int cap)
  * Reserving less than the transaction goes on to record is correct, and costs
  * the grow that a reserve exists to avoid.
  *
- * Call after init and before install.  A handle that already buffers records
+ * Call after init and before commit.  A handle that already buffers records
  * grows to fit @cap.
  *
  * Returns false on OOM.  The failure is sticky, so the caller may ignore the
@@ -718,10 +719,7 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 {
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;		/* sticky: an earlier alloc failed */
-	/*
-	 * PREPARE only, like record().  With proxies installed, the resize
-	 * below would free the descriptor that live slots point into.
-	 */
+	/* PREPARE only, like record(): commit() consumed the handle. */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	urcu_txn_sw__excl_owner(t, "reserve()");
 	if (t->records && cap <= t->cap)
@@ -792,12 +790,13 @@ void urcu_txn_sw_record_set(struct urcu_txn_sw_record *r,
 }
 
 /*
- * Install record @r's tagged proxy into its slot.  Readers resolve it to old
- * until the commit.  The parked value is @r's address OR'd with the record's
- * tag; records are 16-byte aligned, so the address has its low 4 bits free.
+ * Install record @r's tagged proxy into its slot, bound to flip group @group.
+ * Readers resolve it to old until the group commits.  The parked value is @r's
+ * address OR'd with the record's tag; records are 16-byte aligned, so the
+ * address has its low 4 bits free.
  */
 static inline
-void urcu_txn_sw_record_install(struct urcu_txn_sw_txn *t,
+void urcu_txn_sw_record_install(struct urcu_txn_sw_group *group,
 		struct urcu_txn_sw_record *r)
 {
 	/*
@@ -809,7 +808,7 @@ void urcu_txn_sw_record_install(struct urcu_txn_sw_txn *t,
 	 */
 	urcu_assert_debug(r->tag != 0 && r->tag <= 0xf);
 	urcu_assert_debug(!((uintptr_t) r & r->tag));
-	r->group = &t->desc->group;	/* bind to the transaction's group */
+	r->group = group;
 	/* Store-release of slot pairs with rcu_dereference(). */
 	uatomic_store(r->slot,
 			(void *) ((uintptr_t) r | r->tag), CMM_RELEASE);
@@ -1141,83 +1140,25 @@ bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
 }
 
 /*
- * PREPARE -> INSTALLED: install every record's proxy into its slot.  Readers
- * still resolve to old, the selector being 0.  commit() calls this when
- * nr >= 2; a caller that needs to work between the install and the flip may
- * call it directly.  On OOM the handle becomes sticky and nothing is installed.
- */
-static inline
-void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
-{
-	unsigned int i;
-	/*
-	 * @nr does not change from here on.  Read it once: the installs store
-	 * through record->slot, a void ** the compiler cannot prove distinct
-	 * from the handle, so it would reload the field on every iteration.
-	 */
-	const unsigned int nr = t->nr;
-
-	urcu_txn_sw__excl_owner(t, "install()");
-	/*
-	 * A caller-storage handle must never install proxies: its records do
-	 * not outlive the call, and it has no descriptor to hold their group.
-	 * Without this check, the branch below would give it one and install
-	 * proxies through that descriptor's uninitialized slot pointers.
-	 */
-	urcu_posix_assert(!t->records_inline);
-	if (caa_unlikely(!t->desc)) {	/* nothing recorded or reserved */
-		/*
-		 * A heap handle has no descriptor only if nothing was recorded
-		 * or reserved.
-		 */
-		urcu_posix_assert(!nr);
-		t->desc = urcu_txn_sw__desc_alloc(URCU_TXN_SW_CAP);
-		if (caa_unlikely(!t->desc)) {
-			t->state = URCU_TXN_SW_OOM;	/* sticky */
-			return;
-		}
-		t->records = t->desc->records;
-		t->cap = t->desc->cap;
-	}
-	/*
-	 * Records must target pairwise-distinct slots: see
-	 * urcu_txn_sw_record().  Debug-only check; the array is in record
-	 * order, hence the pairwise scan.
-	 */
-	for (i = 1; i < nr; i++) {
-		unsigned int j;
-
-		for (j = 0; j < i; j++)
-			urcu_assert_debug(t->records[i].slot !=
-					t->records[j].slot);
-	}
-	t->state = URCU_TXN_SW_INSTALLED;
-	for (i = 0; i < nr; i++) {
-		urcu_txn_sw__excl_slot_parkable(&t->records[i]);
-		urcu_txn_sw_record_install(t, &t->records[i]);
-	}
-}
-
-/*
- * Commit: flip the group, so that every proxy resolves to new atomically, then
- * settle each slot to its new value.  commit() owns reclaim and consumes the
- * handle, which must be initialized again before it is reused.
+ * Commit: install every record's proxy, flip the group so that every proxy
+ * resolves to new atomically, then settle each slot to its new value.  commit()
+ * owns reclaim and consumes the handle, which must be initialized again before
+ * it is reused.
  *
  * Returns MEMORY_ERROR if an allocation failed (sticky), otherwise OK.  A
  * single writer has no contention, so ABORT is never returned.
  *
- * With one record and no explicit urcu_txn_sw_install(), a lone store-release
- * to the slot is already an atomic commit.  No proxy is installed, so no reader
- * can hold one: no grace period is owed and the descriptor is freed at once.
- * The common one-pointer publish thus needs no install, settle or deferred
- * reclaim.  An empty transaction publishes nothing.
+ * With one record, a lone store-release to the slot is already an atomic
+ * commit.  No proxy is installed, so no reader can hold one: no grace period is
+ * owed and the descriptor is freed at once.  The common one-pointer publish
+ * thus needs no install, settle or deferred reclaim.  An empty transaction
+ * publishes nothing.
  *
- * With two or more records, or after an explicit install, commit() installs the
- * proxies if that is not done yet, flips, settles, then defers the descriptor's
- * reclaim: a reader may still hold a proxy.
+ * With two or more records, the descriptor's reclaim is deferred: a reader may
+ * still hold a proxy.
  *
- * @call_rcu_fn defers that reclaim, and is called only when proxies were
- * installed.  It has the signature of a flavor's call_rcu(), so an embedder
+ * @call_rcu_fn defers that reclaim, and is called only with two or more
+ * records.  It has the signature of a flavor's call_rcu(), so an embedder
  * that selects its flavor at runtime passes flavor->update_call_rcu, and this
  * header binds no flavor at compile time.  An embedder that knows no reader can
  * hold a proxy (single-threaded, or exclusive) may pass a function that calls
@@ -1237,8 +1178,8 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	struct urcu_txn_sw_desc *desc;
 	unsigned int i;
 	/*
-	 * Read once: the settle stores go through record->slot, so the compiler
-	 * must assume each may change it.
+	 * Read once: the install and settle stores go through record->slot, so
+	 * the compiler must assume each may change it.
 	 */
 	const unsigned int nr = t->nr;
 
@@ -1250,39 +1191,50 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 		t->state = URCU_TXN_SW_DONE;
 		return URCU_TXN_STATUS_MEMORY_ERROR;
 	}
-	if (t->state == URCU_TXN_SW_PREPARE) {
-		if (nr <= 1) {
-			if (nr == 1) {
-				struct urcu_txn_sw_record *r = &t->records[0];
+	if (nr <= 1) {
+		if (nr == 1) {
+			struct urcu_txn_sw_record *r = &t->records[0];
 
-				urcu_txn_sw__excl_slot_unchanged(r);
-				/*
-				 * Store-release of slot pairs with
-				 * rcu_dereference().
-				 */
-				uatomic_store(r->slot, r->ptr[1],
-						CMM_RELEASE);
-			}
-			/* nr == 0: empty txn, nothing published. */
-			urcu_txn_sw__free_records(t);	/* no proxy: free now */
-			t->state = URCU_TXN_SW_DONE;
-			return URCU_TXN_STATUS_OK;
+			urcu_txn_sw__excl_slot_unchanged(r);
+			/*
+			 * Store-release of slot pairs with rcu_dereference().
+			 */
+			uatomic_store(r->slot, r->ptr[1], CMM_RELEASE);
 		}
-		urcu_txn_sw_install(t);	/* installs the proxies */
-		if (caa_unlikely(t->state == URCU_TXN_SW_OOM)) {
-			urcu_txn_sw__free_records(t);
-			t->state = URCU_TXN_SW_DONE;
-			return URCU_TXN_STATUS_MEMORY_ERROR;
-		}
+		/* nr == 0: empty txn, nothing published. */
+		urcu_txn_sw__free_records(t);	/* no proxy: free now */
+		t->state = URCU_TXN_SW_DONE;
+		return URCU_TXN_STATUS_OK;
 	}
 
 	/*
-	 * INSTALLED: the proxies live in the descriptor, which is reclaimed
-	 * after a grace period and so must be heap-owned.
+	 * The proxies live in the descriptor, which is reclaimed after a grace
+	 * period and so must be heap-owned: a caller-storage handle has none.
 	 */
 	urcu_posix_assert(!t->records_inline);
 	desc = t->desc;
+	/*
+	 * Records must target pairwise-distinct slots: see
+	 * urcu_txn_sw_record().  Debug-only check; the array is in record
+	 * order, hence the pairwise scan.
+	 */
+	for (i = 1; i < nr; i++) {
+		unsigned int j;
+
+		for (j = 0; j < i; j++)
+			urcu_assert_debug(desc->records[i].slot !=
+					desc->records[j].slot);
+	}
+	/* Install: readers still resolve to old, the selector being 0. */
+	for (i = 0; i < nr; i++) {
+		struct urcu_txn_sw_record *r = &desc->records[i];
+
+		urcu_txn_sw__excl_slot_parkable(r);
+		urcu_txn_sw_record_install(&desc->group, r);
+	}
+	/* Flip: every proxy resolves to new. */
 	urcu_txn_sw_group_commit(&desc->group);
+	/* Settle. */
 	for (i = 0; i < nr; i++) {
 		struct urcu_txn_sw_record *r = &desc->records[i];
 

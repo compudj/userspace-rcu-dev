@@ -21,9 +21,10 @@
  *
  * Each violation is provoked in a forked child and the parent asserts the child
  * died by SIGABRT; the child drops its core limit so a passing run leaves no
- * cores.  The writer/writer races are simulated DETERMINISTICALLY, driving two
- * transactions through the white-box install() entry in an interleaving a real
- * race would produce -- so the test is reproducible rather than timing-dependent.
+ * cores.  The writer/writer races are simulated DETERMINISTICALLY: the other
+ * writer's proxy is parked in the slot by hand, with the flip-group primitives,
+ * as a real race would leave it -- so the test is reproducible rather than
+ * timing-dependent.
  * A control case checks a well-formed single-writer transaction is untouched.
  *
  * QSBR flavor (the commit defers reclaim through call_rcu).
@@ -113,25 +114,36 @@ static void body_cross_thread(void)
 }
 
 /*
+ * Park @slot with a proxy by hand, as a writer stopped between its install and
+ * its flip leaves it.  commit() runs install, flip and settle back to back, so
+ * one thread cannot stop a transaction there.
+ */
+static struct urcu_txn_sw_group g_parked_group;
+static struct urcu_txn_sw_record g_parked[2];
+
+static void park_by_hand(unsigned int i, void **slot, void *old_ptr,
+		void *new_ptr)
+{
+	urcu_txn_sw_group_init(&g_parked_group);
+	urcu_txn_sw_record_set(&g_parked[i], slot, old_ptr, new_ptr, TAG);
+	urcu_txn_sw_record_install(&g_parked_group, &g_parked[i]);
+}
+
+/*
  * 2. A second writer RECORDS a slot the first has already parked.  This is the
  *    interleaving where the violation is visible: writer 1 is between install
- *    and commit, so its proxy is sitting in the slot.
+ *    and flip, so its proxy is sitting in the slot.
  */
 static void body_record_over_parked(void)
 {
-	struct urcu_txn_sw_txn t1, t2;
+	struct urcu_txn_sw_txn t;
 
 	g_a = V0;
-	g_b = V0;
-	urcu_txn_sw_init(&t1);
-	(void) urcu_txn_sw_record(&t1, &g_a, V0, V1, TAG);
-	(void) urcu_txn_sw_record(&t1, &g_b, V0, V1, TAG);
-	urcu_txn_sw_install(&t1);		/* g_a, g_b now hold t1's proxies */
+	park_by_hand(0, &g_a, V0, V1);		/* g_a holds writer 1's proxy */
 
-	urcu_txn_sw_init(&t2);			/* "the other writer" */
-	(void) urcu_txn_sw_record(&t2, &g_a, V1, V2, TAG);	/* g_a is parked! */
-	(void) urcu_txn_sw_commit(&t2);
-	(void) urcu_txn_sw_commit(&t1);
+	urcu_txn_sw_init(&t);			/* "the other writer" */
+	(void) urcu_txn_sw_record(&t, &g_a, V1, V2, TAG);	/* g_a is parked! */
+	(void) urcu_txn_sw_commit(&t);
 }
 
 /*
@@ -141,37 +153,31 @@ static void body_record_over_parked(void)
  */
 static void body_park_over_parked(void)
 {
-	struct urcu_txn_sw_txn t1, t2;
-
-	g_a = V0;
-	g_b = V0;
-	urcu_txn_sw_init(&t2);			/* records first, installs last */
-	(void) urcu_txn_sw_record(&t2, &g_a, V0, V2, TAG);
-	(void) urcu_txn_sw_record(&t2, &g_b, V0, V2, TAG);
-
-	urcu_txn_sw_init(&t1);
-	(void) urcu_txn_sw_record(&t1, &g_a, V0, V1, TAG);
-	(void) urcu_txn_sw_record(&t1, &g_b, V0, V1, TAG);
-	urcu_txn_sw_install(&t1);		/* t1 parks both slots */
-
-	urcu_txn_sw_install(&t2);		/* would clobber t1's proxies */
-	(void) urcu_txn_sw_commit(&t2);
-	(void) urcu_txn_sw_commit(&t1);
-}
-
-/* 4. Our proxy is gone by the time we settle: someone overwrote it. */
-static void body_settle_clobbered(void)
-{
 	struct urcu_txn_sw_txn t;
 
 	g_a = V0;
 	g_b = V0;
-	urcu_txn_sw_init(&t);
-	(void) urcu_txn_sw_record(&t, &g_a, V0, V1, TAG);
-	(void) urcu_txn_sw_record(&t, &g_b, V0, V1, TAG);
-	urcu_txn_sw_install(&t);
-	uatomic_store(&g_b, V2, CMM_RELEASE);	/* a peer overwrites our proxy */
-	(void) urcu_txn_sw_commit(&t);		/* settle finds it gone */
+	urcu_txn_sw_init(&t);			/* records first, installs last */
+	(void) urcu_txn_sw_record(&t, &g_a, V0, V2, TAG);
+	(void) urcu_txn_sw_record(&t, &g_b, V0, V2, TAG);
+
+	park_by_hand(0, &g_a, V0, V1);		/* writer 1 parks both slots */
+	park_by_hand(1, &g_b, V0, V1);
+
+	(void) urcu_txn_sw_commit(&t);		/* would clobber its proxies */
+}
+
+/*
+ * 4. Our proxy is gone by the time we settle: someone overwrote it.  Nothing
+ *    can be staged between commit()'s own install and settle from one thread,
+ *    so this runs the settle-time check itself on a proxy parked by hand.
+ */
+static void body_settle_clobbered(void)
+{
+	g_a = V0;
+	park_by_hand(0, &g_a, V0, V1);		/* stands for our install */
+	uatomic_store(&g_a, V2, CMM_RELEASE);	/* a peer overwrites our proxy */
+	urcu_txn_sw__excl_slot_ours(&g_parked[0]);	/* settle finds it gone */
 }
 
 /*
@@ -192,7 +198,7 @@ static void body_single_edge_changed(void)
 /*
  * 6. The MULTI-edge install has the same witness.  A peer that ran a COMPLETE
  *    transaction on the slot -- install, flip, settle -- between our record()
- *    and our install() leaves a PLAIN value behind, so a presence-only "is
+ *    and our commit() leaves a PLAIN value behind, so a presence-only "is
  *    there a proxy here?" check sees a free slot and waves us through.  We
  *    would then install a proxy whose old is stale (readers in the install
  *    window watch the committed value go backwards) and settle our new over the
@@ -209,8 +215,7 @@ static void body_park_over_settled(void)
 	(void) urcu_txn_sw_record(&t, &g_a, V0, V1, TAG);
 	(void) urcu_txn_sw_record(&t, &g_b, V0, V1, TAG);
 	uatomic_store(&g_b, V2, CMM_RELEASE);	/* a peer committed V0 -> V2 */
-	urcu_txn_sw_install(&t);		/* our install would lose it */
-	(void) urcu_txn_sw_commit(&t);
+	(void) urcu_txn_sw_commit(&t);		/* our install would lose it */
 }
 
 /* Control: a well-formed single-writer transaction trips nothing. */

@@ -18,7 +18,7 @@
  *  - SAME-WORD FUSION -- the reason this header exists in this shape.  63 bits
  *    share a word, and the sw engine has no transactional load and no same-slot
  *    reconcile, so a naive port would put two records on one word and settle
- *    them in record order, silently losing the earlier flip (install()'s debug
+ *    them in record order, silently losing the earlier flip (commit()'s debug
  *    scan aborts; an NDEBUG build corrupts quietly).  The _prepare forms fuse
  *    instead; these tests pin both the VALUES and the record count, since a
  *    correct-looking value could still hide a duplicate record.

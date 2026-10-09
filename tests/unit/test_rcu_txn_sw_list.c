@@ -304,22 +304,22 @@ static void test_proxy_phases(void)
 	struct bl_node *a = bl_node_new(1);
 	struct bl_node *b = bl_node_new(2);
 	struct urcu_txn_sw_list_node *A = &a->node, *B = &b->node;
-	struct urcu_txn_sw_txn _txn, *txn = &_txn;
+	struct urcu_txn_sw_group group;
+	struct urcu_txn_sw_record rec[2];
 
 	urcu_txn_sw_list_add_tail_rcu(A, &head);
 	urcu_txn_sw_list_add_tail_rcu(B, &head);
 
 	/*
-	 * Delete A through the transaction by hand, pausing between the
-	 * explicit install and the commit to observe the reader's view of
-	 * each phase -- the same install -> commit -> settle the mutators run.
+	 * Delete A by hand on the flip-group primitives, pausing between the
+	 * steps to observe the reader's view of each -- the same install ->
+	 * commit -> settle that urcu_txn_sw_commit() runs for the mutators.
 	 */
-	urcu_txn_sw_init(txn);
-	if (!urcu_txn_sw_reserve(txn, 2))
-		abort();
-	urcu_txn_sw_record(txn, (void **) &head.node.next, A, B, URCU_TXN_SW_LIST_PROXY_TAG);	/* head->next */
-	urcu_txn_sw_record(txn, (void **) &B->prev, A, &head.node, URCU_TXN_SW_LIST_PROXY_TAG);	/* B->prev */
-	urcu_txn_sw_install(txn);		/* install proxies; selector 0 => old */
+	urcu_txn_sw_group_init(&group);
+	urcu_txn_sw_record_set(&rec[0], (void **) &head.node.next, A, B, URCU_TXN_SW_LIST_PROXY_TAG);	/* head->next */
+	urcu_txn_sw_record_set(&rec[1], (void **) &B->prev, A, &head.node, URCU_TXN_SW_LIST_PROXY_TAG);	/* B->prev */
+	urcu_txn_sw_record_install(&group, &rec[0]);	/* selector 0 => old */
+	urcu_txn_sw_record_install(&group, &rec[1]);
 
 	rcu_read_lock();
 	ok(urcu_txn_sw_list_next_rcu(&head.node) == A,
@@ -328,8 +328,7 @@ static void test_proxy_phases(void)
 		"install: backward resolves to old (A still present)");
 	rcu_read_unlock();
 
-	/* Proxies were installed explicitly, so commit owns reclaim (call_rcu). */
-	(void) urcu_txn_sw_commit(txn);	/* one flip switches both edges */
+	urcu_txn_sw_group_commit(&group);	/* one flip switches both edges */
 
 	rcu_read_lock();
 	ok(urcu_txn_sw_list_next_rcu(&head.node) == B,
@@ -338,6 +337,9 @@ static void test_proxy_phases(void)
 		"commit: backward resolves to new (A removed)");
 	rcu_read_unlock();
 
+	/* No reader holds a proxy here: the records need no grace period. */
+	uatomic_store(rec[0].slot, rec[0].ptr[1], CMM_RELEASE);
+	uatomic_store(rec[1].slot, rec[1].ptr[1], CMM_RELEASE);
 	ok(head.node.next == B && B->prev == &head.node,
 		"settle: slots hold the direct new targets");
 
