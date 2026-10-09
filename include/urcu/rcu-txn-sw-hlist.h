@@ -197,7 +197,7 @@ extern "C" {
 /*
  * Two constraints, and neither was stated.  Non-zero: with tag 0 every plain
  * value satisfies the proxy predicate, so a reader resolves live pointers as
- * proxies.  Within the low 4 bits: the parked value is (&latch->proxy | TAG)
+ * proxies.  Within the low 4 bits: the parked value is (record_address | TAG)
  * and the latch array is only 16-byte aligned, so a wider tag either collides
  * with an address bit -- making the OR a no-op and the untag reconstruct the
  * wrong address -- or is simply not free.
@@ -507,7 +507,7 @@ static inline
 int urcu_txn_sw_hlist_add_head_rcu(struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_head *head)
 {
-	struct urcu_txn_sw_latch buf[1];
+	struct urcu_txn_sw_record buf[1];
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init_inline(&txn, buf, 1);
@@ -519,7 +519,7 @@ static inline
 int urcu_txn_sw_hlist_add_after_rcu(struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_node *pos)
 {
-	struct urcu_txn_sw_latch buf[1];
+	struct urcu_txn_sw_record buf[1];
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init_inline(&txn, buf, 1);
@@ -531,7 +531,7 @@ static inline
 int urcu_txn_sw_hlist_add_before_rcu(struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_node *pos)
 {
-	struct urcu_txn_sw_latch buf[1];
+	struct urcu_txn_sw_record buf[1];
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init_inline(&txn, buf, 1);
@@ -542,7 +542,7 @@ int urcu_txn_sw_hlist_add_before_rcu(struct urcu_txn_sw_hlist_node *newp,
 static inline
 int urcu_txn_sw_hlist_del_rcu(struct urcu_txn_sw_hlist_node *elem)
 {
-	struct urcu_txn_sw_latch buf[1];
+	struct urcu_txn_sw_record buf[1];
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init_inline(&txn, buf, 1);
@@ -554,7 +554,7 @@ static inline
 int urcu_txn_sw_hlist_replace_rcu(struct urcu_txn_sw_hlist_node *old,
 		struct urcu_txn_sw_hlist_node *newp)
 {
-	struct urcu_txn_sw_latch buf[1];
+	struct urcu_txn_sw_record buf[1];
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init_inline(&txn, buf, 1);

@@ -32,7 +32,7 @@
  * The embedding data structure is responsible for:
  *   - tagging a proxy pointer so its readers recognise it (e.g. a spare
  *     low/high bit, or a reserved type code in an already-tagged pointer)
- *     and routing proxy resolution through urcu_txn_sw_proxy_get();
+ *     and routing proxy resolution through urcu_txn_sw_proxy_resolve();
  *   - allocating proxies and the group (often a single backing block with
  *     one rcu_head), with whatever alignment its tagging scheme needs;
  *   - reclaiming them with call_rcu() after they are unpublished (every
@@ -80,7 +80,7 @@
  * This header provides two layers:
  *
  *   1. The low-level flip group / proxy primitive above (urcu_txn_sw_group,
- *      urcu_txn_sw_proxy, urcu_txn_sw_proxy_get, urcu_txn_sw_group_commit).  The
+ *      urcu_txn_sw_record, urcu_txn_sw_proxy_resolve, urcu_txn_sw_group_commit).  The
  *      embedder allocates and reclaims the proxies, tags them, and routes
  *      resolution -- as in the four-step lifecycle described above.
  *
@@ -134,7 +134,7 @@ extern "C" {
  * Shared selector for a flip group.  selector == 0 -> proxies resolve to
  * old_ptr; selector == 1 -> new_ptr.  Written once (0 -> 1) with release
  * semantics by urcu_txn_sw_group_commit(); read with acquire by
- * urcu_txn_sw_proxy_get().
+ * urcu_txn_sw_proxy_resolve().
  */
 struct urcu_txn_sw_group {
 	unsigned long selector;
@@ -142,26 +142,27 @@ struct urcu_txn_sw_group {
 
 /*
  * ptr[0] is the old target, ptr[1] the new one: the selector (0 -> old,
- * 1 -> new) indexes this array directly in urcu_txn_sw_proxy_get().
+ * 1 -> new) indexes this array directly in urcu_txn_sw_proxy_resolve().
  */
-struct urcu_txn_sw_proxy {
+struct urcu_txn_sw_record {
 	void *ptr[2];
 	struct urcu_txn_sw_group *group;
-};
+	void **slot;			/* install / settle target */
+	uintptr_t tag;			/*
+					 * Embedder tag bits OR'd into THIS
+					 * slot's parked proxy value at install
+					 * (see urcu_txn_sw_record).  Per-record
+					 * so heterogeneous slots -- e.g. a
+					 * 0xF-tagged structural edge and a
+					 * bit-0 list edge -- can share one
+					 * transaction.
+					 */
+} __attribute__((aligned(16)));
 
 static inline
 void urcu_txn_sw_group_init(struct urcu_txn_sw_group *group)
 {
 	group->selector = 0;
-}
-
-static inline
-void urcu_txn_sw_proxy_init(struct urcu_txn_sw_proxy *proxy,
-		struct urcu_txn_sw_group *group, void *old_ptr, void *new_ptr)
-{
-	proxy->ptr[0] = old_ptr;
-	proxy->ptr[1] = new_ptr;
-	proxy->group = group;
 }
 
 /*
@@ -194,10 +195,10 @@ int urcu_txn_sw_is_proxy(const void *v, uintptr_t tag)
  * trick, same reason, as the fractal trie's FT_NODE_SUB_TAG.
  */
 static inline
-struct urcu_txn_sw_proxy *urcu_txn_sw_untag(void *v, uintptr_t tag)
+struct urcu_txn_sw_record *urcu_txn_sw_untag(void *v, uintptr_t tag)
 {
 	urcu_assert_debug(urcu_txn_sw_is_proxy(v, tag));
-	return (struct urcu_txn_sw_proxy *) ((uintptr_t) v - tag);
+	return (struct urcu_txn_sw_record *) ((uintptr_t) v - tag);
 }
 
 /*
@@ -214,7 +215,7 @@ struct urcu_txn_sw_proxy *urcu_txn_sw_untag(void *v, uintptr_t tag)
  * dependency rather than a conditional branch.
  */
 static inline
-void *urcu_txn_sw_proxy_get(const struct urcu_txn_sw_proxy *proxy)
+void *urcu_txn_sw_proxy_resolve(const struct urcu_txn_sw_record *proxy)
 {
 	return proxy->ptr[uatomic_load(&proxy->group->selector, CMM_ACQUIRE)];
 }
@@ -230,13 +231,13 @@ void *urcu_txn_sw_resolve(void *v, uintptr_t tag)
 {
 	if (caa_likely(!urcu_txn_sw_is_proxy(v, tag)))
 		return v;
-	return urcu_txn_sw_proxy_get(urcu_txn_sw_untag(v, tag));
+	return urcu_txn_sw_proxy_resolve(urcu_txn_sw_untag(v, tag));
 }
 
 /*
  * Commit the flip: switch every proxy in @group from old to new with a
  * single release store.  Must be called after the new targets are fully
- * built (the release pairs with urcu_txn_sw_proxy_get()'s acquire).
+ * built (the release pairs with urcu_txn_sw_proxy_resolve()'s acquire).
  */
 static inline
 void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
@@ -311,8 +312,8 @@ enum urcu_txn_sw_state {
 	 * Terminal: commit() consumed the handle.  It exists so that reusing a
 	 * consumed handle is a NAMED abort rather than a wild store.  Without
 	 * it, a handle that committed a SINGLE edge kept state == PREPARE with
-	 * nr == 1, cap == 8 and latches == NULL, so a second record() passed
-	 * every guard and wrote through &t->latches[1] off a NULL base -- a raw
+	 * nr == 1, cap == 8 and records == NULL, so a second record() passed
+	 * every guard and wrote through &t->records[1] off a NULL base -- a raw
 	 * SIGSEGV near address 0x30 with nothing to say it was a lifecycle bug.
 	 * (The multi-edge case already trapped, via state == INSTALLED.)
 	 * Clearing nr/cap instead would let stale reuse silently WORK, which
@@ -321,42 +322,28 @@ enum urcu_txn_sw_state {
 	URCU_TXN_SW_DONE,
 };
 
-struct urcu_txn_sw_latch {
-	struct urcu_txn_sw_proxy proxy;	/* ptr[0]=old, ptr[1]=new, group */
-	void **slot;			/* install / settle target */
-	uintptr_t tag;			/*
-					 * Embedder tag bits OR'd into THIS
-					 * slot's parked proxy value at install
-					 * (see urcu_txn_sw_record).  Per-record
-					 * so heterogeneous slots -- e.g. a
-					 * 0xF-tagged structural edge and a
-					 * bit-0 list edge -- can share one
-					 * transaction.
-					 */
-} __attribute__((aligned(16)));
-
 /*
  * Transaction block (HEAP path): the single allocation that carries a committed
  * transaction across its grace period, mirroring the concurrent engine's struct
  * urcu_mcas (one block = header + inline records).  It holds the flip group
- * every parked proxy reads (&block->group, a plain pointer -- never tagged --
+ * every parked proxy reads (&desc->group, a plain pointer -- never tagged --
  * so it needs no alignment of its own), the rcu_head that defers reclaim, and
  * the record array INLINE (the proxies themselves live there).  Allocated on
  * the first record()/reserve() from the shared per-CPU slab and grown in
  * PREPARE (no proxy is live yet, so it may move); ONE free -- record array and
- * all -- reclaims it.  The 32-byte header keeps latches[] 16-byte aligned so
+ * all -- reclaims it.  The 32-byte header keeps records[] 16-byte aligned so
  * each tagged proxy has its low 4 bits free.  @cap is the physical capacity;
  * @slab (stamped at alloc) tells free the block's origin -- self-describing, so
  * a block allocated before the slab constructor ran or while it was disabled is
  * freed on the right path even if the slab enables in between.  The INLINE path
  * (urcu_txn_sw_init_inline, nr <= 1) never allocates a block.
  */
-struct urcu_txn_sw_block {
-	struct urcu_txn_sw_group group;		/* selector; parked proxies read &block->group */
+struct urcu_txn_sw_desc {
+	struct urcu_txn_sw_group group;		/* selector; parked proxies read &desc->group */
 	/*
 	 * POSITION IS LOAD-BEARING, despite this being cold data touched only
 	 * at reclaim.  The slab threads its pending list through this field --
-	 * urcu_slab_init() is handed offsetof(struct urcu_txn_sw_block, rcu_head) as
+	 * urcu_slab_init() is handed offsetof(struct urcu_txn_sw_desc, rcu_head) as
 	 * @link_off -- and overlays a closed batch's metadata just past it, so
 	 * the smallest usable size class is
 	 *
@@ -377,24 +364,24 @@ struct urcu_txn_sw_block {
 						 * Block origin: slab (1) /
 						 * exact malloc (0); the free
 						 * discriminator, doubling as
-						 * the pad that keeps latches[]
+						 * the pad that keeps records[]
 						 * 16-byte aligned.
 						 */
-	struct urcu_txn_sw_latch latches[];	/* INLINE record array (frozen at install) */
+	struct urcu_txn_sw_record records[];	/* INLINE record array (frozen at install) */
 };
 
-urcu_static_assert(!(offsetof(struct urcu_txn_sw_block, latches) % 16),
-		"urcu_txn_sw_block.latches must be 16-byte aligned for proxy tagging",
-		urcu_txn_sw_block_latches_aligned);
+urcu_static_assert(!(offsetof(struct urcu_txn_sw_desc, records) % 16),
+		"urcu_txn_sw_desc.records must be 16-byte aligned for proxy tagging",
+		urcu_txn_sw_desc_records_aligned);
 
 /*
  * Transaction handle: a small on-stack object with no allocation of its own.
- * The record array @latches grows in PREPARE -- safe because no proxy is
+ * The record array @records grows in PREPARE -- safe because no proxy is
  * installed yet (no slot points into it) -- and is frozen once commit() parks
- * proxies.  @block is the lazily-allocated persistent group block (NULL until
- * proxies are parked); commit() hands @latches to it so a held proxy and its
+ * proxies.  @desc is the lazily-allocated persistent group block (NULL until
+ * proxies are parked); commit() hands @records to it so a held proxy and its
  * selector are reclaimed together after a grace period.  The tag room that
- * matters is on the tagged proxies stored in slots; those live in @latches,
+ * matters is on the tagged proxies stored in slots; those live in @records,
  * allocated 16-byte aligned (posix_memalign) so each latch -- hence each tagged
  * proxy -- keeps its low 4 bits free, letting a low-4-bit pointer-tagging
  * embedder (e.g. the fractal trie) route its slots through this engine.
@@ -412,12 +399,12 @@ struct urcu_txn_sw_txn {
 	 * nothing here is touched by another thread -- no false sharing to
 	 * avoid, unlike struct urcu_txn's queue node.
 	 */
-	struct urcu_txn_sw_latch *latches;	/* record array (realloc-grown, or caller-owned if @latches_inline) */
-	struct urcu_txn_sw_block *block;	/* heap path: single allocation (latches inline); NULL until first record */
+	struct urcu_txn_sw_record *records;	/* record array (realloc-grown, or caller-owned if @records_inline) */
+	struct urcu_txn_sw_desc *desc;	/* heap path: single allocation (records inline); NULL until first record */
 	unsigned int nr;
 	unsigned int cap;
 	enum urcu_txn_sw_state state;
-	bool latches_inline;			/* @latches is caller storage: never realloc'd, never freed */
+	bool records_inline;			/* @records is caller storage: never realloc'd, never freed */
 	bool disjoint;				/* write set declared slot-disjoint: skip the RYW find */
 	bool bloom_live;			/* @ryw_bloom is armed (see urcu_txn_sw__find_ryw) */
 #ifdef URCU_TXN_SW_EXCL_VALIDATE
@@ -529,30 +516,30 @@ void urcu_txn_sw__excl_slot_free(void **slot, uintptr_t tag, const char *what)
 			(void *) slot, v, what);
 }
 
-/* At settle, @l's slot must still hold the proxy WE parked in it. */
+/* At settle, @r's slot must still hold the proxy WE parked in it. */
 static inline
-void urcu_txn_sw__excl_slot_ours(struct urcu_txn_sw_latch *l)
+void urcu_txn_sw__excl_slot_ours(struct urcu_txn_sw_record *r)
 {
-	void *want = (void *) ((uintptr_t) &l->proxy | l->tag);
-	void *v = uatomic_load(l->slot, CMM_RELAXED);
+	void *want = (void *) ((uintptr_t) r | r->tag);
+	void *v = uatomic_load(r->slot, CMM_RELAXED);
 
 	if (v != want)
 		urcu_txn_sw__excl_abort("slot=%p holds %p at settle, expected our parked proxy %p: a concurrent writer overwrote it\n",
-			(void *) l->slot, v, want);
+			(void *) r->slot, v, want);
 }
 
 /*
  * The single-edge commit stores blind (no proxy is ever parked), so its only
- * witness is the value: @l's slot must still hold the recorded old.
+ * witness is the value: @r's slot must still hold the recorded old.
  */
 static inline
-void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_latch *l)
+void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_record *r)
 {
-	void *v = uatomic_load(l->slot, CMM_RELAXED);
+	void *v = uatomic_load(r->slot, CMM_RELAXED);
 
-	if (v != l->proxy.ptr[0])
+	if (v != r->ptr[0])
 		urcu_txn_sw__excl_abort("slot=%p holds %p at the single-edge commit, but %p was recorded as its old: a concurrent writer changed it\n",
-			(void *) l->slot, v, l->proxy.ptr[0]);
+			(void *) r->slot, v, r->ptr[0]);
 }
 
 /*
@@ -573,16 +560,16 @@ void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_latch *l)
  * remains invisible shrinks to same-value ABA.
  */
 static inline
-void urcu_txn_sw__excl_slot_parkable(struct urcu_txn_sw_latch *l)
+void urcu_txn_sw__excl_slot_parkable(struct urcu_txn_sw_record *r)
 {
-	void *v = uatomic_load(l->slot, CMM_RELAXED);
+	void *v = uatomic_load(r->slot, CMM_RELAXED);
 
-	if (urcu_txn_sw__is_proxy(v, l->tag))
+	if (urcu_txn_sw__is_proxy(v, r->tag))
 		urcu_txn_sw__excl_abort("slot=%p already holds a parked proxy (%p) at install (park): another writer is mid-transaction on it\n",
-			(void *) l->slot, v);
-	if (v != l->proxy.ptr[0])
+			(void *) r->slot, v);
+	if (v != r->ptr[0])
 		urcu_txn_sw__excl_abort("slot=%p holds %p at install (park), but %p was recorded as its old: a concurrent writer committed over it\n",
-			(void *) l->slot, v, l->proxy.ptr[0]);
+			(void *) r->slot, v, r->ptr[0]);
 }
 
 #else	/* !URCU_TXN_SW_EXCL_VALIDATE */
@@ -590,15 +577,15 @@ void urcu_txn_sw__excl_slot_parkable(struct urcu_txn_sw_latch *l)
 # define urcu_txn_sw__excl_claim(t)			do { } while (0)
 # define urcu_txn_sw__excl_owner(t, what)		do { } while (0)
 # define urcu_txn_sw__excl_slot_free(slot, tag, what)	do { } while (0)
-# define urcu_txn_sw__excl_slot_parkable(l)		do { } while (0)
-# define urcu_txn_sw__excl_slot_ours(l)			do { } while (0)
-# define urcu_txn_sw__excl_slot_unchanged(l)		do { } while (0)
+# define urcu_txn_sw__excl_slot_parkable(r)		do { } while (0)
+# define urcu_txn_sw__excl_slot_ours(r)			do { } while (0)
+# define urcu_txn_sw__excl_slot_unchanged(r)		do { } while (0)
 
 #endif	/* URCU_TXN_SW_EXCL_VALIDATE */
 
 /*
- * The body both public initializers share: they differed only in @latches,
- * @cap and @latches_inline, everything else being the same zeroing.
+ * The body both public initializers share: they differed only in @records,
+ * @cap and @records_inline, everything else being the same zeroing.
  *
  * One clear up to -- and NOT including -- ryw_bloom, which is why that member
  * sits last: the filter is armed lazily, so zeroing its 128 bytes here would
@@ -607,13 +594,13 @@ void urcu_txn_sw__excl_slot_parkable(struct urcu_txn_sw_latch *l)
  */
 static inline
 void urcu_txn_sw__init(struct urcu_txn_sw_txn *t,
-		struct urcu_txn_sw_latch *buf, unsigned int cap)
+		struct urcu_txn_sw_record *buf, unsigned int cap)
 {
 	memset(t, 0, offsetof(struct urcu_txn_sw_txn, ryw_bloom));
 	t->state = URCU_TXN_SW_PREPARE;
-	t->latches = buf;
+	t->records = buf;
 	t->cap = cap;
-	t->latches_inline = (buf != NULL);
+	t->records_inline = (buf != NULL);
 	urcu_txn_sw__excl_claim(t);
 }
 
@@ -632,7 +619,7 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
 /*
  * Initialize a transaction whose record array is CALLER-PROVIDED storage @buf,
  * holding @cap latches (e.g. a 16-byte-aligned on-stack array -- struct
- * urcu_txn_sw_latch is aligned(16), so an array of it is, keeping each tagged
+ * urcu_txn_sw_record is aligned(16), so an array of it is, keeping each tagged
  * proxy's low 4 bits free).  No allocation, so it cannot fail; record() never
  * realloc-grows the inline array (overflow past @cap is an embedder sizing
  * bug), and commit() never frees it.  Use ONLY where the transaction need not
@@ -646,20 +633,20 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
  */
 static inline
 void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
-		struct urcu_txn_sw_latch *buf, unsigned int cap)
+		struct urcu_txn_sw_record *buf, unsigned int cap)
 {
 	urcu_txn_sw__init(t, buf, cap);
 }
 
-#define urcu_txn_sw_blocksize(cap)	\
-	(sizeof(struct urcu_txn_sw_block) + (size_t) (cap) * sizeof(struct urcu_txn_sw_latch))
+#define urcu_txn_sw_descsize(cap)	\
+	(sizeof(struct urcu_txn_sw_desc) + (size_t) (cap) * sizeof(struct urcu_txn_sw_record))
 
 /*
  * The heap-path transaction block is served from the shared per-CPU
  * size-classed slab in <urcu/rcu-txn-slab.h> (same machinery as the concurrent
  * engine).  Latch-count classes {4,8,16,32,64,128} map to byte sizes; a request
  * over the top class is an exact, uncached posix_memalign.  Each block is
- * stamped with its origin (urcu_txn_sw_block.slab), which free consults.
+ * stamped with its origin (urcu_txn_sw_desc.slab), which free consults.
  * URCU_TXN_NO_CACHE disables the slab.
  */
 static const unsigned int urcu_txn_sw_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
@@ -689,25 +676,25 @@ int urcu_txn_sw_slab_class_of(unsigned int req)
 
 /*
  * Allocate a transaction block for >= @cap latches, 16-byte aligned (so the
- * inline latches[] -- hence every tagged proxy -- keeps its low 4 bits free).
+ * inline records[] -- hence every tagged proxy -- keeps its low 4 bits free).
  * From the slab when the request fits a class (its physical cap becomes the
  * class size), else an exact posix_memalign.  The flip group is initialized
  * here.  Returns NULL on OOM.
  */
 static inline
-struct urcu_txn_sw_block *urcu_txn_sw__block_alloc(unsigned int cap)
+struct urcu_txn_sw_desc *urcu_txn_sw__desc_alloc(unsigned int cap)
 {
-	struct urcu_txn_sw_block *blk;
+	struct urcu_txn_sw_desc *desc;
 	int cl;
 
-	blk = NULL;
+	desc = NULL;
 	if (urcu_slab_enabled(&urcu_txn_sw_slab) &&
 			(cl = urcu_txn_sw_slab_class_of(cap)) >= 0) {
-		blk = (struct urcu_txn_sw_block *)
+		desc = (struct urcu_txn_sw_desc *)
 				urcu_slab_alloc(&urcu_txn_sw_slab, cl);
-		if (caa_likely(blk != NULL)) {
+		if (caa_likely(desc != NULL)) {
 			cap = urcu_txn_sw_slab_rc[cl];	/* physical class cap */
-			blk->slab = 1;
+			desc->slab = 1;
 		}
 		/*
 		 * NULL means the arena hit its footprint cap (or OOM): fall
@@ -716,34 +703,34 @@ struct urcu_txn_sw_block *urcu_txn_sw__block_alloc(unsigned int cap)
 		 * permanent; the burst still has to complete.
 		 */
 	}
-	if (!blk) {
+	if (!desc) {
 		void *p;
 
-		if (posix_memalign(&p, 16, urcu_txn_sw_blocksize(cap)))
+		if (posix_memalign(&p, 16, urcu_txn_sw_descsize(cap)))
 			return NULL;
-		blk = (struct urcu_txn_sw_block *) p;
-		blk->slab = 0;
+		desc = (struct urcu_txn_sw_desc *) p;
+		desc->slab = 0;
 	}
-	urcu_txn_sw_group_init(&blk->group);
-	blk->cap = cap;
-	return blk;
+	urcu_txn_sw_group_init(&desc->group);
+	desc->cap = cap;
+	return desc;
 }
 
 /*
- * Free a block on the path that allocated it (the blk->slab stamp): to its
+ * Free a block on the path that allocated it (the desc->slab stamp): to its
  * slab ORIGIN arena, or to malloc for an exact block.  The stamp -- not the
  * slab's current enabled state -- decides, so a block allocated before the
  * slab constructor ran is never misrouted after the slab enables.
  */
 static inline
-void urcu_txn_sw__block_free(struct urcu_txn_sw_block *blk)
+void urcu_txn_sw__desc_free(struct urcu_txn_sw_desc *desc)
 {
-	if (!blk)
+	if (!desc)
 		return;
-	if (blk->slab)
-		urcu_slab_free(blk);
+	if (desc->slab)
+		urcu_slab_free(desc);
 	else
-		free(blk);
+		free(desc);
 }
 
 /*
@@ -773,7 +760,7 @@ void urcu_txn_sw__block_free(struct urcu_txn_sw_block *blk)
 static inline
 bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 {
-	struct urcu_txn_sw_block *blk;
+	struct urcu_txn_sw_desc *desc;
 
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;			/* sticky: an earlier alloc failed */
@@ -787,12 +774,12 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 	 */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	urcu_txn_sw__excl_owner(t, "reserve()");
-	if (t->latches) {
+	if (t->records) {
 		if (cap <= t->cap)
 			return true;		/* already sized (heap block or inline buf) */
-		if (t->latches_inline) {
+		if (t->records_inline) {
 			/* Fixed caller storage: a sizing bug, not an OOM. */
-			urcu_assert_debug(!t->latches_inline);
+			urcu_assert_debug(!t->records_inline);
 			return false;
 		}
 		/*
@@ -800,27 +787,27 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 		 * PREPARE, so the array may move (same rationale as record()'s
 		 * grow); copy the buffered records into a fresh aligned block.
 		 */
-		blk = urcu_txn_sw__block_alloc(cap);
-		if (!blk) {
+		desc = urcu_txn_sw__desc_alloc(cap);
+		if (!desc) {
 			t->state = URCU_TXN_SW_OOM;	/* sticky: commit reports it */
 			return false;
 		}
-		memcpy(blk->latches, t->latches,
-				(size_t) t->nr * sizeof(*blk->latches));
-		urcu_txn_sw__block_free(t->block);
-		t->block = blk;
-		t->latches = blk->latches;
-		t->cap = blk->cap;
+		memcpy(desc->records, t->records,
+				(size_t) t->nr * sizeof(*desc->records));
+		urcu_txn_sw__desc_free(t->desc);
+		t->desc = desc;
+		t->records = desc->records;
+		t->cap = desc->cap;
 		return true;
 	}
-	blk = urcu_txn_sw__block_alloc(cap);
-	if (!blk) {
+	desc = urcu_txn_sw__desc_alloc(cap);
+	if (!desc) {
 		t->state = URCU_TXN_SW_OOM;	/* sticky: commit reports it */
 		return false;
 	}
-	t->block = blk;
-	t->latches = blk->latches;		/* records live inline in the block */
-	t->cap = blk->cap;			/* physical class capacity */
+	t->desc = desc;
+	t->records = desc->records;		/* records live inline in the block */
+	t->cap = desc->cap;			/* physical class capacity */
 	return true;
 }
 
@@ -850,10 +837,10 @@ bool urcu_txn_sw_append_is_infallible(const struct urcu_txn_sw_txn *t)
 static inline
 void urcu_txn_sw__free_records(struct urcu_txn_sw_txn *t)
 {
-	if (!t->latches_inline)
-		urcu_txn_sw__block_free(t->block);	/* one free; inline storage is caller-owned */
-	t->block = NULL;
-	t->latches = NULL;
+	if (!t->records_inline)
+		urcu_txn_sw__desc_free(t->desc);	/* one free; inline storage is caller-owned */
+	t->desc = NULL;
+	t->records = NULL;
 }
 
 /*
@@ -864,29 +851,29 @@ void urcu_txn_sw__free_records(struct urcu_txn_sw_txn *t)
 static inline
 void urcu_txn_sw_free_rcu(struct rcu_head *head)
 {
-	struct urcu_txn_sw_block *blk = caa_container_of(head,
-			struct urcu_txn_sw_block, rcu_head);
+	struct urcu_txn_sw_desc *desc = caa_container_of(head,
+			struct urcu_txn_sw_desc, rcu_head);
 
-	urcu_txn_sw__block_free(blk);		/* record array is inline -- one free */
+	urcu_txn_sw__desc_free(desc);		/* record array is inline -- one free */
 }
 
 /* Record a latch's {old, new, slot, tag}; its proxy->group is bound at
  * install. */
 static inline
-void urcu_txn_sw_latch_set(struct urcu_txn_sw_latch *l,
+void urcu_txn_sw_record_set(struct urcu_txn_sw_record *r,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
-	l->proxy.ptr[0] = old_ptr;
-	l->proxy.ptr[1] = new_ptr;
-	l->slot = slot;
-	l->tag = tag;
+	r->ptr[0] = old_ptr;
+	r->ptr[1] = new_ptr;
+	r->slot = slot;
+	r->tag = tag;
 }
 
-/* Park latch @l's tagged proxy into its slot (readers resolve to old).  The
- * parked value is &l->proxy OR'd with the slot's per-record tag; the latch
- * array is 16-byte aligned, so &l->proxy keeps its low 4 bits free for it. */
+/* Park latch @r's tagged proxy into its slot (readers resolve to old).  The
+ * parked value is @r's address OR'd with the slot's per-record tag; the latch
+ * array is 16-byte aligned, so that address keeps its low 4 bits free for it. */
 static inline
-void urcu_txn_sw_latch_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_latch *l)
+void urcu_txn_sw_record_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_record *r)
 {
 	/*
 	 * Parking REQUIRES a non-zero tag that fits the alignment room.  With
@@ -896,11 +883,11 @@ void urcu_txn_sw_latch_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_lat
 	 * reconstructs the wrong address.  Both hand the reader a garbage group
 	 * pointer.  Only the low 4 bits are free (16-byte-aligned latch array).
 	 */
-	urcu_assert_debug(l->tag != 0 && l->tag <= 0xf);
-	urcu_assert_debug(!((uintptr_t) &l->proxy & l->tag));
-	l->proxy.group = &t->block->group;	/* bind to the now-allocated group */
-	uatomic_store(l->slot,
-			(void *) ((uintptr_t) &l->proxy | l->tag), CMM_RELEASE);
+	urcu_assert_debug(r->tag != 0 && r->tag <= 0xf);
+	urcu_assert_debug(!((uintptr_t) r & r->tag));
+	r->group = &t->desc->group;	/* bind to the now-allocated group */
+	uatomic_store(r->slot,
+			(void *) ((uintptr_t) r | r->tag), CMM_RELEASE);
 }
 
 /* This transaction's record for @slot, or NULL.  Linear, so O(nr) per call and
@@ -908,14 +895,14 @@ void urcu_txn_sw_latch_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_lat
  * that off the hot path.  The returned pointer is invalidated by the next
  * record() (a grow may move the array), so use it before recording again. */
 static inline
-struct urcu_txn_sw_latch *urcu_txn_sw__find(const struct urcu_txn_sw_txn *t,
+struct urcu_txn_sw_record *urcu_txn_sw__scan(const struct urcu_txn_sw_txn *t,
 		void **slot)
 {
 	unsigned int i;
 
 	for (i = 0; i < t->nr; i++)
-		if (t->latches[i].slot == slot)
-			return &t->latches[i];
+		if (t->records[i].slot == slot)
+			return &t->records[i];
 	return NULL;
 }
 
@@ -960,18 +947,18 @@ void urcu_txn_sw__bloom_arm(struct urcu_txn_sw_txn *t)
 
 	memset(t->ryw_bloom, 0, sizeof(t->ryw_bloom));
 	for (i = 0; i < t->nr; i++)
-		urcu_txn_bloom_set(t->ryw_bloom, t->latches[i].slot);
+		urcu_txn_bloom_set(t->ryw_bloom, t->records[i].slot);
 	t->bloom_live = true;
 }
 
 /*
- * urcu_txn_sw__find() with the certain-miss filter in front: a clear bit means
+ * urcu_txn_sw__scan() with the certain-miss filter in front: a clear bit means
  * the slot is DEFINITELY not recorded, so the scan is skipped; all k bits set
  * falls through to the authoritative find, which resolves the false positive.
  * The filter can only ever save the scan, never change the answer.
  */
 static inline
-struct urcu_txn_sw_latch *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
+struct urcu_txn_sw_record *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
 		void **slot)
 {
 #ifndef URCU_TXN_SW_RYW_NO_BLOOM
@@ -983,13 +970,13 @@ struct urcu_txn_sw_latch *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
 		 * testing -- measured ~8% on an 8-edge commit, pure loss.
 		 */
 		if (t->nr < URCU_TXN_SW_BLOOM_MIN)
-			return urcu_txn_sw__find(t, slot);
+			return urcu_txn_sw__scan(t, slot);
 		urcu_txn_sw__bloom_arm(t);
 	}
 	if (!urcu_txn_bloom_test(t->ryw_bloom, slot))
 		return NULL;			/* definitely absent */
 #endif
-	return urcu_txn_sw__find(t, slot);
+	return urcu_txn_sw__scan(t, slot);
 }
 
 /*
@@ -1009,7 +996,7 @@ static __attribute__((noinline, unused))
 bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
 {
 	unsigned int newcap = t->cap ? t->cap * 2 : URCU_TXN_SW_CAP;
-	struct urcu_txn_sw_block *nb;
+	struct urcu_txn_sw_desc *new_desc;
 
 	/*
 	 * Caller-owned (inline) storage is sized to the embedder's edge
@@ -1017,23 +1004,23 @@ bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
 	 * (e.g. on-stack) memory.  Overflow here is an embedder sizing
 	 * bug.
 	 */
-	urcu_posix_assert(!t->latches_inline);
+	urcu_posix_assert(!t->records_inline);
 	/*
 	 * No proxy address is live yet -> the array may move.  No
 	 * aligned realloc exists, so allocate a fresh 16-byte-aligned
 	 * block, copy the buffered records, and free the old one.
 	 */
-	nb = urcu_txn_sw__block_alloc(newcap);
-	if (!nb) {
+	new_desc = urcu_txn_sw__desc_alloc(newcap);
+	if (!new_desc) {
 		t->state = URCU_TXN_SW_OOM;	/* sticky: commit reports it */
 		return false;
 	}
-	memcpy(nb->latches, t->latches,
-			(size_t) t->nr * sizeof(*nb->latches));
-	urcu_txn_sw__block_free(t->block);	/* NULL on the first grow */
-	t->block = nb;
-	t->latches = nb->latches;
-	t->cap = nb->cap;
+	memcpy(new_desc->records, t->records,
+			(size_t) t->nr * sizeof(*new_desc->records));
+	urcu_txn_sw__desc_free(t->desc);	/* NULL on the first grow */
+	t->desc = new_desc;
+	t->records = new_desc->records;
+	t->cap = new_desc->cap;
 	/*
 	 * The storage is now the ENGINE's, so drop the inline flag.  It
 	 * can still be set here: the assert above compiles out under
@@ -1045,7 +1032,7 @@ bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
 	 * -- a leak -- and would trip commit()'s inline assert on a
 	 * handle that is no longer inline.
 	 */
-	t->latches_inline = false;
+	t->records_inline = false;
 	return true;
 }
 
@@ -1068,7 +1055,7 @@ static inline
 bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
-	struct urcu_txn_sw_latch *l;
+	struct urcu_txn_sw_record *r;
 
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;			/* sticky: an earlier alloc failed */
@@ -1085,20 +1072,20 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	urcu_assert_debug(!urcu_txn_sw_is_proxy(new_ptr, tag));
 	/*
 	 * Inline (caller-storage) handles are LONE-EDGE by construction: no
-	 * commit path accepts one with nr >= 2 (install asserts !latches_inline,
-	 * and under NDEBUG it would instead repoint ->latches at a fresh block
+	 * commit path accepts one with nr >= 2 (install asserts !records_inline,
+	 * and under NDEBUG it would instead repoint ->records at a fresh block
 	 * and release-store proxies through uninitialised slot pointers).  Trap
 	 * at the second record, where the sizing decision is still in view,
 	 * rather than at the commit far away -- capacity past 1 in
 	 * urcu_txn_sw_init_inline() is dead, not headroom.
 	 */
-	urcu_posix_assert(!t->latches_inline || t->nr == 0);
+	urcu_posix_assert(!t->records_inline || t->nr == 0);
 	urcu_txn_sw__excl_owner(t, "record()");
 	urcu_txn_sw__excl_slot_free(slot, tag, "record()");
 	if (caa_unlikely(t->nr == t->cap) && !urcu_txn_sw__grow(t))
 		return false;			/* OOM, now sticky */
-	l = &t->latches[t->nr++];
-	urcu_txn_sw_latch_set(l, slot, old_ptr, new_ptr, tag);
+	r = &t->records[t->nr++];
+	urcu_txn_sw_record_set(r, slot, old_ptr, new_ptr, tag);
 	if (caa_unlikely(t->bloom_live))	/* armed: keep it current (disjoint never arms) */
 		urcu_txn_bloom_set(t->ryw_bloom, slot);
 	return true;
@@ -1208,14 +1195,14 @@ static inline
 void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 		uintptr_t tag)
 {
-	struct urcu_txn_sw_latch *l;
+	struct urcu_txn_sw_record *r;
 	void *v;
 
 	urcu_txn_sw__excl_owner(t, "load()");
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE ||
 			t->state == URCU_TXN_SW_OOM);
-	if (!t->disjoint && (l = urcu_txn_sw__find_ryw(t, slot)) != NULL)
-		return l->proxy.ptr[1];		/* our own pending write */
+	if (!t->disjoint && (r = urcu_txn_sw__find_ryw(t, slot)) != NULL)
+		return r->ptr[1];		/* our own pending write */
 #ifdef URCU_TXN_SW_DEBUG_DISJOINT
 	/*
 	 * The LOAD side of the disjoint promise, which nothing used to check.
@@ -1226,7 +1213,7 @@ void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 	 * install duplicate scan and the exclusion validator all stay silent
 	 * while the commit republishes state the bracket had already replaced.
 	 */
-	if (t->disjoint && urcu_txn_sw__find(t, slot) != NULL) {
+	if (t->disjoint && urcu_txn_sw__scan(t, slot) != NULL) {
 		fprintf(stderr, "urcu-txn-sw: disjoint-contract violation: "
 			"slot %p is read after this transaction recorded it, but the "
 			"handle declared its write set disjoint via "
@@ -1241,7 +1228,7 @@ void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 	/*
 	 * @tag && : the predicate reduces to 0 != 0 for a zero tag, which would
 	 * abort a legal tag-0 single-edge embedder (a transaction that never
-	 * parks needs no tag; see urcu_txn_sw_latch_install()).
+	 * parks needs no tag; see urcu_txn_sw_record_install()).
 	 */
 	urcu_assert_debug(!tag || ((uintptr_t) v & tag) != tag);
 	return v;
@@ -1258,14 +1245,14 @@ static __attribute__((noinline, unused))
 bool urcu_txn_sw__chain(struct urcu_txn_sw_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
-	struct urcu_txn_sw_latch *l;
+	struct urcu_txn_sw_record *r;
 
-	l = urcu_txn_sw__find_ryw(t, slot);
-	if (!l)
+	r = urcu_txn_sw__find_ryw(t, slot);
+	if (!r)
 		return urcu_txn_sw_record(t, slot, old_ptr, new_ptr, tag);
-	urcu_assert_debug(l->tag == tag);
-	urcu_assert_debug(l->proxy.ptr[1] == old_ptr);	/* caller read its own writes */
-	l->proxy.ptr[1] = new_ptr;		/* committed old preserved */
+	urcu_assert_debug(r->tag == tag);
+	urcu_assert_debug(r->ptr[1] == old_ptr);	/* caller read its own writes */
+	r->ptr[1] = new_ptr;		/* committed old preserved */
 	return true;
 }
 
@@ -1292,7 +1279,7 @@ bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
 	urcu_txn_sw__excl_owner(t, "record_chain()");
 	if (t->disjoint) {			/* declared: no slot repeats, skip the find */
 #ifdef URCU_TXN_SW_DEBUG_DISJOINT
-		if (urcu_txn_sw__find(t, slot) != NULL) {
+		if (urcu_txn_sw__scan(t, slot) != NULL) {
 			fprintf(stderr, "urcu-txn-sw: disjoint-contract violation: "
 				"slot %p is already recorded in this transaction, but the "
 				"handle declared its write set disjoint via "
@@ -1337,27 +1324,27 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 	 * path", but neither existing assert covers it: record()'s fires only
 	 * on a grow (nr == cap), and commit()'s runs AFTER install has already
 	 * stored.  Without this guard an inline handle with 2..cap records
-	 * walks into the branch below -- !t->block is ALSO the normal state of
-	 * every inline handle -- which repoints t->latches at a fresh block,
+	 * walks into the branch below -- !t->desc is ALSO the normal state of
+	 * every inline handle -- which repoints t->records at a fresh block,
 	 * DISCARDING the caller's records, and the park loop then
 	 * release-stores tagged proxies through that block's UNINITIALIZED
-	 * l->slot pointers: wild stores to garbage addresses.
+	 * r->slot pointers: wild stores to garbage addresses.
 	 */
-	urcu_posix_assert(!t->latches_inline);
-	if (caa_unlikely(!t->block)) {		/* white-box install with no record */
+	urcu_posix_assert(!t->records_inline);
+	if (caa_unlikely(!t->desc)) {		/* white-box install with no record */
 		/*
 		 * The only way to be block-less on a heap handle: nothing was
 		 * ever recorded or reserved.  Anything else would strand the
 		 * records buffered in the array we are about to replace.
 		 */
 		urcu_posix_assert(!nr);
-		t->block = urcu_txn_sw__block_alloc(URCU_TXN_SW_CAP);
-		if (caa_unlikely(!t->block)) {
+		t->desc = urcu_txn_sw__desc_alloc(URCU_TXN_SW_CAP);
+		if (caa_unlikely(!t->desc)) {
 			t->state = URCU_TXN_SW_OOM;	/* sticky; nothing parked */
 			return;
 		}
-		t->latches = t->block->latches;
-		t->cap = t->block->cap;
+		t->records = t->desc->records;
+		t->cap = t->desc->cap;
 	}
 	/*
 	 * Engine precondition: records target pairwise-distinct slots.
@@ -1372,12 +1359,12 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 		unsigned int j;
 
 		for (j = 0; j < i; j++)
-			urcu_assert_debug(t->latches[i].slot != t->latches[j].slot);
+			urcu_assert_debug(t->records[i].slot != t->records[j].slot);
 	}
 	t->state = URCU_TXN_SW_INSTALLED;
 	for (i = 0; i < nr; i++) {
-		urcu_txn_sw__excl_slot_parkable(&t->latches[i]);
-		urcu_txn_sw_latch_install(t, &t->latches[i]);
+		urcu_txn_sw__excl_slot_parkable(&t->records[i]);
+		urcu_txn_sw_record_install(t, &t->records[i]);
 	}
 }
 
@@ -1437,7 +1424,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 			void (*)(struct rcu_head *)),
 		const struct rcu_flavor_struct *flavor)
 {
-	struct urcu_txn_sw_block *blk;
+	struct urcu_txn_sw_desc *desc;
 	unsigned int i;
 	/*
 	 * Frozen for the commit, but the settle stores go through latch->slot,
@@ -1455,10 +1442,10 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	if (t->state == URCU_TXN_SW_PREPARE) {
 		if (nr <= 1) {
 			if (nr == 1) {
-				struct urcu_txn_sw_latch *l = &t->latches[0];
+				struct urcu_txn_sw_record *r = &t->records[0];
 
-				urcu_txn_sw__excl_slot_unchanged(l);
-				uatomic_store(l->slot, l->proxy.ptr[1],
+				urcu_txn_sw__excl_slot_unchanged(r);
+				uatomic_store(r->slot, r->ptr[1],
 						CMM_RELEASE);
 			}
 			/* nr == 0: empty txn, nothing published. */
@@ -1481,17 +1468,17 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	 * cannot grow past its lone-edge bound), so nr >= 2 here implies a heap
 	 * block.
 	 */
-	urcu_posix_assert(!t->latches_inline);
-	blk = t->block;
-	urcu_txn_sw_group_commit(&blk->group);
+	urcu_posix_assert(!t->records_inline);
+	desc = t->desc;
+	urcu_txn_sw_group_commit(&desc->group);
 	for (i = 0; i < nr; i++) {
-		struct urcu_txn_sw_latch *l = &blk->latches[i];
+		struct urcu_txn_sw_record *r = &desc->records[i];
 
-		urcu_txn_sw__excl_slot_ours(l);
-		uatomic_store(l->slot, l->proxy.ptr[1], CMM_RELEASE);
+		urcu_txn_sw__excl_slot_ours(r);
+		uatomic_store(r->slot, r->ptr[1], CMM_RELEASE);
 	}
 	/*
-	 * A reader may hold a proxy into @blk, so this must not free it before a
+	 * A reader may hold a proxy into @desc, so this must not free it before a
 	 * grace period.  Both routes honour that; they differ in WHO defers.
 	 * By default the block goes to the slab's batch retirement (one call_rcu
 	 * per BATCH); -DURCU_TXN_SLAB_NO_BATCH keeps one call_rcu per block.
@@ -1500,16 +1487,16 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	 * under @flavor's own deferral (batches are per flavor).
 	 */
 #ifndef URCU_TXN_SLAB_NO_BATCH
-	if (!(caa_likely(blk->slab && flavor &&
+	if (!(caa_likely(desc->slab && flavor &&
 			flavor->update_call_rcu == call_rcu_fn) &&
-			urcu_slab_free_pending(blk, flavor)))
-		call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);
+			urcu_slab_free_pending(desc, flavor)))
+		call_rcu_fn(&desc->rcu_head, urcu_txn_sw_free_rcu);
 #else
 	(void) flavor;
-	call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);
+	call_rcu_fn(&desc->rcu_head, urcu_txn_sw_free_rcu);
 #endif
-	t->block = NULL;		/* handle consumed */
-	t->latches = NULL;
+	t->desc = NULL;		/* handle consumed */
+	t->records = NULL;
 	t->state = URCU_TXN_SW_DONE;
 	return URCU_TXN_STATUS_OK;
 }

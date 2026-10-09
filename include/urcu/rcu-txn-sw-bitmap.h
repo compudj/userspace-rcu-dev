@@ -43,7 +43,7 @@
  * structural: it must INCLUDE BIT 0 -- a settled word always has bit 0 clear,
  * and that is exactly what makes every live value miss the tag pattern -- and
  * it must fit the low 4 bits, which is the alignment room the parked value
- * (&latch->proxy | TAG) has.  Widening does not shrink BITS_PER_WORD: the extra
+ * (record_address | TAG) has.  Widening does not shrink BITS_PER_WORD: the extra
  * bits are borrowed from the LATCH ADDRESS, not from the word.
  *
  * LAYOUT.  The API operates on a caller-provided `uintptr_t *words` (the bitmap
@@ -53,7 +53,7 @@
  * READS must run inside an RCU read-side critical section of the flavor the
  * transactions use (they resolve proxies, whose lifetime is the RCU grace
  * period) -- exactly like urcu_txn_sw_list_*_rcu().  A reader resolves through
- * urcu_txn_sw_proxy_get(): one acquire load of the flip selector, never
+ * urcu_txn_sw_proxy_resolve(): one acquire load of the flip selector, never
  * blocking and never waiting on anyone.  The concurrent twin's read-policy
  * question ("a pure reader must not wait") simply does not arise -- this engine
  * has no UNDECIDED window at all, so a resolved word is always the flip's
@@ -443,7 +443,7 @@ int urcu_txn_sw_bitmap_clear_range_prepare(struct urcu_txn_sw_txn *txn,
 static inline
 enum urcu_txn_status urcu_txn_sw_bitmap_set_rcu(uintptr_t *words, size_t bit)
 {
-	struct urcu_txn_sw_latch buf[1];
+	struct urcu_txn_sw_record buf[1];
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init_inline(&txn, buf, 1);
@@ -455,7 +455,7 @@ enum urcu_txn_status urcu_txn_sw_bitmap_set_rcu(uintptr_t *words, size_t bit)
 static inline
 enum urcu_txn_status urcu_txn_sw_bitmap_clear_rcu(uintptr_t *words, size_t bit)
 {
-	struct urcu_txn_sw_latch buf[1];
+	struct urcu_txn_sw_record buf[1];
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init_inline(&txn, buf, 1);

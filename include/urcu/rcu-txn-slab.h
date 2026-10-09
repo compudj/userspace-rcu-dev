@@ -226,7 +226,7 @@ urcu_static_assert(!(URCU_SLAB_RANGE & URCU_SLAB_RANGE_MASK),
  * For urcu_slab_free_pending() they must be dead for the whole deferral window,
  * which STARTS AT THE CALL -- one grace period before readers are done with the
  * block.  Both engines satisfy this: the overlay lands on urcu_txn_desc::nr/
- * nr_mw and urcu_txn_sw_block::cap/slab, which no reader loads.
+ * nr_mw and urcu_txn_sw_desc::cap/slab, which no reader loads.
  */
 struct urcu_slab_batch {
 	struct cds_lfs_node *head;	/* the batch's chain head */
@@ -500,7 +500,7 @@ struct urcu_slab {
 	 * It CANNOT be offset 0.  A block reaches free_pending() at commit, one
 	 * grace period BEFORE readers are done with it -- offset 0 is live
 	 * reader state in both engines (urcu_txn_desc::status, which a proxy
-	 * resolve loads; urcu_txn_sw_block::group, which parked proxies point
+	 * resolve loads; urcu_txn_sw_desc::group, which parked proxies point
 	 * at).  Linking there corrupts exactly the field the deferral exists to
 	 * protect.  Point this at the block's rcu_head, which call_rcu already
 	 * writes at deferral time for the same reason: nobody reads it.

@@ -136,7 +136,7 @@ void urcu_txn_sw_list_init(struct urcu_txn_sw_list_head *head)
 
 /*
  * Proxy tagging: a slot value with bit 0 set is a tagged
- * struct urcu_txn_sw_proxy * rather than a direct node pointer.  Node and
+ * struct urcu_txn_sw_record * rather than a direct node pointer.  Node and
  * proxy addresses are both at least pointer-aligned, so bit 0 is free.
  */
 #define URCU_TXN_SW_LIST_PROXY_TAG		1UL

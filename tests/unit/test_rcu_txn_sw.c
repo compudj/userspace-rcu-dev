@@ -183,17 +183,17 @@ int main(void)
 	{
 		void *s1 = (void *) 0x10, *s2 = (void *) 0x20;
 		struct urcu_txn_sw_txn _t, *t = &_t;
-		struct urcu_txn_sw_latch *latches;
+		struct urcu_txn_sw_record *records;
 		enum urcu_txn_status st;
 
 		urcu_txn_sw_init(t);
 		ok(urcu_txn_sw_reserve(t, 2) && t->cap >= 2 &&
 			t->cap < URCU_TXN_SW_CAP,
 			"reserve(2) is not rounded up to the unreserved capacity");
-		latches = t->latches;
+		records = t->records;
 		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
 		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
-		ok(t->latches == latches,
+		ok(t->records == records,
 			"recording the reserved bound does not move the record array");
 		st = urcu_txn_sw_commit(t);
 		ok(st == URCU_TXN_STATUS_OK && s1 == (void *) 0x11 &&
@@ -241,7 +241,7 @@ int main(void)
 	 */
 	{
 		void *slot = (void *) 0x100;
-		struct urcu_txn_sw_latch buf[1];
+		struct urcu_txn_sw_record buf[1];
 		struct urcu_txn_sw_txn _t, *t = &_t;
 		enum urcu_txn_status st;
 

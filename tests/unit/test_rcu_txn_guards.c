@@ -170,7 +170,7 @@ static void body_tagged_old(void)
 /* 4. sw: an inline (caller-storage) handle carrying records reaches install. */
 static void body_sw_inline_install(void)
 {
-	struct urcu_txn_sw_latch buf[4] __attribute__((aligned(16)));
+	struct urcu_txn_sw_record buf[4] __attribute__((aligned(16)));
 	struct urcu_txn_sw_txn t;
 
 	urcu_txn_sw_init_inline(&t, buf, 4);
@@ -182,7 +182,7 @@ static void body_sw_inline_install(void)
 	 * here means it ran the park loop -- i.e. it already release-stored
 	 * proxies through the fresh block's UNINITIALIZED slot pointers.  The
 	 * checkpoint is what pins "aborts BEFORE parking"; SIGABRT alone would not
-	 * (commit() has a late latches_inline assert that fires after the damage).
+	 * (commit() has a late records_inline assert that fires after the damage).
 	 */
 	*g_reached = 1;
 	(void) urcu_txn_sw_commit(&t);
