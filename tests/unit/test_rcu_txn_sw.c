@@ -113,13 +113,13 @@ int main(void)
 
 		urcu_txn_sw_init(t);
 		urcu_txn_sw_reserve(t, 4);
-		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
-		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
-		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x31, TEST_TAG);
+		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x12, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x22, TEST_TAG);
+		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x32, TEST_TAG);
 		st = urcu_txn_sw_commit(t);		/* multi-edge: installs proxies */
 		ok(st == URCU_TXN_STATUS_OK, "multi-edge commit returns OK");
-		ok(s1 == (void *) 0x11 && s2 == (void *) 0x21 &&
-			s3 == (void *) 0x31, "multi-edge slots all settled to new");
+		ok(s1 == (void *) 0x12 && s2 == (void *) 0x22 &&
+			s3 == (void *) 0x32, "multi-edge slots all settled to new");
 	}
 
 	/*
@@ -196,13 +196,13 @@ int main(void)
 			t->cap <= urcu_txn_sw_slab_rc[0],
 			"reserve(2) is not rounded up past the first slab class");
 		records = t->records;
-		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
-		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
+		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x12, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x22, TEST_TAG);
 		ok(t->records == records,
 			"recording the reserved bound does not move the record array");
 		st = urcu_txn_sw_commit(t);
-		ok(st == URCU_TXN_STATUS_OK && s1 == (void *) 0x11 &&
-			s2 == (void *) 0x21,
+		ok(st == URCU_TXN_STATUS_OK && s1 == (void *) 0x12 &&
+			s2 == (void *) 0x22,
 			"small-reserve multi-edge commit settles both slots");
 	}
 
@@ -275,13 +275,13 @@ int main(void)
 
 		reclaim_calls = 0;
 		urcu_txn_sw_init(t);
-		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
-		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
-		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x31, TEST_TAG);
+		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x12, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x22, TEST_TAG);
+		urcu_txn_sw_record(t, &s3, (void *) 0x30, (void *) 0x32, TEST_TAG);
 		st = urcu_txn_sw_commit_flavor(t, counting_call_rcu, NULL);
 		ok(st == URCU_TXN_STATUS_OK, "commit_flavor multi-edge returns OK");
-		ok(s1 == (void *) 0x11 && s2 == (void *) 0x21 &&
-			s3 == (void *) 0x31, "commit_flavor slots all settled to new");
+		ok(s1 == (void *) 0x12 && s2 == (void *) 0x22 &&
+			s3 == (void *) 0x32, "commit_flavor slots all settled to new");
 		ok(reclaim_calls == 1,
 			"commit_flavor routed reclaim through the supplied call_rcu_fn");
 	}
@@ -298,12 +298,12 @@ int main(void)
 		enum urcu_txn_status st;
 
 		urcu_txn_sw_init(t);
-		urcu_txn_sw_record(t, &s1, (void *) 0x40, (void *) 0x41, TEST_TAG);
-		urcu_txn_sw_record(t, &s2, (void *) 0x50, (void *) 0x51, TEST_TAG);
+		urcu_txn_sw_record(t, &s1, (void *) 0x40, (void *) 0x42, TEST_TAG);
+		urcu_txn_sw_record(t, &s2, (void *) 0x50, (void *) 0x52, TEST_TAG);
 		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu, NULL);
 		ok(st == URCU_TXN_STATUS_OK,
 			"exclusive (synchronous-reclaim) multi-edge commit returns OK");
-		ok(s1 == (void *) 0x41 && s2 == (void *) 0x51,
+		ok(s1 == (void *) 0x42 && s2 == (void *) 0x52,
 			"exclusive multi-edge slots settled to new, descriptor freed in place");
 	}
 
