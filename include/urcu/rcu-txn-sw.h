@@ -106,7 +106,13 @@
 extern "C" {
 #endif
 
-#define URCU_TXN_SW_CAP	8	/* first capacity of an unreserved handle */
+/*
+ * First capacity of an unreserved handle: the smallest descriptor class.  A
+ * two-record commit from the next class up was measured at nearly twice the
+ * cost.  A transaction that records more should urcu_txn_sw_reserve() its
+ * bound rather than grow to it.
+ */
+#define URCU_TXN_SW_CAP	4
 
 /*
  * RCU pseudo-transaction (urcu_txn_sw_txn)

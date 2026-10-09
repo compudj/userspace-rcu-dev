@@ -30,7 +30,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 26
+#define NR_TESTS 27
 
 /* Per-record tag: bit 0 of the proxy pointer (records are 16B-aligned). */
 #define TEST_TAG	1UL
@@ -155,7 +155,7 @@ int main(void)
 		struct urcu_txn_sw_txn _t, *t = &_t;
 		enum urcu_txn_status st;
 		bool all_recorded = true, all_new = true;
-		unsigned int i;
+		unsigned int i, first_cap = 0;
 
 		urcu_txn_sw_init(t);
 		for (i = 0; i < NR_EDGES; i++) {
@@ -163,7 +163,11 @@ int main(void)
 			if (!urcu_txn_sw_record(t, &slots[i], slots[i],
 				(void *) ((((unsigned long) (i + 1)) << 8) | 0x10), TEST_TAG))
 				all_recorded = false;
+			if (!i)
+				first_cap = t->cap;
 		}
+		ok(first_cap == urcu_txn_sw_slab_rc[0],
+			"an unreserved handle starts in the first slab class");
 		ok(all_recorded, "record realloc-grows past the initial capacity");
 		st = urcu_txn_sw_commit(t);
 		ok(st == URCU_TXN_STATUS_OK,
@@ -175,10 +179,10 @@ int main(void)
 	}
 
 	/*
-	 * 4b. reserve() honors a bound below URCU_TXN_SW_CAP: the handle gets
-	 * the smallest descriptor that holds the bound, not the capacity an
-	 * unreserved handle starts at, and recording up to the bound does not
-	 * move the record array.
+	 * 4b. reserve() honors a small bound: the handle gets the smallest
+	 * descriptor that holds it, which is the first slab class or an exact
+	 * allocation, and recording up to the bound does not move the record
+	 * array.
 	 */
 	{
 		void *s1 = (void *) 0x10, *s2 = (void *) 0x20;
@@ -188,8 +192,8 @@ int main(void)
 
 		urcu_txn_sw_init(t);
 		ok(urcu_txn_sw_reserve(t, 2) && t->cap >= 2 &&
-			t->cap < URCU_TXN_SW_CAP,
-			"reserve(2) is not rounded up to the unreserved capacity");
+			t->cap <= urcu_txn_sw_slab_rc[0],
+			"reserve(2) is not rounded up past the first slab class");
 		records = t->records;
 		urcu_txn_sw_record(t, &s1, (void *) 0x10, (void *) 0x11, TEST_TAG);
 		urcu_txn_sw_record(t, &s2, (void *) 0x20, (void *) 0x21, TEST_TAG);
