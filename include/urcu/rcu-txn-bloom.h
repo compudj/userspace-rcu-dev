@@ -101,10 +101,11 @@ void urcu_txn_bloom_h1h2(void **slot, uint64_t *h1, uint64_t *h2)
 {
 	/*
 	 * Shift by the alignment actually guaranteed.  >> 3 discards a live
-	 * address bit on ILP32, where slots are only 4-byte aligned, so adjacent
-	 * slots collapse onto identical k positions -- a false-positive rate the
-	 * model does not predict.  On LP64 the one residual zero bit is absorbed
-	 * by the SplitMix64 avalanche on the very next line.
+	 * address bit on ILP32, where slots are only 4-byte aligned, so
+	 * adjacent slots collapse onto identical k positions -- a
+	 * false-positive rate the model does not predict.  On LP64 the one
+	 * residual zero bit is absorbed by the SplitMix64 avalanche on the very
+	 * next line.
 	 */
 	uint64_t x = (uint64_t) (uintptr_t) slot >> 2;
 
@@ -126,9 +127,9 @@ bool urcu_txn_bloom_test(const uint64_t *bloom, void **slot)
 		uint64_t idx = (h1 + (uint64_t) i * h2) % URCU_TXN_BLOOM_BITS;
 
 		if (!(bloom[idx >> 6] & ((uint64_t) 1 << (idx & 63))))
-			return false;	/* a clear bit: the slot is definitely absent */
+			return false;	/* a clear bit: definitely absent */
 	}
-	return true;			/* all k bits set: present (or a false positive) */
+	return true;	/* all k bits set: present (or a false positive) */
 }
 
 static inline

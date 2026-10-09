@@ -90,10 +90,10 @@
 #include <urcu/assert.h>
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
-#include <urcu/call-rcu.h>		/* struct rcu_head + call_rcu (commit reclaim) */
-#include <urcu/rcu-txn-bloom.h>	/* shared RYW lookup filter (also used by rcu-txn.h) */
+#include <urcu/call-rcu.h>		/* struct rcu_head, call_rcu() */
+#include <urcu/rcu-txn-bloom.h>	/* read-your-own-writes filter */
 #include <urcu/rcu-txn-status.h>	/* enum urcu_txn_status */
-#include <urcu/rcu-txn-slab.h>		/* shared per-CPU size-classed descriptor slab */
+#include <urcu/rcu-txn-slab.h>		/* per-CPU descriptor slab */
 
 #ifdef URCU_TXN_SW_EXCL_VALIDATE
 # include <pthread.h>
@@ -106,7 +106,7 @@
 extern "C" {
 #endif
 
-#define URCU_TXN_SW_CAP	8	/* first record-array capacity of an unreserved handle */
+#define URCU_TXN_SW_CAP	8	/* first capacity of an unreserved handle */
 
 /*
  * RCU pseudo-transaction (urcu_txn_sw_txn)
@@ -182,7 +182,7 @@ struct urcu_txn_sw_group {
  * Records are 16-byte aligned so each tagged proxy has its low 4 bits free.
  */
 struct urcu_txn_sw_record {
-	void *ptr[2];			/* [0] old, [1] new: the selector indexes it */
+	void *ptr[2];			/* [0] old, [1] new; selector-indexed */
 	struct urcu_txn_sw_group *group;
 	void **slot;			/* install / settle target */
 	uintptr_t tag;			/*
@@ -211,7 +211,7 @@ struct urcu_txn_sw_record {
  * descriptor.
  */
 struct urcu_txn_sw_desc {
-	struct urcu_txn_sw_group group;		/* selector; installed proxies read &desc->group */
+	struct urcu_txn_sw_group group;		/* read by installed proxies */
 	/*
 	 * Keep @rcu_head at this offset.  The slab threads its pending list
 	 * through it and lays a closed batch's metadata just past it, so the
@@ -233,7 +233,7 @@ struct urcu_txn_sw_desc {
 						 * the pad that keeps records[]
 						 * 16-byte aligned.
 						 */
-	struct urcu_txn_sw_record records[];	/* inline record array (frozen at install) */
+	struct urcu_txn_sw_record records[];	/* frozen at install */
 };
 
 urcu_static_assert(!(offsetof(struct urcu_txn_sw_desc, records) % 16),
@@ -259,22 +259,17 @@ struct urcu_txn_sw_txn {
 	 * first cache line, without holes.  The handle is private to one
 	 * writer, so there is no false sharing to avoid.
 	 */
-	struct urcu_txn_sw_record *records;	/* record array (realloc-grown, or caller-owned if @records_inline) */
-	struct urcu_txn_sw_desc *desc;	/* heap path: single allocation (records inline); NULL until first record */
+	struct urcu_txn_sw_record *records;	/* grown, or caller storage */
+	struct urcu_txn_sw_desc *desc;		/* NULL until first allocated */
 	unsigned int nr;
 	unsigned int cap;
 	enum urcu_txn_sw_state state;
-	bool records_inline;			/* @records is caller storage: never realloc'd, never freed */
-	bool disjoint;				/* write set declared slot-disjoint: skip the RYW find */
-	bool bloom_live;			/* @ryw_bloom is armed (see urcu_txn_sw__find_ryw) */
+	bool records_inline;			/* @records is caller storage */
+	bool disjoint;				/* declared slot-disjoint */
+	bool bloom_live;			/* @ryw_bloom is armed */
 #ifdef URCU_TXN_SW_EXCL_VALIDATE
-	pthread_t excl_owner;			/*
-						 * pthread_self() of the thread
-						 * that initialized this handle; the
-						 * handle must be driven end to
-						 * end by it.  See the validator
-						 * below.
-						 */
+	/* Thread that initialized the handle, and must drive it end to end. */
+	pthread_t excl_owner;
 #endif
 	/*
 	 * Last, after the conditional member, so that init clears everything
@@ -337,7 +332,10 @@ struct urcu_txn_sw_record *urcu_txn_sw_untag(void *v, uintptr_t tag)
 static inline
 void *urcu_txn_sw_proxy_resolve(const struct urcu_txn_sw_record *proxy)
 {
-	/* Load-acquire (A) pairs with urcu_txn_sw_group_commit() store-release (B). */
+	/*
+	 * Load-acquire (A) pairs with the store-release (B) of
+	 * urcu_txn_sw_group_commit().
+	 */
 	return proxy->ptr[uatomic_load(&proxy->group->selector, CMM_ACQUIRE)];
 }
 
@@ -362,7 +360,10 @@ void *urcu_txn_sw_resolve(void *v, uintptr_t tag)
 static inline
 void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
 {
-	/* Store-release (B) pairs with urcu_txn_sw_proxy_resolve() load-acquire (A). */
+	/*
+	 * Store-release (B) pairs with the load-acquire (A) of
+	 * urcu_txn_sw_proxy_resolve().
+	 */
 	uatomic_store(&group->selector, 1, CMM_RELEASE);
 }
 
@@ -556,8 +557,9 @@ void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
 	urcu_txn_sw__init(t, buf, cap);
 }
 
-#define urcu_txn_sw_descsize(cap)	\
-	(sizeof(struct urcu_txn_sw_desc) + (size_t) (cap) * sizeof(struct urcu_txn_sw_record))
+#define urcu_txn_sw_descsize(cap)				\
+	(sizeof(struct urcu_txn_sw_desc) +			\
+	 (size_t) (cap) * sizeof(struct urcu_txn_sw_record))
 
 /*
  * Transaction descriptors come from the per-CPU size-classed slab of
@@ -567,7 +569,8 @@ void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
  * (urcu_txn_sw_desc.slab), which the free path consults.  URCU_TXN_NO_CACHE
  * disables the slab.
  */
-static const unsigned int urcu_txn_sw_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
+static const unsigned int urcu_txn_sw_slab_rc[] =
+	{ 4u, 8u, 16u, 32u, 64u, 128u };
 #define URCU_TXN_SW_SLAB_NCLASS	\
 	((int) (sizeof(urcu_txn_sw_slab_rc) / sizeof(urcu_txn_sw_slab_rc[0])))
 
@@ -677,7 +680,7 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 	struct urcu_txn_sw_desc *desc;
 
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
-		return false;			/* sticky: an earlier alloc failed */
+		return false;		/* sticky: an earlier alloc failed */
 	/*
 	 * PREPARE only, like record().  With proxies installed, the grow path
 	 * below would free the descriptor that live slots point into.
@@ -698,7 +701,7 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 		 */
 		desc = urcu_txn_sw__desc_alloc(cap);
 		if (!desc) {
-			t->state = URCU_TXN_SW_OOM;	/* sticky: commit reports it */
+			t->state = URCU_TXN_SW_OOM;	/* sticky */
 			return false;
 		}
 		memcpy(desc->records, t->records,
@@ -711,7 +714,7 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 	}
 	desc = urcu_txn_sw__desc_alloc(cap);
 	if (!desc) {
-		t->state = URCU_TXN_SW_OOM;	/* sticky: commit reports it */
+		t->state = URCU_TXN_SW_OOM;	/* sticky */
 		return false;
 	}
 	t->desc = desc;
@@ -783,7 +786,8 @@ void urcu_txn_sw_record_set(struct urcu_txn_sw_record *r,
  * tag; records are 16-byte aligned, so the address has its low 4 bits free.
  */
 static inline
-void urcu_txn_sw_record_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_record *r)
+void urcu_txn_sw_record_install(struct urcu_txn_sw_txn *t,
+		struct urcu_txn_sw_record *r)
 {
 	/*
 	 * Installing requires a non-zero tag within the low 4 bits, none of
@@ -903,7 +907,7 @@ bool urcu_txn_sw__grow(struct urcu_txn_sw_txn *t)
 	 */
 	new_desc = urcu_txn_sw__desc_alloc(newcap);
 	if (!new_desc) {
-		t->state = URCU_TXN_SW_OOM;	/* sticky: commit reports it */
+		t->state = URCU_TXN_SW_OOM;	/* sticky */
 		return false;
 	}
 	memcpy(new_desc->records, t->records,
@@ -946,7 +950,7 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	struct urcu_txn_sw_record *r;
 
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
-		return false;			/* sticky: an earlier alloc failed */
+		return false;		/* sticky: an earlier alloc failed */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	/*
 	 * Neither value may look like a proxy under @tag.  After settle the
@@ -1107,7 +1111,8 @@ bool urcu_txn_sw__chain(struct urcu_txn_sw_txn *t, void **slot,
 	if (!r)
 		return urcu_txn_sw_record(t, slot, old_ptr, new_ptr, tag);
 	urcu_assert_debug(r->tag == tag);
-	urcu_assert_debug(r->ptr[1] == old_ptr);	/* caller read its own writes */
+	/* The caller must have read its own write. */
+	urcu_assert_debug(r->ptr[1] == old_ptr);
 	r->ptr[1] = new_ptr;		/* committed old preserved */
 	return true;
 }
@@ -1129,7 +1134,7 @@ bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
-		return false;			/* sticky: an earlier alloc failed */
+		return false;		/* sticky: an earlier alloc failed */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	urcu_txn_sw__excl_owner(t, "record_chain()");
 	if (t->disjoint) {		/* no slot repeats: skip the lookup */
@@ -1184,7 +1189,7 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 		urcu_posix_assert(!nr);
 		t->desc = urcu_txn_sw__desc_alloc(URCU_TXN_SW_CAP);
 		if (caa_unlikely(!t->desc)) {
-			t->state = URCU_TXN_SW_OOM;	/* sticky; nothing installed */
+			t->state = URCU_TXN_SW_OOM;	/* sticky */
 			return;
 		}
 		t->records = t->desc->records;
@@ -1199,7 +1204,8 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 		unsigned int j;
 
 		for (j = 0; j < i; j++)
-			urcu_assert_debug(t->records[i].slot != t->records[j].slot);
+			urcu_assert_debug(t->records[i].slot !=
+					t->records[j].slot);
 	}
 	t->state = URCU_TXN_SW_INSTALLED;
 	for (i = 0; i < nr; i++) {
@@ -1253,7 +1259,8 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	const unsigned int nr = t->nr;
 
 	urcu_txn_sw__excl_owner(t, "commit()");
-	urcu_posix_assert(t->state != URCU_TXN_SW_DONE);	/* re-init to reuse */
+	/* A consumed handle must be initialized again before reuse. */
+	urcu_posix_assert(t->state != URCU_TXN_SW_DONE);
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM)) {
 		urcu_txn_sw__free_records(t);
 		t->state = URCU_TXN_SW_DONE;
@@ -1265,7 +1272,10 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 				struct urcu_txn_sw_record *r = &t->records[0];
 
 				urcu_txn_sw__excl_slot_unchanged(r);
-				/* Store-release of slot pairs with rcu_dereference(). */
+				/*
+				 * Store-release of slot pairs with
+				 * rcu_dereference().
+				 */
 				uatomic_store(r->slot, r->ptr[1],
 						CMM_RELEASE);
 			}
