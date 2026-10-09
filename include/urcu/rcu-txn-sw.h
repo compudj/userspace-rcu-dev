@@ -31,13 +31,15 @@
  * consistently to the old or the new target.
  *
  * The embedding data structure is responsible for:
- *   - tagging a proxy pointer so its readers recognise it (e.g. a spare
- *     low/high bit, or a reserved type code in an already-tagged pointer)
- *     and routing proxy resolution through urcu_txn_sw_proxy_resolve();
- *   - allocating proxies and the group (often a single backing block with
- *     one rcu_head), with whatever alignment its tagging scheme needs;
- *   - reclaiming them with call_rcu() after they are unpublished (every
- *     slot rewritten from the tagged proxy to the resolved target).
+ *   - excluding concurrent writers from the slots a transaction commits;
+ *   - choosing the tag that marks a proxy pointer so its readers recognise
+ *     it (a spare low bit, or a reserved type code in an already-tagged
+ *     pointer), and never storing a live value that carries it;
+ *   - routing its readers' slot loads through urcu_txn_sw_resolve();
+ *   - supplying the call_rcu() of its readers' RCU flavor.
+ *
+ * The transaction allocates the records and their flip group as a single
+ * descriptor, and reclaims it after a grace period.
  *
  * Lifecycle (writer)
  * ------------------
