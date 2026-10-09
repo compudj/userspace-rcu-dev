@@ -56,6 +56,27 @@
  *
  * urcu_txn_sw_commit() performs steps 2 to 4.
  *
+ * Store-release / load-acquire pairs
+ * ----------------------------------
+ * What each of the writer's store-release orders, and against which load:
+ *
+ *   - Install.  The store-release of the tagged proxy into the slot pairs
+ *     with the reader's rcu_dereference() of that slot.  It orders the
+ *     writer's earlier stores to the transaction descriptor, which are the
+ *     record's {old, new, group} and the selector's initialization to 0,
+ *     before their respective loads by urcu_txn_sw_proxy_resolve().
+ *
+ *   - Commit and settle.  The store-release of the selector (0 -> 1) pairs
+ *     with the load-acquire of the selector in urcu_txn_sw_proxy_resolve().
+ *     The store-release of the new target into the slot pairs with the
+ *     reader's rcu_dereference() of that slot.  Each orders the writer's
+ *     earlier stores to the new data being published before their respective
+ *     loads by the reader, which is the usual RCU publication guarantee.  A
+ *     reader is covered by the first pair when its rcu_dereference() returned
+ *     a tagged proxy, and by the second when it returned the new target.
+ *
+ * A single-record commit installs no proxy: it is the settle store alone.
+ *
  * Ordering / monotonicity
  * ------------------------
  * The selector is written exactly once (0 -> 1) and never back, so a
