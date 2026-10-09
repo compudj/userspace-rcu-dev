@@ -960,7 +960,7 @@ void urcu_txn_sw__bloom_arm(struct urcu_txn_sw_txn *t)
 
 	memset(t->ryw_bloom, 0, sizeof(t->ryw_bloom));
 	for (i = 0; i < t->nr; i++)
-		urcu_txn__ryw_bloom_set(t->ryw_bloom, t->latches[i].slot);
+		urcu_txn_bloom_set(t->ryw_bloom, t->latches[i].slot);
 	t->bloom_live = true;
 }
 
@@ -986,7 +986,7 @@ struct urcu_txn_sw_latch *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
 			return urcu_txn_sw__find(t, slot);
 		urcu_txn_sw__bloom_arm(t);
 	}
-	if (!urcu_txn__ryw_bloom_test(t->ryw_bloom, slot))
+	if (!urcu_txn_bloom_test(t->ryw_bloom, slot))
 		return NULL;			/* definitely absent */
 #endif
 	return urcu_txn_sw__find(t, slot);
@@ -1100,7 +1100,7 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	l = &t->latches[t->nr++];
 	urcu_txn_sw_latch_set(l, slot, old_ptr, new_ptr, tag);
 	if (caa_unlikely(t->bloom_live))	/* armed: keep it current (disjoint never arms) */
-		urcu_txn__ryw_bloom_set(t->ryw_bloom, slot);
+		urcu_txn_bloom_set(t->ryw_bloom, slot);
 	return true;
 }
 

@@ -1068,7 +1068,7 @@ void urcu_txn__bloom_arm(struct urcu_txn *txn, struct urcu_txn_desc *m)
 
 	memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));
 	for (i = 0; i < m->nr; i++)
-		urcu_txn__ryw_bloom_set(txn->ryw_bloom, m->recs[i].slot);
+		urcu_txn_bloom_set(txn->ryw_bloom, m->recs[i].slot);
 	txn->bloom_live = 1;
 }
 
@@ -1091,7 +1091,7 @@ int urcu_txn__ryw_hit(struct urcu_txn *txn, struct urcu_txn_desc *m,
 			return urcu_txn_find(m, slot) != NULL;
 		urcu_txn__bloom_arm(txn, m);
 	}
-	return urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot);
+	return urcu_txn_bloom_test(txn->ryw_bloom, slot);
 }
 
 /*
@@ -1137,7 +1137,7 @@ int urcu_txn__record(struct urcu_txn *txn, void **slot,
 			}
 			urcu_txn__bloom_arm(txn, m);
 		}
-		coincide = urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom,
+		coincide = urcu_txn_bloom_test_and_set(txn->ryw_bloom,
 				slot);
 coincide_known:
 		if (coincide && urcu_txn__eff_retry(txn) == 0)

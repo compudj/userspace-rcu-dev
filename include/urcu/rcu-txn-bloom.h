@@ -43,6 +43,7 @@
  * allocator) and owns zeroing it.  These helpers are pure functions over it.
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -106,7 +107,7 @@ extern "C" {
  * visits k distinct bits.
  */
 static inline
-void urcu_txn__ryw_bloom_h1h2(void **slot, uint64_t *h1, uint64_t *h2)
+void urcu_txn_bloom_h1h2(void **slot, uint64_t *h1, uint64_t *h2)
 {
 	/*
 	 * Shift by the alignment actually guaranteed.  >> 3 discards a live
@@ -124,27 +125,27 @@ void urcu_txn__ryw_bloom_h1h2(void **slot, uint64_t *h1, uint64_t *h2)
 	*h2 = (x >> 32) | 1;		/* high lane, odd stride */
 }
 static inline
-int urcu_txn__ryw_bloom_test(const uint64_t *bloom, void **slot)
+bool urcu_txn_bloom_test(const uint64_t *bloom, void **slot)
 {
 	uint64_t h1, h2;
 	unsigned int i;
 
-	urcu_txn__ryw_bloom_h1h2(slot, &h1, &h2);
+	urcu_txn_bloom_h1h2(slot, &h1, &h2);
 	for (i = 0; i < URCU_TXN_BLOOM_K; i++) {
 		uint64_t idx = (h1 + (uint64_t) i * h2) % URCU_TXN_BLOOM_BITS;
 
 		if (!(bloom[idx >> 6] & ((uint64_t) 1 << (idx & 63))))
-			return 0;	/* a clear bit: the slot is definitely absent */
+			return false;	/* a clear bit: the slot is definitely absent */
 	}
-	return 1;			/* all k bits set: present (or a false positive) */
+	return true;			/* all k bits set: present (or a false positive) */
 }
 static inline
-void urcu_txn__ryw_bloom_set(uint64_t *bloom, void **slot)
+void urcu_txn_bloom_set(uint64_t *bloom, void **slot)
 {
 	uint64_t h1, h2;
 	unsigned int i;
 
-	urcu_txn__ryw_bloom_h1h2(slot, &h1, &h2);
+	urcu_txn_bloom_h1h2(slot, &h1, &h2);
 	for (i = 0; i < URCU_TXN_BLOOM_K; i++) {
 		uint64_t idx = (h1 + (uint64_t) i * h2) % URCU_TXN_BLOOM_BITS;
 
@@ -152,20 +153,20 @@ void urcu_txn__ryw_bloom_set(uint64_t *bloom, void **slot)
 	}
 }
 static inline
-int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
+bool urcu_txn_bloom_test_and_set(uint64_t *bloom, void **slot)
 {
 	uint64_t h1, h2;
 	unsigned int i;
-	int was_set = 1;
+	bool was_set = true;
 
-	urcu_txn__ryw_bloom_h1h2(slot, &h1, &h2);
+	urcu_txn_bloom_h1h2(slot, &h1, &h2);
 	for (i = 0; i < URCU_TXN_BLOOM_K; i++) {
 		uint64_t idx = (h1 + (uint64_t) i * h2) % URCU_TXN_BLOOM_BITS;
 		unsigned int w = (unsigned int) (idx >> 6);
 		uint64_t bit = (uint64_t) 1 << (idx & 63);
 
 		if (!(bloom[w] & bit))
-			was_set = 0;
+			was_set = false;
 		bloom[w] |= bit;
 	}
 	return was_set;

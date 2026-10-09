@@ -99,7 +99,7 @@ int main(void)
 	/* 4. An empty filter must answer absent for every slot. */
 	memset(bloom, 0, sizeof(bloom));
 	for (i = 0; i < NR_SLOTS; i++)
-		if (urcu_txn__ryw_bloom_test(bloom, g_slot[i]))
+		if (urcu_txn_bloom_test(bloom, g_slot[i]))
 			empty_clean = 0;
 	ok(empty_clean, "an empty filter reports every slot absent (so the "
 		"no-false-negative test below cannot pass vacuously)");
@@ -113,10 +113,10 @@ int main(void)
 	 */
 	memset(bloom, 0, sizeof(bloom));
 	for (i = 0; i < NR_SLOTS / 8; i++)
-		urcu_txn__ryw_bloom_set(bloom, g_slot[i]);
+		urcu_txn_bloom_set(bloom, g_slot[i]);
 	for (i = NR_SLOTS / 8; i < NR_SLOTS; i++) {
 		probes++;
-		if (urcu_txn__ryw_bloom_test(bloom, g_slot[i]))
+		if (urcu_txn_bloom_test(bloom, g_slot[i]))
 			fp++;
 	}
 	diag("false positives: %d / %d probes (%.1f%%) at n=%d over %d bits, k=%d",
@@ -133,14 +133,14 @@ int main(void)
 	 */
 	memset(bloom, 0, sizeof(bloom));
 	for (i = 0; i < NR_SLOTS; i++) {
-		urcu_txn__ryw_bloom_set(bloom, g_slot[i]);
+		urcu_txn_bloom_set(bloom, g_slot[i]);
 		/* re-testing all i+1 each round is O(n^2); sample instead */
 		for (j = 0; j <= i; j += (i / 16 + 1))
-			if (!urcu_txn__ryw_bloom_test(bloom, g_slot[j]))
+			if (!urcu_txn_bloom_test(bloom, g_slot[j]))
 				no_false_neg = 0;
 	}
 	for (i = 0; i < NR_SLOTS; i++)		/* and all of them at the end */
-		if (!urcu_txn__ryw_bloom_test(bloom, g_slot[i]))
+		if (!urcu_txn_bloom_test(bloom, g_slot[i]))
 			no_false_neg = 0;
 	ok(no_false_neg, "no false negatives: every slot ever set still reports "
 		"present, whatever is set after it");
@@ -153,7 +153,7 @@ int main(void)
 	 */
 	memset(rebuilt, 0, sizeof(rebuilt));
 	for (i = NR_SLOTS - 1; i >= 0; i--)		/* reverse order */
-		urcu_txn__ryw_bloom_set(rebuilt, g_slot[i]);
+		urcu_txn_bloom_set(rebuilt, g_slot[i]);
 	ok(memcmp(bloom, rebuilt, sizeof(bloom)) == 0,
 		"the filter is order-independent and deterministic: a rebuild from "
 		"the same slots is bit-identical (what arming relies on)");
@@ -165,11 +165,11 @@ int main(void)
 	 */
 	memset(bloom, 0, sizeof(bloom));
 	for (i = 0; i < 64; i++) {
-		int first = urcu_txn__ryw_bloom_test_and_set(bloom, g_slot[i]);
-		int again = urcu_txn__ryw_bloom_test_and_set(bloom, g_slot[i]);
+		int first = urcu_txn_bloom_test_and_set(bloom, g_slot[i]);
+		int again = urcu_txn_bloom_test_and_set(bloom, g_slot[i]);
 
 		/* @first may be a false positive; @again must always be 1 */
-		if (!again || !urcu_txn__ryw_bloom_test(bloom, g_slot[i]))
+		if (!again || !urcu_txn_bloom_test(bloom, g_slot[i]))
 			tas_ok = 0;
 		(void) first;
 	}
@@ -182,9 +182,9 @@ int main(void)
 		int stable = 1;
 
 		memset(probe, 0, sizeof(probe));
-		urcu_txn__ryw_bloom_set(probe, g_slot[0]);
+		urcu_txn_bloom_set(probe, g_slot[0]);
 		for (i = 0; i < 1000; i++)
-			if (!urcu_txn__ryw_bloom_test(probe, g_slot[0]))
+			if (!urcu_txn_bloom_test(probe, g_slot[0]))
 				stable = 0;
 		ok(stable, "repeated tests of one set slot agree (the hash has no "
 			"hidden state)");
