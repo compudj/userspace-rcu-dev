@@ -808,11 +808,11 @@ bool urcu_txn_sw_append_is_infallible(const struct urcu_txn_sw_txn *t)
 }
 
 /*
- * Free the record array of a handle that never installed proxies (no grace
- * period).  Caller-owned (inline) storage is never freed by the engine.
+ * Release the handle's descriptor.  No proxy of it was installed, so no grace
+ * period is owed.  Caller storage is not the engine's to free.
  */
 static inline
-void urcu_txn_sw__free_records(struct urcu_txn_sw_txn *t)
+void urcu_txn_sw__release_desc(struct urcu_txn_sw_txn *t)
 {
 	if (!t->records_inline)
 		urcu_txn_sw__desc_free(t->desc);
@@ -1217,7 +1217,7 @@ void urcu_txn_sw_cancel(struct urcu_txn_sw_txn *t)
 	urcu_txn_sw__excl_owner(t, "cancel()");
 	/* A consumed handle must be initialized again before reuse. */
 	urcu_posix_assert(t->state != URCU_TXN_SW_DONE);
-	urcu_txn_sw__free_records(t);	/* no proxy: free now */
+	urcu_txn_sw__release_desc(t);	/* no proxy: free now */
 	t->state = URCU_TXN_SW_DONE;
 }
 
@@ -1284,7 +1284,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 			uatomic_store(r->slot, r->ptr[1], CMM_RELEASE);
 		}
 		/* nr == 0: empty txn, nothing published. */
-		urcu_txn_sw__free_records(t);	/* no proxy: free now */
+		urcu_txn_sw__release_desc(t);	/* no proxy: free now */
 		t->state = URCU_TXN_SW_DONE;
 		return URCU_TXN_STATUS_OK;
 	}
