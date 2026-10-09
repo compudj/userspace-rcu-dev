@@ -6,169 +6,113 @@
 #define _URCU_RCU_TXN_SW_HLIST_H
 
 /*
- * rcu-txn-sw-hlist: a kernel-hlist-shaped, single-pointer-head RCU list under a
- * SINGLE writer (writers mutually excluded, as with cds_hlist_*_rcu).  It is
- * the single-writer sibling of the concurrent-writer <urcu/rcu-txn-hlist.h>
- * and the hash-bucket sibling of the circular bidir <urcu/rcu-txn-sw-list.h>:
- * the head is a SINGLE 8-byte pointer, so a table of buckets is half the
- * footprint of the sentinel-node heads.  See design/rcu-txn-hlist.md.
+ * rcu-txn-sw-hlist: an RCU list with a single-pointer head, shaped like the
+ * kernel's hlist, for a single writer (writers mutually excluded, as with
+ * cds_hlist_*_rcu).  It is the single-writer sibling of the concurrent
+ * <urcu/rcu-txn-hlist.h>, and the hash-bucket sibling of the circular
+ * <urcu/rcu-txn-sw-list.h>: its head is one pointer, half the footprint of a
+ * sentinel-node head.
  *
- * pprev encoding, forward-only readers
- * ------------------------------------
- * A node's backward link is a pointer to the SLOT that names it (&prev->next or
- * &head->first), never a node pointer -- so the head's single pointer is just
- * another "next" slot and no operation carries a head special case (see the
- * concurrent header for the full rationale).
+ * Forward-only readers, and pprev
+ * -------------------------------
+ * A node's backward link is a pointer to the slot that names it (&prev->next or
+ * &head->first), not to a node, so no operation has a head special case.
  *
  *   Node: { struct urcu_txn_sw_hlist_node *next;    (node ptr; reader-visible)
  *           struct urcu_txn_sw_hlist_node **pprev;  (slot ptr; writer-only) }
  *
- * Readers walk FORWARD ONLY, so each structural op has exactly ONE
- * reader-visible edge -- the "next" slot it re-points (&head->first for a
- * first-position op, &prev->next otherwise).  That edge, and ONLY that edge, is
- * recorded into the flip transaction (<urcu/rcu-txn-sw.h>).
+ * Readers walk forward only, so each operation has exactly one reader-visible
+ * edge: the next slot it re-points.  Only that edge is recorded into the
+ * transaction (<urcu/rcu-txn-sw.h>).
  *
- * pprev is written by a PLAIN STORE, eagerly, inside the _prepare form
- * ------------------------------------------------------------------
- * pprev is writer-only: no reader ever loads it (the walk is forward-only) and
- * a single writer has no concurrent writer, so it needs neither atomicity, nor
- * release ordering, nor a flip proxy.  Recording it would buy nothing and cost
- * a second edge on every op.  Note this is where the hlist parts ways with the
- * bidir <urcu/rcu-txn-sw-list.h>, whose readers "may iterate in either
- * direction": THAT structure's prev is reader-visible and must stay transacted.
- * The resemblance of the two backward links is superficial.
+ * pprev is writer-only state, and a single writer has no concurrent writer: it
+ * needs neither atomicity nor a proxy, and is written by a plain store.  This
+ * is where the hlist differs from <urcu/rcu-txn-sw-list.h>, whose prev is
+ * reader-visible and transacted.
  *
- * The store is EAGER -- at _prepare time, not after commit -- and that is what
- * keeps same-bucket composition correct.  A later _prepare in the same bracket
- * reads its neighbour's pprev RAW and sees the earlier _prepare's value, because
- * under a single writer a plain store is immediately visible to that same
- * writer.  Deferring the pprev write and then reading it raw is the bug: a
- * later edit would read a STALE slot address, one naming a node the earlier edit
- * already unlinked, and re-point that dead slot instead of the live one.  See
- * urcu_txn_sw_hlist_del_prepare() for the worked adjacent-delete case.
+ * The store happens in the _prepare form, not after the commit.  A later
+ * _prepare of the same transaction then reads its neighbour's pprev directly
+ * and sees the earlier one's value, which is what makes edits of one bucket
+ * compose: see urcu_txn_sw_hlist_del_prepare().
  *
- * Invariant, for the general argument rather than one example: raw pprev here
- * equals what pprev's PENDING value would be were it transacted.  It holds at
- * bracket entry (both are the committed value) and each _prepare computes the
- * same value from the same inputs and makes it visible to the next op, so it is
- * preserved; and pprev influences committed state only by naming the slot a
- * forward-edge record targets, which is exactly what the invariant covers.
+ * Reserve before composing
+ * ------------------------
+ * A plain store is not rolled back.  If a transaction composing several
+ * operations ran out of memory midway, it would commit nothing and leave pprev
+ * advanced, and a later delete would then corrupt the reader-visible chain.
  *
- * The one thing this gives up, and the reserve() obligation it creates
- * ------------------------------------------------------------------
- * A plain store does not roll back.  A composed bracket that OOMs mid-way would
- * commit nothing yet leave pprev advanced -- writer bookkeeping permanently
- * skewed, which a LATER del would turn into a corrupt reader-visible chain.
+ * Each _prepare records before it stores, and stores nothing if the record
+ * fails.  A transaction of a single operation is therefore safe without a
+ * reserve; this covers every _rcu form below.
  *
- * Each _prepare closes the FIRST-op case itself: it records before it stores and
- * returns early if that record fails, so an op that cannot be published stores
- * nothing.  A lone-op bracket is therefore safe with no reserve at all -- which
- * is every _rcu wrapper below, and any hand-rolled init/prepare/commit of one
- * edit.
+ * A transaction composing more than one operation must urcu_txn_sw_reserve()
+ * its record bound before the first _prepare, so that no later record can fail
+ * behind an earlier store.  One record per operation is enough.  Checking only
+ * commit()'s status, as elsewhere, is not enough here.  A debug build asserts
+ * it: see URCU_TXN_SW_HLIST__ASSERT_ROLLBACKABLE.
  *
- * What no _prepare can close is a LATER op failing behind an earlier op's store.
- * So a bracket composing more than one op MUST urcu_txn_sw_reserve() its edge
- * bound up front, before the first _prepare.  A successful reserve makes every
- * later record() append without reallocating and pre-allocates the descriptor
- * install() would otherwise take lazily, so commit() cannot then report
- * MEMORY_ERROR -- no failure path is left behind any store.  Checking only
- * commit()'s status, the engine's general model, is NOT enough here.  (Bound the
- * reserve by op count: one transacted edge per op is the maximum, and adjacent
- * ops chain onto one record, so the bound is loose.)
+ * Composing edits of one hlist
+ * ----------------------------
+ * Operations whose neighbourhoods touch may share a transaction: each _prepare
+ * reads the next/first slots through urcu_txn_sw_hlist_pending_next() and
+ * chains a second write to a slot onto the first.  Two rules remain for the
+ * caller:
  *
- * URCU_TXN_SW_HLIST__ASSERT_ROLLBACKABLE, on every _prepare, traps a violation
- * under DEBUG_RCU rather than leaving it to surface as corruption later.  It
- * asserts the underlying invariant -- spare capacity behind an eager store --
- * not the reserve() call itself; see it for why those differ.
+ *   - Name the nodes before editing, rather than by traversing the list in the
+ *     middle of the transaction.
  *
- * The single-op _rcu brackets below owe nothing: each records exactly ONE edge,
- * which the engine commits with a lone store-release -- no proxy, no
- * descriptor, no allocation at all (they drive an on-stack
- * urcu_txn_sw_init_inline handle), and so no failure path to protect.
+ *   - Every node an operation is anchored on must still be in the list as the
+ *     transaction leaves it.  A single-writer delete leaves no deletion mark,
+ *     so a _prepare cannot tell a deleted anchor from a live one.
  *
- * Composition itself covers cross-structure edits (the intended use, disjoint by
- * construction) AND edits on ONE hlist whose neighbourhoods touch: each _prepare
- * reads the reader-visible "next"/first slots through the engine's
- * read-your-own-writes load (urcu_txn_sw_hlist_pending_next) and chains a
- * same-slot record rather than duplicating it, so adjacent deletes and the like
- * commit correctly.
+ *     Example: 1 -> 2 -> 3, del_prepare(2) then add_after_prepare(9, 2).  The
+ *     delete records {&1->next: 2 -> 3}.  The add then records
+ *     {&2->next: 3 -> 9} and sets 3->pprev = &9->next.  The slots are distinct
+ *     and the commit reports OK in every build, but the committed chain is
+ *     1 -> 3: node 9 is reachable only through the removed node 2, and
+ *     3->pprev names a slot no live node holds.  A later del_rcu(3) follows
+ *     that pprev, commits into the unreachable node 9 and returns success,
+ *     while 1->next still names 3, which the caller then frees.
  *
- * TWO obligations are left to the caller, not one.
+ *     add_before and replace anchored on a deleted node chain onto the delete's
+ *     record instead.  A debug build trips urcu_txn_sw_record_chain()'s
+ *     assertion; an NDEBUG build links the deleted node, or its replacement,
+ *     back into the chain.
  *
- * (1) Name the nodes before editing them, not by traversing mid-bracket.
- *
- * (2) EVERY ANCHOR MUST STILL BE LIVE AS THIS TRANSACTION LEAVES THE LIST.  An
- * op anchored on a node an EARLIER op of the same bracket deleted is a ghost
- * anchor, and there is nothing here to detect it: unlike the concurrent
- * sibling, a single-writer delete leaves no deletion mark, so a prepare cannot
- * tell a deleted anchor from a live one.  Naming the node up front satisfies
- * obligation (1) and says nothing about this.
- *
- * 1 -> 2 -> 3, one bracket: del_prepare(2) then add_after_prepare(9, 2).  The
- * delete records {&1->next: 2 -> 3} -- it never touches &2->next -- so the add
- * reads a pending_next of 3 off the ghost and records {&2->next: 3 -> 9}, a
- * fresh record on a slot inside it, and overwrites the delete's 3->pprev with
- * &9->next.  Pairwise-distinct slots, so install's duplicate scan passes under
- * DEBUG_RCU, no record_chain old assert is reached, EXCL_VALIDATE sees one
- * thread, and the commit reports OK.  The committed chain is 1 -> 3; node 9 is
- * reachable only through the ghost, and 3->pprev names a slot no live node
- * holds.  A LATER del_rcu(3) then follows that pprev, matches its old, commits
- * into the unreachable node, and returns success -- while 1->next still names
- * 3, which the caller frees.  Every reader walking 1 -> 3 then touches freed
- * memory.
- *
- * The add_before and replace variants chain onto the delete's record instead
- * and trip record_chain's pending-old assert under DEBUG_RCU; under NDEBUG they
- * resurrect the deleted node into the committed chain.  Only the add_after form
- * above is caught by nothing at all.
- *
- * Configurable proxy tag (a compile-time define, never stored in the head)
- * ----------------------------------------------------------------------
- * Every READER-VISIBLE slot of the hlist -- head-first and a node's next -- is
- * transacted under URCU_TXN_SW_HLIST_TAG, the flip proxy tag
- * (<urcu/rcu-txn-sw.h>).  pprev is NOT: it is writer-only state, plain-stored,
- * as the preamble above explains.  It is a compile-time define (default
- * bit 0) rather than a per-call argument, so the head costs no
- * extra storage and call sites stay kernel-terse, and rather than a hard-coded
- * constant so an embedder whose head lives in a slot it already transacts under
- * its OWN tag (e.g. the fractal trie's low-nibble child-slot tag) can
+ * Proxy tag
+ * ---------
+ * The reader-visible slots, head->first and node->next, are transacted under
+ * URCU_TXN_SW_HLIST_TAG (bit 0 by default).  It is a compile-time define, so
+ * the head needs no extra storage.  An embedder whose head lives in a slot it
+ * already transacts under its own tag (e.g. the fractal trie's child-slot tag)
+ * can
  *     #define URCU_TXN_SW_HLIST_TAG   FT_SLOT_TAG
- * before including this header.  Every function is static inline, so TUs picking
- * different tags coexist with no ODR clash.  URCU_TXN_SW_HLIST_TAG must satisfy
- * the engine's per-record contract ((value & TAG) != TAG for every live value a
- * slot holds).
- *
- * Because there is a single writer there is NO logical-deletion mark (nothing
- * concurrent to detect): del simply re-points the naming slot.  A removed node's
- * own next/pprev are left intact (ghost), so a reader standing on it still
- * escapes forward into the live chain; the caller reclaims it after a grace
- * period, exactly as cds_hlist_del_rcu().
+ * before including this header.  Every function is static inline, so
+ * translation units choosing different tags can coexist.  No live value a slot
+ * holds may carry the tag: (value & TAG) != TAG.
  *
  * Read side
  * ---------
- * Iterate under rcu_read_lock() through the resolving accessors
- * (urcu_txn_sw_hlist_first_rcu / _next_rcu) or the macros below -- never touch
- * node->next directly (a transacted slot may transiently hold a tagged proxy).
- * pprev is writer-only and needs no reader accessor.
+ * Iterate within an RCU read-side critical section, through
+ * urcu_txn_sw_hlist_first_rcu() / _next_rcu() or the macros below.  Never read
+ * node->next directly: a slot may transiently hold a tagged proxy.
  *
  * Write side
  * ----------
- * Writers must be mutually excluded.  Each mutator drives a urcu_txn_sw_txn: it
- * records its ONE reader-visible next edge, plain-stores pprev, and commits --
- * for a single op the commit is one store-release, with no proxy installed and
- * so no grace period owed.  Include this header AFTER an RCU flavor header.
+ * Writers must be mutually excluded.  A removed node keeps its own next, so a
+ * reader standing on it still reaches the live chain; the caller reclaims it
+ * after a grace period, as with cds_hlist_del_rcu().  Include this header after
+ * an RCU flavor header.
  *
- * A mutator returns an int with errors negative, so a source port from the
- * concurrent <urcu/rcu-txn-hlist.h> compiles; the single-op forms below
- * allocate nothing and cannot fail.  THE CONVENTIONS ARE NOT OTHERWISE THE
- * SAME, and a mechanical migration breaks on the differences: there, del()
- * returns 1/0 to say whether THIS call removed the node, and that bit is the
- * reclaim gate -- here there is a single writer, so a delete always removed it
- * and the forms return 0.  Port a del site that gated call_rcu on a 1 and it
- * either stops reclaiming or double-frees.  The error codes differ too, and the
- * concurrent forms take a struct urcu_txn_domain * these do not.  A caller
- * composing several ops into one bracket takes on the reserve()-up-front
- * obligation described above.
+ * Return values
+ * -------------
+ * Mutators return an int, negative on error, so that code written against the
+ * concurrent <urcu/rcu-txn-hlist.h> compiles.  The conventions differ
+ * otherwise.  There, del() returns 1 or 0 to say whether this call removed the
+ * node, and callers gate reclaim on it; here a delete always removes the node
+ * and returns 0.  A del site ported unchanged either stops reclaiming or frees
+ * twice.  The error codes differ too, and the concurrent forms take a struct
+ * urcu_txn_domain * that these do not.
  */
 
 #include <stdlib.h>
@@ -178,29 +122,26 @@
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>		/* struct rcu_head */
 #include <urcu/rcu-txn-sw.h>
-#include <urcu-pointer.h>		/* rcu_dereference / rcu_assign_pointer */
+#include <urcu-pointer.h>		/* rcu_dereference() */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /*
- * Flip proxy tag for every hlist slot (head-first and node next/pprev).
- * Override before include to drive the chain under an embedder's own tag.  Must
- * satisfy (value & TAG) != TAG for every live value any slot holds, must be
- * non-zero, and must fit the low 4 bits (see the assert below).
+ * Proxy tag of the reader-visible slots, head->first and node->next.  Override
+ * it before including this header to use an embedder's own tag.  It must be
+ * non-zero and within the low 4 bits, and no live value a slot holds may carry
+ * it: (value & TAG) != TAG.
  */
 #ifndef URCU_TXN_SW_HLIST_TAG
 #define URCU_TXN_SW_HLIST_TAG	1UL
 #endif
 
 /*
- * Two constraints, and neither was stated.  Non-zero: with tag 0 every plain
- * value satisfies the proxy predicate, so a reader resolves live pointers as
- * proxies.  Within the low 4 bits: the parked value is (record_address | TAG)
- * and the record array is only 16-byte aligned, so a wider tag either collides
- * with an address bit -- making the OR a no-op and the untag reconstruct the
- * wrong address -- or is simply not free.
+ * Under a zero tag every plain value would pass for a proxy.  A tag beyond the
+ * low 4 bits would overlap the address of a record, which is only 16-byte
+ * aligned.
  */
 urcu_static_assert(URCU_TXN_SW_HLIST_TAG != 0 &&
 			(URCU_TXN_SW_HLIST_TAG & ~0xFUL) == 0,
@@ -213,7 +154,7 @@ struct urcu_txn_sw_hlist_node {
 	struct urcu_txn_sw_hlist_node **pprev;	/* slot ptr; writer-only */
 };
 
-/* Single 8-byte bucket head, matching struct hlist_head. */
+/* A bucket head is one pointer, like struct hlist_head. */
 struct urcu_txn_sw_hlist_head {
 	struct urcu_txn_sw_hlist_node *first;
 };
@@ -227,10 +168,9 @@ void urcu_txn_sw_hlist_init(struct urcu_txn_sw_hlist_head *head)
 }
 
 /*
- * Resolve a "next"/head-first slot value to the node it currently denotes: a
- * tagged proxy (all of URCU_TXN_SW_HLIST_TAG's bits set -- the sw engine
- * installs record_address | tag) resolves through the flip selector, a direct
- * node pointer passes through unchanged.
+ * Resolve a head->first or node->next slot value to the node it currently
+ * denotes: a tagged proxy resolves to its old or new target, a node pointer is
+ * returned as is.
  */
 static inline
 struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_resolve(
@@ -240,7 +180,7 @@ struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_resolve(
 			urcu_txn_sw_resolve(ptr, URCU_TXN_SW_HLIST_TAG);
 }
 
-/* Resolved bucket-first / forward step (call under rcu_read_lock()). */
+/* First node and forward step, for use within an RCU read-side section. */
 static inline
 struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_first_rcu(
 		struct urcu_txn_sw_hlist_head *head)
@@ -256,10 +196,8 @@ struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_next_rcu(
 }
 
 /*
- * True iff the chain is empty.  CALL WITHIN AN RCU READ-SIDE SECTION, like the
- * accessors it is built on: resolving an installed proxy dereferences the
- * writer's descriptor, which is reclaimed a grace period after that writer
- * commits.
+ * True iff the chain is empty.  Call within an RCU read-side critical section,
+ * like the accessors it is built on.
  */
 static inline
 int urcu_txn_sw_hlist_empty(struct urcu_txn_sw_hlist_head *head)
@@ -268,24 +206,15 @@ int urcu_txn_sw_hlist_empty(struct urcu_txn_sw_hlist_head *head)
 }
 
 /*
- * WRITE-SIDE read of a reader-visible "next"/first slot: its value as @txn will
- * leave it -- this transaction's pending write to the slot if it has recorded
- * one, else the slot's committed value.  A typed wrapper over the engine's
- * read-your-own-writes load (<urcu/rcu-txn-sw.h>).  The _prepare forms below
- * read every forward neighbour link through this rather than touching ->next /
- * *slot directly -- that is what lets edits COMPOSE on one bucket (see
- * urcu_txn_sw_hlist_del_prepare()).  Writer side only -- a reader wants
- * urcu_txn_sw_hlist_first_rcu() / _next_rcu(), which resolve against the flip
- * selector and know nothing of a transaction's pending state.
+ * Write-side read of a head->first or node->next slot: this transaction's
+ * pending write to it if it recorded one, else the slot's committed value.  A
+ * typed wrapper over urcu_txn_sw_load().  The _prepare forms read every forward
+ * link through this, which is what lets edits compose on one bucket (see
+ * urcu_txn_sw_hlist_del_prepare()).  Readers use urcu_txn_sw_hlist_first_rcu()
+ * / _next_rcu() instead.
  *
- * The load returns the committed value when the slot is unrecorded and the
- * pending value once it is, which is exactly what record_chain() wants as the
- * @old_ptr in either case: a fresh record's committed old, or the pending value
- * it asserts against on a chain.
- *
- * There is deliberately no _pending_pprev counterpart: pprev is written by an
- * eager plain store (see the preamble), so a RAW read of it is already this
- * transaction's pending value.
+ * pprev needs no counterpart: it is plain-stored at _prepare time, so reading
+ * it directly already gives this transaction's pending value.
  */
 static inline
 struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_pending_next(
@@ -297,49 +226,32 @@ struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_pending_next(
 }
 
 /*
- * Debug guard on the eager-pprev contract, asserted at the top of every
- * _prepare form.
+ * Debug check at the top of every _prepare: an operation may plain-store pprev
+ * only while no later record of the transaction can fail behind the store.
+ * That holds when nothing is recorded yet, since this operation then stores
+ * nothing if its own record fails, or when the handle has spare capacity, so
+ * that this append cannot fail.
  *
- * The rule it enforces: an op may plain-store pprev only while the whole
- * bracket is still rollbackable -- that is, while no LATER record in it can
- * fail behind the store.  Two ways that holds.  Either nothing has been
- * recorded yet (nr == 0), so this op's own record is the first and it either
- * succeeds or stores nothing (each _prepare below returns early on a failed
- * record, which is what makes a lone-op bracket safe with no reserve at all);
- * or the handle already owns spare capacity, so this append cannot fail.
- *
- * Note what this does NOT check: whether reserve() was called.  That would be
- * the wrong question -- record() grows on demand to URCU_TXN_SW_CAP, so the
- * first several ops of an unreserved bracket are just as infallible as a
- * reserved one, and a reserve() too small for the bracket is just as unsafe.
- * Capacity is the invariant; reserve() up front is simply the reliable way for
- * a caller to guarantee it, and the only way once a bracket outgrows
- * URCU_TXN_SW_CAP.  Firing here means: reserve your edge bound before the first
- * _prepare, or the bracket's pprev bookkeeping can be left skewed by an OOM
- * that publishes nothing.
- *
- * Debug-only: urcu_assert_debug compiles out under NDEBUG, and the predicate is
- * two loads off the handle.
+ * It checks capacity, not whether urcu_txn_sw_reserve() was called: an
+ * unreserved handle has spare capacity for its first URCU_TXN_SW_CAP records,
+ * and a reserve too small for the transaction is no protection.  When it fires,
+ * reserve the transaction's record bound before the first _prepare.
  */
 #define URCU_TXN_SW_HLIST__ASSERT_ROLLBACKABLE(txn)			\
 	urcu_assert_debug((txn)->nr == 0				\
 			|| urcu_txn_sw_append_is_infallible(txn))
 
 /*
- * urcu_txn_sw_hlist_insert_at_slot_prepare: the core composable primitive.
- * Record the edges that make @slot name @newp, given @slot will hold @succ as
- * this transaction leaves it, WITHOUT committing.  @slot is &head->first for
- * insert-at-head or &pos->next for insert-after.  Records the reader-visible
- * *slot edge and, when @succ is non-NULL, the writer-only &succ->pprev edge.
- * Always returns 0 (single writer); the int return matches the concurrent
- * variant for transition parity.
+ * Record the edge that makes @slot name @newp, into @txn, without committing.
+ * @slot is &head->first to insert at the head, or &pos->next to insert after
+ * @pos.  When @succ is non-NULL, its pprev is set to &newp->next.  Always
+ * returns 0; the int return matches the concurrent variant.
  *
- * @succ must be the value @slot will hold as this transaction leaves it, not a
- * raw read: @newp is built pointing at it (newp->next = succ), so a stale @succ
- * links @newp behind a node an earlier edit of the SAME bracket already
- * displaced.  Read it with urcu_txn_sw_hlist_pending_next() when composing on
- * one bucket -- the add_head / add_after wrappers below do.  With that, edits
- * compose on one hlist; see urcu_txn_sw_hlist_del_prepare() for the worked trap.
+ * @succ must be the value @slot will hold as this transaction leaves it, read
+ * with urcu_txn_sw_hlist_pending_next(): @newp is built pointing at it, and a
+ * value read directly would link @newp behind a node that an earlier edit of
+ * the same transaction displaced.  The add_head and add_after forms below do
+ * so.
  */
 static inline
 int urcu_txn_sw_hlist_insert_at_slot_prepare(struct urcu_txn_sw_txn *txn,
@@ -353,19 +265,20 @@ int urcu_txn_sw_hlist_insert_at_slot_prepare(struct urcu_txn_sw_txn *txn,
 	newp->next = succ;
 	newp->pprev = slot;
 
-	/* Reader-visible edge, transacted: *slot: succ -> newp. */
+	/* The reader-visible edge: *slot: succ -> newp. */
 	if (!urcu_txn_sw_record_chain(txn, (void **) slot, succ, newp,
 			URCU_TXN_SW_HLIST_TAG))
-		return 0;			/* OOM: store nothing (see above) */
-	/* Writer-only bookkeeping, eager plain store: succ is now named by &newp->next. */
+		return 0;		/* OOM: store nothing */
+	/* Writer-only: succ is now named by &newp->next. */
 	if (succ != NULL)
 		succ->pprev = &newp->next;
 	return 0;
 }
 
 /*
- * urcu_txn_sw_hlist_add_head_prepare: composable form of insert-at-head (see
- * insert_at_slot_prepare for the contract).  Always returns 0.
+ * Record the insertion of @newp at the head of @head into @txn, without
+ * committing.  See urcu_txn_sw_hlist_insert_at_slot_prepare().  Always
+ * returns 0.
  */
 static inline
 int urcu_txn_sw_hlist_add_head_prepare(struct urcu_txn_sw_txn *txn,
@@ -378,8 +291,8 @@ int urcu_txn_sw_hlist_add_head_prepare(struct urcu_txn_sw_txn *txn,
 }
 
 /*
- * urcu_txn_sw_hlist_add_after_prepare: composable form of insert-after @pos.
- * Always returns 0.
+ * Record the insertion of @newp after @pos into @txn, without committing.  See
+ * urcu_txn_sw_hlist_insert_at_slot_prepare().  Always returns 0.
  */
 static inline
 int urcu_txn_sw_hlist_add_after_prepare(struct urcu_txn_sw_txn *txn,
@@ -392,51 +305,47 @@ int urcu_txn_sw_hlist_add_after_prepare(struct urcu_txn_sw_txn *txn,
 }
 
 /*
- * urcu_txn_sw_hlist_add_before_prepare: composable form of insert-before @pos
- * (kernel hlist_add_before).  @pos->pprev names the slot to re-point.  Always
- * returns 0.
+ * Record the insertion of @newp before @pos (the kernel's hlist_add_before)
+ * into @txn, without committing.  @pos->pprev names the slot to re-point.
+ * Always returns 0.
  */
 static inline
 int urcu_txn_sw_hlist_add_before_prepare(struct urcu_txn_sw_txn *txn,
 		struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_node *pos)
 {
-	struct urcu_txn_sw_hlist_node **slot = pos->pprev;	/* raw: eager-stored, already pending */
+	/* pprev is plain-stored at _prepare time: read it directly. */
+	struct urcu_txn_sw_hlist_node **slot = pos->pprev;
 
 	URCU_TXN_SW_HLIST__ASSERT_ROLLBACKABLE(txn);
 
 	newp->next = pos;
 	newp->pprev = slot;
 
-	/* Reader-visible edge, transacted: *slot: pos -> newp. */
+	/* The reader-visible edge: *slot: pos -> newp. */
 	if (!urcu_txn_sw_record_chain(txn, (void **) slot, pos, newp,
 			URCU_TXN_SW_HLIST_TAG))
-		return 0;			/* OOM: store nothing (see above) */
-	pos->pprev = &newp->next;		/* writer-only, eager plain store */
+		return 0;		/* OOM: store nothing */
+	pos->pprev = &newp->next;		/* writer-only: a plain store */
 	return 0;
 }
 
 /*
- * urcu_txn_sw_hlist_del_prepare: composable form of del.  @elem between slot
- * *elem->pprev and next.  @elem's own next/pprev are left intact (ghost) so a
- * reader standing on it still escapes forward; the caller frees @elem after a
- * grace period (post-commit).  Always returns 0.
+ * Record the unlink of @elem into @txn, without committing.  @elem's own
+ * next/pprev are left as they are, so a reader standing on it still reaches the
+ * live chain; the caller frees @elem a grace period after the commit.  Always
+ * returns 0.
  *
- * Composition on one bucket, worked through -- delete adjacent A and B from
- * head -> A -> B -> C in one bracket.  del(A) records {*head->first: A -> B},
- * then plain-stores B->pprev = &head->first.  del(B) reads B->pprev RAW and gets
- * &head->first -- the value that store just left there, NOT the stale &A->next
- * -- so it records against &head->first, finds it already recorded, and CHAINS:
- * {*head->first: A -> C}; then plain-stores C->pprev = &head->first.  Result:
- * head->first == C, C->pprev == &head->first; A and B both unlinked, in ONE
- * recorded edge.
+ * Composing on one bucket, by example: delete the adjacent A and B from
+ * head -> A -> B -> C in one transaction.  del(A) records
+ * {&head->first: A -> B}, then sets B->pprev = &head->first.  del(B) reads
+ * B->pprev and gets &head->first, not the stale &A->next, so it records against
+ * &head->first, finds it recorded, and chains: {&head->first: A -> C}.  It then
+ * sets C->pprev = &head->first.  Both nodes are unlinked with a single record.
  *
- * What makes the raw read safe is that the pprev store is EAGER.  Defer it to
- * after the commit and del(B) would read the stale &A->next -- a slot inside the
- * node del(A) just unlinked -- and re-point that dead slot, leaving head->first
- * naming the deleted B.  Eager plain store and transacted pprev agree on every
- * committed outcome; they part only on the OOM path, which is what the
- * reserve()-up-front contract in the preamble exists to close.
+ * This relies on pprev being stored at _prepare time.  Were the store deferred
+ * to after the commit, del(B) would read &A->next, a slot inside the node that
+ * del(A) just unlinked, and head->first would be left naming the deleted B.
  */
 static inline
 int urcu_txn_sw_hlist_del_prepare(struct urcu_txn_sw_txn *txn,
@@ -444,24 +353,26 @@ int urcu_txn_sw_hlist_del_prepare(struct urcu_txn_sw_txn *txn,
 {
 	struct urcu_txn_sw_hlist_node *next =
 			urcu_txn_sw_hlist_pending_next(txn, &elem->next);
-	struct urcu_txn_sw_hlist_node **ppv = elem->pprev;	/* raw: eager-stored, already pending */
+	/* pprev is plain-stored at _prepare time: read it directly. */
+	struct urcu_txn_sw_hlist_node **ppv = elem->pprev;
 
 	URCU_TXN_SW_HLIST__ASSERT_ROLLBACKABLE(txn);
 
-	/* Reader-visible edge, transacted: *ppv: elem -> next. */
+	/* The reader-visible edge: *ppv: elem -> next. */
 	if (!urcu_txn_sw_record_chain(txn, (void **) ppv, elem, next,
 			URCU_TXN_SW_HLIST_TAG))
-		return 0;			/* OOM: store nothing (see above) */
-	/* Writer-only bookkeeping, eager plain store: next inherits elem's slot. */
+		return 0;		/* OOM: store nothing */
+	/* Writer-only: next takes elem's slot. */
 	if (next != NULL)
 		next->pprev = ppv;
 	return 0;
 }
 
 /*
- * urcu_txn_sw_hlist_replace_prepare: composable form of replace.  @newp inherits
- * @old's slot and successor; @old is left ghost for parked readers.  Argument
- * order is (old, new), as cds_list_replace_rcu().  Always returns 0.
+ * Record the replacement of @old by @newp into @txn, without committing.  @newp
+ * takes @old's slot and successor, and @old keeps its own next for readers
+ * standing on it.  Arguments are (old, new), as cds_list_replace_rcu().  Always
+ * returns 0.
  */
 static inline
 int urcu_txn_sw_hlist_replace_prepare(struct urcu_txn_sw_txn *txn,
@@ -470,39 +381,35 @@ int urcu_txn_sw_hlist_replace_prepare(struct urcu_txn_sw_txn *txn,
 {
 	struct urcu_txn_sw_hlist_node *next =
 			urcu_txn_sw_hlist_pending_next(txn, &old->next);
-	struct urcu_txn_sw_hlist_node **ppv = old->pprev;	/* raw: eager-stored, already pending */
+	/* pprev is plain-stored at _prepare time: read it directly. */
+	struct urcu_txn_sw_hlist_node **ppv = old->pprev;
 
 	URCU_TXN_SW_HLIST__ASSERT_ROLLBACKABLE(txn);
 
 	newp->next = next;
 	newp->pprev = ppv;
 
-	/* Reader-visible edge, transacted: *ppv: old -> newp. */
+	/* The reader-visible edge: *ppv: old -> newp. */
 	if (!urcu_txn_sw_record_chain(txn, (void **) ppv, old, newp,
 			URCU_TXN_SW_HLIST_TAG))
-		return 0;			/* OOM: store nothing (see above) */
-	/* Writer-only bookkeeping, eager plain store: next is now named by &newp->next. */
+		return 0;		/* OOM: store nothing */
+	/* Writer-only: next is now named by &newp->next. */
 	if (next != NULL)
 		next->pprev = &newp->next;
 	return 0;
 }
 
 /*
- * Convenience brackets: each records its op and commits it.
+ * The _rcu forms: each records one operation and commits it.
  *
- * Every op records EXACTLY ONE edge (the reader-visible one; pprev is a plain
- * store), which the engine commits with a lone store-release -- no proxy is
- * installed, no descriptor is allocated, and no grace period is owed.  So these
- * drive a caller-storage handle over a one-record on-stack buffer
- * (urcu_txn_sw_init_inline, blessed for exactly this lone-edge use): the whole
- * bracket is allocation-free, and a single hlist mutation costs about what a
- * bare rcu_assign_pointer does.
+ * An operation records exactly one edge, which commits as a lone store-release:
+ * no proxy is installed, no descriptor is allocated and no grace period is
+ * owed.  These forms therefore use a caller-storage handle over a one-record
+ * on-stack buffer (urcu_txn_sw_init_inline()), and allocate nothing.
  *
- * With no allocation there is no failure path: commit cannot report
- * MEMORY_ERROR and these cannot return -1.  The int return is kept for source
- * compatibility with the concurrent <urcu/rcu-txn-hlist.h>, whose same-named
- * forms CAN fail -- shape only; see the preamble for the convention
- * differences a port has to fix by hand, del()'s reclaim gate above all.
+ * Without an allocation they cannot fail, and always return 0.  The int return
+ * is kept for source compatibility with the concurrent <urcu/rcu-txn-hlist.h>;
+ * see "Return values" above.
  */
 static inline
 int urcu_txn_sw_hlist_add_head_rcu(struct urcu_txn_sw_hlist_node *newp,
@@ -568,7 +475,8 @@ int urcu_txn_sw_hlist_replace_rcu(struct urcu_txn_sw_hlist_node *old,
 
 #define urcu_txn_sw_hlist_entry_safe(ptr, type, member) \
 	__extension__ ({ __typeof__(ptr) ___ptr = (ptr); \
-		___ptr ? urcu_txn_sw_hlist_entry(___ptr, type, member) : NULL; })
+		___ptr ? urcu_txn_sw_hlist_entry(___ptr, type, member) \
+			: NULL; })
 
 /* Iterate forward over a bucket (under rcu_read_lock()). */
 #define urcu_txn_sw_hlist_for_each_rcu(pos, head) \
