@@ -84,7 +84,7 @@
  * old...old,new...new sequence -- never new-then-old.  Embedders can rely
  * on this together with a fixed read order to avoid a per-traversal
  * snapshot (e.g. publishing the back edges of a re-parent through the
- * latch *before* the forward edge, so a reader descending before it
+ * transaction *before* the forward edge, so a reader descending before it
  * walks back up can only ever progress old->new, never regress).
  *
  * Scope of "never new-then-old":  Monotonicity of the selector is
