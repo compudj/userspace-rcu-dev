@@ -162,6 +162,9 @@ extern "C" {
  * which drops it.  Either consumes the handle, which must be initialized again
  * before it is reused.
  *
+ * One thread drives a handle from init() to its end.  A handle that holds no
+ * record yet may change hands once: see urcu_txn_sw_adopt().
+ *
  * OOM is sticky.  Once a reserve() or a record() has failed to allocate, later
  * ones do nothing and commit() publishes nothing and reports MEMORY_ERROR.  An
  * embedder may therefore ignore their return values and test only commit()'s.
@@ -274,7 +277,8 @@ struct urcu_txn_sw_txn {
 	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];  /* RYW certain-miss filter */
 #ifdef URCU_TXN_SW_EXCL_VALIDATE
 	/*
-	 * Thread that initialized the handle, and must drive it end to end.
+	 * Thread that initialized the handle, or adopted it, and must drive it
+	 * to its end.
 	 * Last: liburcu-common is handed the handle (urcu_txn_sw__grow()) and
 	 * may be built without it, so no other member's offset may depend on
 	 * it.
@@ -416,9 +420,10 @@ void urcu_txn_sw__record_settle(struct urcu_txn_sw_record *r)
  * There is no per-structure object to claim an owner on, so the
  * validator claims the two things that do exist:
  *
- *   - the handle.  Its owner is the thread that initialized it, and
- *     reserve / record / load / commit / cancel must all run on that thread.
- *     Catches a transaction handed between threads mid-flight.
+ *   - the handle.  Its owner is the thread that initialized it, or the one
+ *     that adopted it before anything was recorded, and reserve / record /
+ *     load / commit / cancel must all run on that thread.  Catches a
+ *     transaction handed between threads mid-flight.
  *
  *   - the slot, which is what two racing writers actually share, and so is
  *     where the real violation is visible.  In a correct single-writer
@@ -459,6 +464,15 @@ void urcu_txn_sw__excl_owner(const struct urcu_txn_sw_txn *t, const char *what)
 			(const void *) t, what);
 }
 
+/* @t must hold no record: one that changes hands with some is mid-flight. */
+static inline
+void urcu_txn_sw__excl_adoptable(const struct urcu_txn_sw_txn *t)
+{
+	if (t->nr)
+		urcu_txn_sw__excl_abort("txn=%p: adopt() of a handle that holds %u records -- a transaction does not change hands once it has recorded\n",
+			(const void *) t, t->nr);
+}
+
 /* @slot must hold no proxy: it would be another writer's. */
 static inline
 void urcu_txn_sw__excl_slot_free(void **slot, uintptr_t tag, const char *what)
@@ -496,6 +510,12 @@ static inline
 void urcu_txn_sw__excl_owner(
 		const struct urcu_txn_sw_txn *t __attribute__((unused)),
 		const char *what __attribute__((unused)))
+{
+}
+
+static inline
+void urcu_txn_sw__excl_adoptable(
+		const struct urcu_txn_sw_txn *t __attribute__((unused)))
 {
 }
 
@@ -724,6 +744,25 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 	if (t->records_inline)
 		return false;
 	return urcu_txn_sw__resize(t, cap);
+}
+
+/*
+ * Take over a handle that another thread got ready.
+ *
+ * One thread drives a transaction end to end.  An embedder may still get a
+ * handle ready on one thread, where a failure is easy to handle, with init()
+ * and reserve(), and have another record and commit, or cancel.  The thread
+ * that takes over calls this first, on a handle that holds no record yet.  The
+ * embedder makes sure that the thread which got the handle ready is done with
+ * it.
+ *
+ * It changes which thread URCU_TXN_SW_EXCL_VALIDATE expects, and nothing else.
+ */
+static inline
+void urcu_txn_sw_adopt(struct urcu_txn_sw_txn *t)
+{
+	urcu_txn_sw__excl_adoptable(t);
+	urcu_txn_sw__excl_claim(t);
 }
 
 /*

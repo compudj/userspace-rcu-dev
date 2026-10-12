@@ -60,7 +60,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	7
+#define NR_TESTS	10
 
 #define TAG	1UL		/* bit 0: no live value below carries it */
 
@@ -118,6 +118,77 @@ static void body_cross_thread(void)
 	if (pthread_create(&th, NULL, handoff_thread, NULL))
 		return;				/* cannot provoke: child exits 0 */
 	(void) pthread_join(th, NULL);
+}
+
+/*
+ * A handle got ready here, with a reserve, and adopted by the thread that
+ * drives it: what an embedder does when it allocates where it can still fail
+ * and commits elsewhere.
+ */
+static void *adopt_commit_thread(void *arg)
+{
+	(void) arg;
+	rcu_register_thread();
+	urcu_txn_sw_adopt(&g_handoff);		/* owner := this thread */
+	(void) urcu_txn_sw_record(&g_handoff, &g_a, V0, V1, TAG);
+	(void) urcu_txn_sw_record_chain(&g_handoff, &g_b,
+			urcu_txn_sw_load(&g_handoff, &g_b, TAG), V1, TAG);
+	if (urcu_txn_sw_commit(&g_handoff) != URCU_TXN_STATUS_OK)
+		abort();		/* fail the case: an adopted txn commits */
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void body_adopt_commit(void)
+{
+	pthread_t th;
+
+	g_a = V0;
+	g_b = V0;
+	urcu_txn_sw_init(&g_handoff);
+	if (!urcu_txn_sw_reserve(&g_handoff, 2))
+		abort();
+	if (pthread_create(&th, NULL, adopt_commit_thread, NULL))
+		abort();
+	(void) pthread_join(th, NULL);
+	if (g_a != V1 || g_b != V1)
+		abort();		/* fail the case: the commit did not land */
+}
+
+/* The same handle, let go of by the thread that adopted it. */
+static void *adopt_cancel_thread(void *arg)
+{
+	(void) arg;
+	urcu_txn_sw_adopt(&g_handoff);
+	urcu_txn_sw_cancel(&g_handoff);
+	return NULL;
+}
+
+static void body_adopt_cancel(void)
+{
+	pthread_t th;
+
+	urcu_txn_sw_init(&g_handoff);
+	if (!urcu_txn_sw_reserve(&g_handoff, 2))
+		abort();
+	if (pthread_create(&th, NULL, adopt_cancel_thread, NULL))
+		abort();
+	(void) pthread_join(th, NULL);
+}
+
+/*
+ * A handle that already holds a record is mid-flight: it does not change
+ * hands.  One thread is enough to show it.
+ */
+static void body_adopt_recorded(void)
+{
+	struct urcu_txn_sw_txn t;
+
+	g_a = V0;
+	urcu_txn_sw_init(&t);
+	(void) urcu_txn_sw_record(&t, &g_a, V0, V1, TAG);
+	urcu_txn_sw_adopt(&t);
+	urcu_txn_sw_cancel(&t);
 }
 
 /*
@@ -251,6 +322,12 @@ int main(void)
 
 	ok(aborts_in_child(body_cross_thread),
 		"a handle driven from a thread other than the one that init'd it aborts");
+	ok(!aborts_in_child(body_adopt_commit),
+		"a handle adopted before anything is recorded commits on the adopting thread");
+	ok(!aborts_in_child(body_adopt_cancel),
+		"a handle adopted before anything is recorded is cancelled on the adopting thread");
+	ok(aborts_in_child(body_adopt_recorded),
+		"adopting a handle that already holds a record aborts");
 	ok(aborts_in_child(body_record_over_parked),
 		"recording a slot another writer has already parked aborts");
 	ok(aborts_in_child(body_park_over_parked),
