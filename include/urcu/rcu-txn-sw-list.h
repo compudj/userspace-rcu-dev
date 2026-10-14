@@ -27,6 +27,10 @@
  *   insert E between P and N:   P->next: N -> E   and   N->prev: P -> E
  *   delete E between P and N:   P->next: E -> N   and   N->prev: E -> P
  *
+ * A move of E from between P and N to between Q and R re-points six: those of
+ * the delete and of the insert, and E's own next and prev, which a reader
+ * standing on E follows.
+ *
  * rcu-txn-sw-list commits both edges as one RCU pseudo-transaction
  * (<urcu/rcu-txn-sw.h>): the two slots transiently hold tagged proxies that
  * share one selector, and one store-release switches both edges from old to
@@ -67,8 +71,8 @@
  * Write side
  * ----------
  * Writers must be mutually excluded, as with cds_list_*_rcu.  Each mutator
- * records its forward and backward edge in a urcu_txn_sw_txn and commits them
- * together.  The transaction reclaims itself through call_rcu() after a grace
+ * records its edges in a urcu_txn_sw_txn, a forward and a backward one or six
+ * for a move, and commits them together.  The transaction reclaims itself through call_rcu() after a grace
  * period, so this header must be included after an RCU flavor header (e.g.
  * <urcu-qsbr.h>).  A mutator returns 0 on success, or -1 if the transaction
  * could not be allocated, in which case the list is unchanged.
@@ -431,6 +435,116 @@ int urcu_txn_sw_list_replace_rcu(struct urcu_txn_sw_list_node *old,
 	(void) urcu_txn_sw_reserve(&txn, 2);
 	(void) urcu_txn_sw_list_replace_prepare(&txn, old, newp);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
+}
+
+/*
+ * Record the move of @elem, a node of the list, to just after @pos into @txn,
+ * without committing.  See urcu_txn_sw_list_add_after_prepare().  Six edges
+ * switch together: the two that unlink @elem, the two that link it after @pos,
+ * and @elem's own next and prev, so that a reader standing on @elem leaves it
+ * by its old neighbours until the commit and by its new ones from then on.
+ *
+ * A move of @elem after the node it already follows records nothing.  @pos must
+ * not be @elem.  Always returns 0.
+ */
+static inline
+int urcu_txn_sw_list_move_after_prepare(struct urcu_txn_sw_txn *txn,
+		struct urcu_txn_sw_list_node *elem,
+		struct urcu_txn_sw_list_node *pos)
+{
+	struct urcu_txn_sw_list_node *prev =
+			urcu_txn_sw_list_pending(txn, &elem->prev);
+	struct urcu_txn_sw_list_node *next =
+			urcu_txn_sw_list_pending(txn, &elem->next);
+	struct urcu_txn_sw_list_node *succ;
+
+	urcu_posix_assert(pos != elem);
+	if (pos == prev)
+		return 0;		/* already there */
+	succ = urcu_txn_sw_list_pending(txn, &pos->next);
+
+	/* prev->next: elem -> next ; next->prev: elem -> prev */
+	(void) urcu_txn_sw_record_chain(txn, (void **) &prev->next, elem, next,
+			URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &next->prev, elem, prev,
+			URCU_TXN_SW_LIST_PROXY_TAG);
+	/* pos->next: succ -> elem ; succ->prev: pos -> elem */
+	(void) urcu_txn_sw_record_chain(txn, (void **) &pos->next, succ, elem,
+			URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &succ->prev, pos, elem,
+			URCU_TXN_SW_LIST_PROXY_TAG);
+	/* elem->next: next -> succ ; elem->prev: prev -> pos */
+	(void) urcu_txn_sw_record_chain(txn, (void **) &elem->next, next, succ,
+			URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &elem->prev, prev, pos,
+			URCU_TXN_SW_LIST_PROXY_TAG);
+	return 0;
+}
+
+/*
+ * Record the move of @elem to just before @pos into @txn, without committing.
+ * See urcu_txn_sw_list_move_after_prepare().  Always returns 0.
+ */
+static inline
+int urcu_txn_sw_list_move_before_prepare(struct urcu_txn_sw_txn *txn,
+		struct urcu_txn_sw_list_node *elem,
+		struct urcu_txn_sw_list_node *pos)
+{
+	struct urcu_txn_sw_list_node *prev =
+			urcu_txn_sw_list_pending(txn, &pos->prev);
+
+	urcu_posix_assert(pos != elem);
+	if (prev == elem)
+		return 0;		/* already there */
+	return urcu_txn_sw_list_move_after_prepare(txn, elem, prev);
+}
+
+/* Move @elem to just after @pos, in a transaction of its own. */
+static inline
+int urcu_txn_sw_list_move_after_rcu(struct urcu_txn_sw_list_node *elem,
+		struct urcu_txn_sw_list_node *pos)
+{
+	struct urcu_txn_sw_txn txn;
+
+	urcu_txn_sw_init(&txn);
+	/* One operation: its six slots are distinct. */
+	urcu_txn_sw_declare_disjoint(&txn);
+	/* An OOM is sticky: commit reports it. */
+	(void) urcu_txn_sw_reserve(&txn, 6);
+	(void) urcu_txn_sw_list_move_after_prepare(&txn, elem, pos);
+	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
+}
+
+/* Move @elem to just before @pos, in a transaction of its own. */
+static inline
+int urcu_txn_sw_list_move_before_rcu(struct urcu_txn_sw_list_node *elem,
+		struct urcu_txn_sw_list_node *pos)
+{
+	struct urcu_txn_sw_txn txn;
+
+	urcu_txn_sw_init(&txn);
+	/* One operation: its six slots are distinct. */
+	urcu_txn_sw_declare_disjoint(&txn);
+	/* An OOM is sticky: commit reports it. */
+	(void) urcu_txn_sw_reserve(&txn, 6);
+	(void) urcu_txn_sw_list_move_before_prepare(&txn, elem, pos);
+	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
+}
+
+/* Move @elem to the head of the list (just after @head). */
+static inline
+int urcu_txn_sw_list_move_rcu(struct urcu_txn_sw_list_node *elem,
+		struct urcu_txn_sw_list_head *head)
+{
+	return urcu_txn_sw_list_move_after_rcu(elem, &head->node);
+}
+
+/* Move @elem to the tail of the list (just before @head). */
+static inline
+int urcu_txn_sw_list_move_tail_rcu(struct urcu_txn_sw_list_node *elem,
+		struct urcu_txn_sw_list_head *head)
+{
+	return urcu_txn_sw_list_move_before_rcu(elem, &head->node);
 }
 
 #define urcu_txn_sw_list_entry(ptr, type, member) \

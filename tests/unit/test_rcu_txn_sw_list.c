@@ -7,7 +7,7 @@
  * RCU list.  Validates that:
  *   - forward and reverse iteration are exact mirrors;
  *   - next/prev are mutual inverses around the whole ring (coherence);
- *   - add / add_tail / del / replace keep both directions coherent;
+ *   - add / add_tail / del / replace / move keep both directions coherent;
  *   - the proxy-flip resolves correctly across the
  *     install -> commit -> settle phases of a two-edge flip (the
  *     mechanism a concurrent reader relies on).
@@ -34,7 +34,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	30
+#define NR_TESTS	62
 
 struct bl_node {
 	struct urcu_txn_sw_list_node node;
@@ -459,6 +459,145 @@ static void test_compose_triple_del(void)
 	destroy_list(&head);
 }
 
+/* Check both directions of @head against @want, and the ring's coherence. */
+static void expect_order(struct urcu_txn_sw_list_head *head, const int *want,
+		int nr, const char *what)
+{
+	int fwd[8], rev[8], i, n;
+
+	n = collect_forward(head, fwd, 8);
+	ok(n == nr && arr_eq(fwd, want, nr), "%s: forward order", what);
+	n = collect_reverse(head, rev, 8);
+	for (i = 0; i < nr && n == nr; i++)
+		if (rev[i] != want[nr - 1 - i])
+			n = -1;
+	ok(n == nr, "%s: reverse order", what);
+	ok(check_inverses(head), "%s: ring stays coherent", what);
+}
+
+/* The moves of a node, in a transaction of their own. */
+static void test_move(void)
+{
+	URCU_TXN_SW_LIST_HEAD(head);
+	const int want_front[5] = { 4, 1, 2, 3, 5 };
+	const int want_tail[5] = { 1, 2, 3, 5, 4 };
+	const int want_next[5] = { 1, 3, 2, 5, 4 };
+	const int want_back[5] = { 1, 2, 3, 5, 4 };
+	struct urcu_txn_sw_list_node *e1, *e2, *e3, *e4;
+	struct urcu_txn_sw_txn t;
+	int i;
+
+	for (i = 1; i <= 5; i++)
+		urcu_txn_sw_list_add_tail_rcu(&bl_node_new(i)->node, &head);
+	e1 = find_key(&head, 1);
+	e2 = find_key(&head, 2);
+	e3 = find_key(&head, 3);
+	e4 = find_key(&head, 4);
+
+	ok(urcu_txn_sw_list_move_rcu(e4, &head) == 0, "move to the front");
+	expect_order(&head, want_front, 5, "move to the front");
+	ok(urcu_txn_sw_list_move_tail_rcu(e4, &head) == 0, "move to the tail");
+	expect_order(&head, want_tail, 5, "move to the tail");
+	/* Past its next, then back before it: the neighbourhoods overlap. */
+	ok(urcu_txn_sw_list_move_after_rcu(e2, e3) == 0, "move after the next");
+	expect_order(&head, want_next, 5, "move after the next");
+	ok(urcu_txn_sw_list_move_before_rcu(e2, e3) == 0, "move before the prev");
+	expect_order(&head, want_back, 5, "move before the prev");
+
+	/* Where it already is: nothing is recorded. */
+	urcu_txn_sw_init(&t);
+	(void) urcu_txn_sw_list_move_after_prepare(&t, e2, e1);
+	(void) urcu_txn_sw_list_move_before_prepare(&t, e1, e2);
+	ok(t.nr == 0, "a move to where a node already is records nothing");
+	urcu_txn_sw_cancel(&t);
+	destroy_list(&head);
+}
+
+/*
+ * Drive the six-edge flip of a move by hand: a reader standing on the moved
+ * node, or next to it, sees the old list until the flip and the new one after,
+ * the node's own links included.
+ *
+ * Ring: head <-> A <-> B <-> C <-> D <-> head.  Move D after A.
+ */
+static void test_move_phases(void)
+{
+	URCU_TXN_SW_LIST_HEAD(head);
+	struct urcu_txn_sw_list_node *n[4], *H = &head.node;
+	struct urcu_txn_sw_list_node *A, *B, *C, *D;
+	struct urcu_txn_sw_txn t;
+	unsigned int i;
+
+	for (i = 0; i < 4; i++) {
+		n[i] = &bl_node_new(i + 1)->node;
+		urcu_txn_sw_list_add_tail_rcu(n[i], &head);
+	}
+	A = n[0];
+	B = n[1];
+	C = n[2];
+	D = n[3];
+
+	urcu_txn_sw_init(&t);
+	ok(urcu_txn_sw_reserve(&t, 6), "move phases: reserve");
+	(void) urcu_txn_sw_list_move_after_prepare(&t, D, A);
+	ok(t.nr == 6, "move phases: six edges recorded");
+	for (i = 0; i < t.nr; i++)
+		urcu_txn_sw__record_install(&t.desc->group, &t.records[i]);
+
+	rcu_read_lock();
+	ok(urcu_txn_sw_list_next_rcu(A) == B && urcu_txn_sw_list_prev_rcu(B) == A,
+		"install: A and B still linked");
+	ok(urcu_txn_sw_list_next_rcu(C) == D && urcu_txn_sw_list_prev_rcu(H) == D,
+		"install: D still between C and head");
+	ok(urcu_txn_sw_list_next_rcu(D) == H && urcu_txn_sw_list_prev_rcu(D) == C,
+		"install: D's own links are the old ones");
+	rcu_read_unlock();
+
+	urcu_txn_sw__group_commit(&t.desc->group);
+
+	rcu_read_lock();
+	ok(urcu_txn_sw_list_next_rcu(A) == D && urcu_txn_sw_list_prev_rcu(B) == D,
+		"commit: D between A and B");
+	ok(urcu_txn_sw_list_next_rcu(C) == H && urcu_txn_sw_list_prev_rcu(H) == C,
+		"commit: C and head linked");
+	ok(urcu_txn_sw_list_next_rcu(D) == B && urcu_txn_sw_list_prev_rcu(D) == A,
+		"commit: D's own links are the new ones");
+	rcu_read_unlock();
+
+	/* No reader holds a proxy here: the records need no grace period. */
+	for (i = 0; i < t.nr; i++)
+		uatomic_store(t.records[i].slot, t.records[i].ptr[1], CMM_RELEASE);
+	urcu_txn_sw__desc_free(t.desc);
+	urcu_txn_sw__done(&t);
+	{
+		const int want[4] = { 1, 4, 2, 3 };
+
+		expect_order(&head, want, 4, "move phases: settled");
+	}
+	destroy_list(&head);
+}
+
+/* Two moves to the front in one transaction: their edges chain. */
+static void test_compose_moves(void)
+{
+	URCU_TXN_SW_LIST_HEAD(head);
+	const int want[4] = { 4, 3, 1, 2 };
+	struct urcu_txn_sw_txn t;
+	int i, st;
+
+	for (i = 1; i <= 4; i++)
+		urcu_txn_sw_list_add_tail_rcu(&bl_node_new(i)->node, &head);
+	urcu_txn_sw_init(&t);
+	(void) urcu_txn_sw_list_move_after_prepare(&t, find_key(&head, 3),
+			&head.node);
+	(void) urcu_txn_sw_list_move_after_prepare(&t, find_key(&head, 4),
+			&head.node);
+	st = urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
+	ok(st, "compose two moves: commit");
+	expect_order(&head, want, 4, "compose two moves");
+	destroy_list(&head);
+}
+
 int main(void)
 {
 	int err;
@@ -481,6 +620,9 @@ int main(void)
 	test_compose_adjacent_del();
 	test_compose_del_and_add();
 	test_compose_triple_del();
+	test_move();
+	test_move_phases();
+	test_compose_moves();
 
 	rcu_barrier();			/* drain proxy + node reclaim callbacks */
 	rcu_unregister_thread();
