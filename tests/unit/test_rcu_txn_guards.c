@@ -175,10 +175,10 @@ static void body_tagged_old(void)
 /* 4. sw: an inline (caller-storage) handle is given a second record. */
 static void body_sw_inline_two_records(void)
 {
-	struct urcu_txn_sw_record buf[4] __attribute__((aligned(16)));
+	struct urcu_txn_sw_record rec;
 	struct urcu_txn_sw_txn t;
 
-	urcu_txn_sw_init_inline(&t, buf, 4);
+	urcu_txn_sw_init_inline(&t, &rec);
 	(void) urcu_txn_sw_record(&t, &g_a, NULL, V0, URCU_TXN_TAG);
 	/* nr >= 2 on inline storage: illegal */
 	(void) urcu_txn_sw_record(&t, &g_b, NULL, V1, URCU_TXN_TAG);

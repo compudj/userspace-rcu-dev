@@ -242,20 +242,20 @@ int main(void)
 
 	/*
 	 * 5. Inline (caller-storage) lone-edge: urcu_txn_sw_init_inline backs the
-	 * record array with an on-stack record buffer (no allocation).  A
+	 * record array with one on-stack record (no allocation).  A
 	 * single recorded edge takes the fast path -- one direct store, no
 	 * proxy -- and commit_flavor() never touches the reclaim fn or frees
 	 * the inline buffer.
 	 */
 	{
 		void *slot = (void *) 0x100;
-		struct urcu_txn_sw_record buf[1];
+		struct urcu_txn_sw_record rec;
 		struct urcu_txn_sw_txn _t, *t = &_t;
 		enum urcu_txn_status st;
 
-		ok(((unsigned long) buf & 0xfUL) == 0,
-			"inline record buffer is 16-byte aligned (tag room)");
-		urcu_txn_sw_init_inline(t, buf, 1);
+		ok(((unsigned long) &rec & 0xfUL) == 0,
+			"inline record is 16-byte aligned (tag room)");
+		urcu_txn_sw_init_inline(t, &rec);
 		urcu_txn_sw_record(t, &slot, (void *) 0x100, (void *) 0x200, TEST_TAG);
 		st = urcu_txn_sw_commit_flavor(t, sync_call_rcu, NULL);	/* lone edge: fn unused */
 		ok(st == URCU_TXN_STATUS_OK, "inline lone-edge commit_flavor returns OK");
@@ -316,7 +316,7 @@ int main(void)
 	 */
 	{
 		void *s1 = (void *) 0x60, *s2 = (void *) 0x70;
-		struct urcu_txn_sw_record buf[1];
+		struct urcu_txn_sw_record rec;
 		struct urcu_txn_sw_txn _t, *t = &_t;
 		enum urcu_txn_status st;
 		uintptr_t prev = 0;
@@ -358,7 +358,7 @@ int main(void)
 		ok(t->state == URCU_TXN_SW_DONE,
 			"cancel accepts a handle that recorded nothing");
 
-		urcu_txn_sw_init_inline(t, buf, 1);
+		urcu_txn_sw_init_inline(t, &rec);
 		urcu_txn_sw_record(t, &s1, (void *) 0x60, (void *) 0x62, TEST_TAG);
 		urcu_txn_sw_cancel(t);
 		ok(s1 == (void *) 0x60 && t->state == URCU_TXN_SW_DONE,

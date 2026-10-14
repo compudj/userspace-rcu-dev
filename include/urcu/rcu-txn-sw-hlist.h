@@ -407,8 +407,8 @@ int urcu_txn_sw_hlist_replace_prepare(struct urcu_txn_sw_txn *txn,
  *
  * An operation records exactly one edge, which commits as a lone store-release:
  * no proxy is installed, no descriptor is allocated and no grace period is
- * owed.  These forms therefore use a caller-storage handle over a one-record
- * on-stack buffer (urcu_txn_sw_init_inline()), and allocate nothing.
+ * owed.  These forms therefore use a caller-storage handle over one on-stack
+ * record (urcu_txn_sw_init_inline()), and allocate nothing.
  *
  * Without an allocation they cannot fail, and always return 0.  The int return
  * is kept for source compatibility with the concurrent <urcu/rcu-txn-hlist.h>;
@@ -418,10 +418,10 @@ static inline
 int urcu_txn_sw_hlist_add_head_rcu(struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_head *head)
 {
-	struct urcu_txn_sw_record buf[1];
+	struct urcu_txn_sw_record rec;
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init_inline(&txn, buf, 1);
+	urcu_txn_sw_init_inline(&txn, &rec);
 	(void) urcu_txn_sw_hlist_add_head_prepare(&txn, newp, head);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
@@ -430,10 +430,10 @@ static inline
 int urcu_txn_sw_hlist_add_after_rcu(struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_node *pos)
 {
-	struct urcu_txn_sw_record buf[1];
+	struct urcu_txn_sw_record rec;
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init_inline(&txn, buf, 1);
+	urcu_txn_sw_init_inline(&txn, &rec);
 	(void) urcu_txn_sw_hlist_add_after_prepare(&txn, newp, pos);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
@@ -442,10 +442,10 @@ static inline
 int urcu_txn_sw_hlist_add_before_rcu(struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_node *pos)
 {
-	struct urcu_txn_sw_record buf[1];
+	struct urcu_txn_sw_record rec;
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init_inline(&txn, buf, 1);
+	urcu_txn_sw_init_inline(&txn, &rec);
 	(void) urcu_txn_sw_hlist_add_before_prepare(&txn, newp, pos);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
@@ -453,10 +453,10 @@ int urcu_txn_sw_hlist_add_before_rcu(struct urcu_txn_sw_hlist_node *newp,
 static inline
 int urcu_txn_sw_hlist_del_rcu(struct urcu_txn_sw_hlist_node *elem)
 {
-	struct urcu_txn_sw_record buf[1];
+	struct urcu_txn_sw_record rec;
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init_inline(&txn, buf, 1);
+	urcu_txn_sw_init_inline(&txn, &rec);
 	(void) urcu_txn_sw_hlist_del_prepare(&txn, elem);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }
@@ -465,10 +465,10 @@ static inline
 int urcu_txn_sw_hlist_replace_rcu(struct urcu_txn_sw_hlist_node *old,
 		struct urcu_txn_sw_hlist_node *newp)
 {
-	struct urcu_txn_sw_record buf[1];
+	struct urcu_txn_sw_record rec;
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init_inline(&txn, buf, 1);
+	urcu_txn_sw_init_inline(&txn, &rec);
 	(void) urcu_txn_sw_hlist_replace_prepare(&txn, old, newp);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
 }

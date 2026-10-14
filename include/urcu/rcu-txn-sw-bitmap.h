@@ -442,10 +442,10 @@ int urcu_txn_sw_bitmap_clear_range_prepare(struct urcu_txn_sw_txn *txn,
 static inline
 enum urcu_txn_status urcu_txn_sw_bitmap_set_rcu(uintptr_t *words, size_t bit)
 {
-	struct urcu_txn_sw_record buf[1];
+	struct urcu_txn_sw_record rec;
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init_inline(&txn, buf, 1);
+	urcu_txn_sw_init_inline(&txn, &rec);
 	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: one word, no same-slot WAW */
 	(void) urcu_txn_sw_bitmap_set_prepare(&txn, words, bit);
 	return urcu_txn_sw_commit(&txn);
@@ -454,10 +454,10 @@ enum urcu_txn_status urcu_txn_sw_bitmap_set_rcu(uintptr_t *words, size_t bit)
 static inline
 enum urcu_txn_status urcu_txn_sw_bitmap_clear_rcu(uintptr_t *words, size_t bit)
 {
-	struct urcu_txn_sw_record buf[1];
+	struct urcu_txn_sw_record rec;
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init_inline(&txn, buf, 1);
+	urcu_txn_sw_init_inline(&txn, &rec);
 	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: one word, no same-slot WAW */
 	(void) urcu_txn_sw_bitmap_clear_prepare(&txn, words, bit);
 	return urcu_txn_sw_commit(&txn);

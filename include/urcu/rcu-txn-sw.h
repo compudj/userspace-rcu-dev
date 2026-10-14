@@ -631,7 +631,7 @@ void urcu_txn_sw__desc_free(struct urcu_txn_sw_desc *desc)
 
 /*
  * Common body of the two public initializers.  @buf == NULL selects the
- * heap-growing form.
+ * heap-growing form; otherwise @buf is caller storage for @cap records.
  *
  * Clears everything up to, and not including, @ryw_bloom: the filter is armed
  * lazily, and zeroing its 128 bytes per transaction would cost what the lazy
@@ -659,21 +659,20 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
 }
 
 /*
- * Initialize a transaction whose records live in caller storage @buf, holding
- * @cap records.  Allocates nothing, so it cannot fail.  record() never grows
- * @buf and commit() never frees it.
+ * Initialize a transaction of at most one record, whose record lives in caller
+ * storage @rec.  Allocates nothing, so it cannot fail, and commit() never frees
+ * @rec.
  *
- * Use it only for a transaction of at most one record.  Such a commit installs
- * no proxy and owes no grace period, so nothing references the handle or @buf
- * once commit() returns.  A transaction that installs proxies (nr >= 2) must
- * use urcu_txn_sw_init(): its records have to outlive a grace period.  record()
- * and commit() both assert it.
+ * Such a commit installs no proxy and owes no grace period, so nothing
+ * references the handle or @rec once commit() returns.  A transaction that
+ * installs proxies (nr >= 2) must use urcu_txn_sw_init(): its records have to
+ * outlive a grace period.  A second record() asserts it.
  */
 static inline
 void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
-		struct urcu_txn_sw_record *buf, unsigned int cap)
+		struct urcu_txn_sw_record *rec)
 {
-	urcu_txn_sw__init(t, buf, cap);
+	urcu_txn_sw__init(t, rec, 1);
 }
 
 /*
@@ -726,8 +725,8 @@ bool urcu_txn_sw__resize(struct urcu_txn_sw_txn *t, unsigned int cap)
  * grows to fit @cap.
  *
  * Returns false on OOM, which is sticky.  It also returns false, without
- * becoming sticky, when a caller-storage handle is asked for more than its
- * buffer holds: that is a sizing bug, not a memory failure.
+ * becoming sticky, when a caller-storage handle is asked for more than its one
+ * record: that is a sizing bug, not a memory failure.
  */
 static inline
 bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
