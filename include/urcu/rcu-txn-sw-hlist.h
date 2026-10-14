@@ -242,7 +242,7 @@ struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_pending_next(
  */
 #define URCU_TXN_SW_HLIST__ASSERT_ROLLBACKABLE(txn)			\
 	urcu_assert_debug((txn)->nr == 0				\
-			|| urcu_txn_sw_append_is_infallible(txn))
+			|| urcu_txn_sw__append_is_infallible(txn))
 
 /*
  * Record the edge that makes @slot name @newp, into @txn, without committing.

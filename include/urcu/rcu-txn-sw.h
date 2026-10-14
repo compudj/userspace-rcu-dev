@@ -771,13 +771,13 @@ void urcu_txn_sw_adopt(struct urcu_txn_sw_txn *t)
  * satisfies it after its first record(), until URCU_TXN_SW_CAP records are
  * used.  A handle in the OOM state answers false.
  *
- * This is for embedders that change state outside the transaction as they
- * record, with a plain store that cannot be rolled back, such as the
- * writer-only pprev of <urcu/rcu-txn-sw-hlist.h>.  They are safe only while no
- * later record of the same transaction can fail.
+ * This is for the debug checks of a front-end that changes state outside the
+ * transaction as it records, with a plain store that cannot be rolled back,
+ * such as the writer-only pprev of <urcu/rcu-txn-sw-hlist.h>.  It is safe only
+ * while no later record of the same transaction can fail.
  */
 static inline
-bool urcu_txn_sw_append_is_infallible(const struct urcu_txn_sw_txn *t)
+bool urcu_txn_sw__append_is_infallible(const struct urcu_txn_sw_txn *t)
 {
 	return t->state == URCU_TXN_SW_PREPARE && t->nr < t->cap;
 }
@@ -971,8 +971,8 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
  * After an OOM the pair no longer reads its own writes: the failed record()
  * appended nothing, so a later load() of that slot returns the committed value.
  * commit() then publishes nothing, but an embedder that changes state outside
- * the transaction as it records must not derive it from such a load: see
- * urcu_txn_sw_append_is_infallible().
+ * the transaction as it records must not derive it from such a load: it
+ * reserves its record bound first, as <urcu/rcu-txn-sw-hlist.h> requires.
  */
 
 /*
