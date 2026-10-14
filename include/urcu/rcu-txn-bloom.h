@@ -87,25 +87,19 @@ extern "C" {
 #define URCU_TXN_BLOOM_BITS	(64ULL * URCU_TXN_BLOOM_WORDS)
 
 /*
- * Two independent hashes of the slot.  A single multiply leaves the k derived
- * positions correlated (slot addresses are aligned and clustered).
- * Minimal-cost Kirsch-Mitzenmacher: run one SplitMix64 avalanche (two
- * multiplies) and split its fully-mixed 64 bits into two independent 32-bit
- * lanes -- one hash yields both h1,h2, half the cost of two separate hashes and
- * far cheaper than a multiply-free chain (Thomas Wang) whose long dependency
- * chain is slower in practice.  h2 is forced odd so the progression h1 + i*h2
+ * Two independent hashes of the slot, for Kirsch-Mitzenmacher double hashing:
+ * one SplitMix64 avalanche (two multiplies), its 64 bits split into two 32-bit
+ * lanes.  A single multiply would leave the k positions correlated, slot
+ * addresses being aligned and clustered.  h2 is forced odd so that h1 + i*h2
  * visits k distinct bits.
  */
 static inline
 void urcu_txn_bloom_h1h2(void **slot, uint64_t *h1, uint64_t *h2)
 {
 	/*
-	 * Shift by the alignment actually guaranteed.  >> 3 discards a live
-	 * address bit on ILP32, where slots are only 4-byte aligned, so
-	 * adjacent slots collapse onto identical k positions -- a
-	 * false-positive rate the model does not predict.  On LP64 the one
-	 * residual zero bit is absorbed by the SplitMix64 avalanche on the very
-	 * next line.
+	 * Shift by the alignment every slot has, 4 bytes on ILP32: >> 3 would
+	 * map adjacent slots there to the same k positions.  On LP64 the one
+	 * zero bit left is mixed away by the avalanche.
 	 */
 	uint64_t x = (uint64_t) (uintptr_t) slot >> 2;
 

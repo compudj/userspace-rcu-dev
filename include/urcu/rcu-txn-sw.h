@@ -6,10 +6,9 @@
 #define _URCU_RCU_TXN_SW_H
 
 /*
- * rcu-txn-sw.h implements "Single-Writer RCU Pseudo-Transactions".
- * This abstraction atomically switches a *set* of pointers from an
- * "old" value to a "new" value with a single store, as observed by
- * concurrent RCU readers.
+ * rcu-txn-sw.h implements single-writer RCU pseudo-transactions.  This
+ * abstraction atomically switches a set of pointers from an "old" value to a
+ * "new" value with a single store, as observed by concurrent RCU readers.
  *
  * Motivation
  * ----------
@@ -26,7 +25,7 @@
  * and a pointer to a shared "flip group" carrying a boolean selector
  * word.  Resolving a proxy returns old_ptr while the selector is 0 and
  * new_ptr once it is 1.  Because every proxy in a group reads the
- * *same* selector, a single store flipping that selector switches the
+ * same selector, a single store flipping that selector switches the
  * whole set atomically: at any instant every proxy resolves
  * consistently to the old or the new target.
  *
@@ -84,7 +83,7 @@
  * old...old,new...new sequence -- never new-then-old.  Embedders can rely
  * on this together with a fixed read order to avoid a per-traversal
  * snapshot (e.g. publishing the back edges of a re-parent through the
- * transaction *before* the forward edge, so a reader descending before it
+ * transaction before the forward edge, so a reader descending before it
  * walks back up can only ever progress old->new, never regress).
  *
  * Scope of "never new-then-old":  Monotonicity of the selector is
