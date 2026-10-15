@@ -414,7 +414,7 @@ void urcu_txn_sw__record_settle(struct urcu_txn_sw_record *r)
  *
  * This engine requires writer mutual exclusion -- it has no install-time CAS,
  * no conflict detection and no abort, so two writers racing on one slot simply
- * corrupt it, and nothing in a default build says so.  Enable with
+ * corrupt it, and a default build does not detect it.  Enable with
  * -DURCU_TXN_SW_EXCL_VALIDATE to have a violation abort the process with a
  * report identifying the violated handle or slot.  Off by default (zero
  * overhead: no checks, and the handle does not even carry the owner field).
