@@ -23,15 +23,15 @@
  * This Bloom filter is an optimisation to answer the miss in O(1)
  * without false negatives: a clear bit means the slot is definitely
  * absent, so the scan is skipped outright.  All k bits set means
- * present or a false positive, which falls through to the authoritative
- * find.
+ * present or a false positive, which falls through to the scan.
  *
- * Correctness never depends on the filter's presence, width or k: a
- * false positive costs the find, or at age 0 one extra attempt.  It does
- * depend on the absence of false negatives, which is an obligation on
- * the engine: the filter must be set for every slot recorded while it is
- * live (arming rebuilds it from all records, so this holds from the
- * moment it goes live).
+ * Correctness never depends on the filter's presence, width or k.  A false
+ * positive only costs time: the scan of the records that the filter fails to
+ * skip, which then finds the slot absent, or at age 0 one extra attempt.
+ * Correctness does depend on the absence of false negatives, which is an
+ * obligation on the engine: the filter must be set for every slot recorded
+ * while it is live (arming rebuilds it from all records, so this holds from
+ * the moment it goes live).
  *
  * The state belongs to the caller: an RCU pseudo-transaction declares
  * its own uint64_t [URCU_TXN_BLOOM_WORDS] array (an on-stack handle,
