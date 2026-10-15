@@ -756,8 +756,6 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
  * that takes over calls this first, on a handle that holds no record yet.  The
  * embedder makes sure that the thread which got the handle ready is done with
  * it.
- *
- * It changes which thread URCU_TXN_SW_EXCL_VALIDATE expects, and nothing else.
  */
 static inline
 void urcu_txn_sw_adopt(struct urcu_txn_sw_txn *t)
