@@ -15,8 +15,9 @@
  *
  * Forward-only readers, and pprev
  * -------------------------------
- * A node's backward link is a pointer to the slot that names it (&prev->next or
- * &head->first), not to a node, so no operation has a head special case.
+ * A node's backward link is a pointer to the slot that points to it
+ * (&prev->next or &head->first), not to a node, so no operation has a head
+ * special case.
  *
  *   Node: { struct urcu_txn_sw_hlist_node *next;    (node ptr; reader-visible)
  *           struct urcu_txn_sw_hlist_node **pprev;  (slot ptr; writer-only) }
@@ -50,8 +51,8 @@
  * them, and chains a second write to a slot onto the first.  Two rules remain
  * for the caller:
  *
- *   - Name the nodes before editing, rather than by traversing the list in the
- *     middle of the transaction.
+ *   - Look up the nodes before editing, rather than by traversing the list in
+ *     the middle of the transaction.
  *
  *   - Every node an operation is anchored on must still be in the list as the
  *     transaction leaves it.  A single-writer delete leaves no deletion mark,
@@ -63,9 +64,10 @@
  *     &2->next, where the delete left it at &1->next.  A debug build trips
  *     urcu_txn_sw_record_chain()'s assertion there.  An NDEBUG build commits
  *     the chain 1 -> 3: node 9 is reachable only through the removed node 2,
- *     and 3->pprev names a slot no live node holds.  A later del_rcu(3)
- *     follows that pprev, commits into the unreachable node 9 and returns
- *     success, while 1->next still names 3, which the caller then frees.
+ *     and 3->pprev points to a slot that no live node holds.  A later
+ *     del_rcu(3) follows that pprev, commits into the unreachable node 9 and
+ *     returns success, while 1->next still points to 3, which the caller then
+ *     frees.
  *
  *     add_before and replace anchored on a deleted node chain onto the delete's
  *     record of 1->next instead, with the same assertion; an NDEBUG build links
@@ -234,8 +236,8 @@ struct urcu_txn_sw_hlist_node **urcu_txn_sw_hlist__pending_pprev(
 }
 
 /*
- * Record that @node, named by @old as the transaction leaves it so far, is now
- * named by @newp.
+ * Record that @node's pprev, @old as the transaction leaves it so far, becomes
+ * @newp.
  */
 static inline
 void urcu_txn_sw_hlist__record_pprev(struct urcu_txn_sw_txn *txn,
@@ -248,10 +250,10 @@ void urcu_txn_sw_hlist__record_pprev(struct urcu_txn_sw_txn *txn,
 }
 
 /*
- * Record the edge that makes @slot name @newp, into @txn, without committing.
- * @slot is &head->first to insert at the head, or &pos->next to insert after
- * @pos.  When @succ is non-NULL, its pprev becomes &newp->next.  Always
- * returns 0; the int return matches the concurrent variant.
+ * Record the edge that makes @slot point to @newp, into @txn, without
+ * committing.  @slot is &head->first to insert at the head, or &pos->next to
+ * insert after @pos.  When @succ is non-NULL, its pprev becomes &newp->next.
+ * Always returns 0; the int return matches the concurrent variant.
  *
  * @succ must be the value @slot will hold as this transaction leaves it, read
  * with urcu_txn_sw_hlist_pending_next(): @newp is built pointing at it, and a
@@ -307,7 +309,7 @@ int urcu_txn_sw_hlist_add_after_prepare(struct urcu_txn_sw_txn *txn,
 
 /*
  * Record the insertion of @newp before @pos (the kernel's hlist_add_before)
- * into @txn, without committing.  @pos's pprev names the slot to re-point.
+ * into @txn, without committing.  @pos's pprev points to the slot to re-point.
  * Always returns 0.
  */
 static inline
@@ -341,8 +343,8 @@ int urcu_txn_sw_hlist_add_before_prepare(struct urcu_txn_sw_txn *txn,
  * {&C->pprev: &B->next -> &head->first}.
  *
  * Had del(B) read B->pprev directly, it would have found &A->next, a slot
- * inside the node that del(A) unlinks, and head->first would be left naming
- * the deleted B.
+ * inside the node that del(A) unlinks, and head->first would be left pointing
+ * to the deleted B.
  */
 static inline
 int urcu_txn_sw_hlist_del_prepare(struct urcu_txn_sw_txn *txn,

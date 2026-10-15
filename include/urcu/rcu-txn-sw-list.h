@@ -245,10 +245,10 @@ int urcu_txn_sw_list_flip2(
  *
  * Two rules remain for the caller:
  *
- *   - Name the nodes before editing.  A traversal made with the _rcu accessors
- *     sees the committed list, not the transaction's pending one, so a caller
- *     that walks and edits in the same transaction may name a node that its own
- *     earlier edit displaced.
+ *   - Look up the nodes before editing.  A traversal made with the _rcu
+ *     accessors sees the committed list, not the transaction's pending one, so
+ *     a caller that walks and edits in the same transaction may find a node
+ *     that its own earlier edit displaced.
  *
  *   - Do not call urcu_txn_sw_declare_disjoint() on a transaction that composes
  *     edits.  It turns off both mechanisms above: in the example, del(E2) would

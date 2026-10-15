@@ -7,9 +7,9 @@
  * kernel-hlist-shaped RCU list.  Validates that:
  *   - forward iteration matches the model after add_head / add_after /
  *     add_before / del / replace;
- *   - the writer-only pprev chain stays coherent (every node's pprev names the
- *     slot that holds it) -- the backward bookkeeping a reader never sees but
- *     every structural op depends on;
+ *   - the writer-only pprev chain stays coherent (every node's pprev points to
+ *     the slot that points to it) -- the backward bookkeeping a reader never
+ *     sees but every structural op depends on;
  *   - edits COMPOSE on one bucket: adjacent deletes, a delete folded with an
  *     insert into the same gap, and a run of deletes all commit correctly in a
  *     single flip.  The _prepare forms read both the forward slots and pprev
@@ -84,8 +84,8 @@ static int arr_eq(const int *a, const int *b, int n)
 }
 
 /*
- * Walk the bucket and verify each node's pprev names the slot that holds it:
- * &head->first for the first node, &prev->next thereafter.  This is the
+ * Walk the bucket and verify each node's pprev points to the slot that points
+ * to it: &head->first for the first node, &prev->next thereafter.  This is the
  * backward invariant every del/add_before/replace relies on; a torn pprev is
  * invisible to forward iteration but breaks the next structural op.
  */
@@ -349,10 +349,11 @@ static void test_compose_triple_del(void)
 
 /*
  * Insert 9 after 1, then delete 1 -- in that ORDER, so the fresh node inherits
- * &1->next as its naming slot and the very next op ghosts the node that slot
- * lives in.  add_after must have recorded 2's pprev as &9->next (NOT left it at
- * the doomed &1->next), and del(1) must then re-point head->first to the
- * PENDING 9 rather than the committed 2, and record 9's pprev as &head->first.
+ * &1->next as the slot that points to it, and the very next op ghosts the node
+ * that slot lives in.  add_after must have recorded 2's pprev as &9->next (NOT
+ * left it at the doomed &1->next), and del(1) must then re-point head->first to
+ * the PENDING 9 rather than the committed 2, and record 9's pprev as
+ * &head->first.
  *
  * Note the division of labour between the two assertions: a wrong pprev for 2
  * leaves this bracket's FORWARD order intact, so it is check_pprev() alone that
@@ -377,7 +378,7 @@ static void test_compose_add_then_del_host(void)
 
 	urcu_txn_sw_init(&t);
 	(void) urcu_txn_sw_hlist_add_after_prepare(&t, &hn_new(9)->node, e1);
-	(void) urcu_txn_sw_hlist_del_prepare(&t, e1);	/* ghosts 9's naming slot's host */
+	(void) urcu_txn_sw_hlist_del_prepare(&t, e1);	/* 9's slot is in 1 */
 	st = urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
 	call_rcu(&n1->rcu_head, hn_free);
 

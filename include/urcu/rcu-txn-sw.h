@@ -992,10 +992,10 @@ void urcu_txn_sw_declare_disjoint(struct urcu_txn_sw_txn *t)
 
 /*
  * URCU_TXN_SW_DEBUG_DISJOINT: on a handle declared disjoint, abort the process
- * when a load or a record names a slot the transaction has already recorded.
- * The load would return the committed value where its caller expects the
- * pending one, and the record would install a second proxy on the slot.  Off by
- * default.
+ * when a load or a record targets a slot that the transaction has already
+ * recorded.  The load would return the committed value where its caller expects
+ * the pending one, and the record would install a second proxy on the slot.
+ * Off by default.
  */
 #ifdef URCU_TXN_SW_DEBUG_DISJOINT
 
