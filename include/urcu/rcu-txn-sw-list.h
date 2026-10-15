@@ -176,7 +176,10 @@ struct urcu_txn_sw_list_node *urcu_txn_sw_list_prev_rcu(
 
 /*
  * True iff the list is empty.  Call within an RCU read-side critical section,
- * like the accessors it is built on.
+ * which cds_list_empty() does not need: while a commit is in flight on
+ * head->node.next, the slot holds a proxy, and telling an empty list from
+ * another then reads the transaction's descriptor, which is reclaimed after a
+ * grace period.
  */
 static inline
 int urcu_txn_sw_list_empty(struct urcu_txn_sw_list_head *head)

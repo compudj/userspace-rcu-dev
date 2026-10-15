@@ -197,7 +197,10 @@ struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_next_rcu(
 
 /*
  * True iff the chain is empty.  Call within an RCU read-side critical section,
- * like the accessors it is built on.
+ * which a plain test of head->first would not need: while a commit of two
+ * records or more is in flight on that slot, it holds a proxy, and telling an
+ * empty chain from another then reads the transaction's descriptor, which is
+ * reclaimed after a grace period.
  */
 static inline
 int urcu_txn_sw_hlist_empty(struct urcu_txn_sw_hlist_head *head)
