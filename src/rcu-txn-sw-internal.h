@@ -37,8 +37,8 @@ void urcu_txn_sw__group_commit(struct urcu_txn_sw_group *group)
 
 /*
  * Install record @r's tagged proxy into its slot, bound to flip group @group.
- * Readers resolve it to old until the group commits.  The parked value is @r's
- * address OR'd with the record's tag.
+ * Readers resolve it to old until the group commits.  The installed value is
+ * @r's address OR'd with the record's tag.
  */
 static inline
 void urcu_txn_sw__record_install(struct urcu_txn_sw_group *group,
@@ -93,7 +93,7 @@ void urcu_txn_sw__excl_slot_ours(struct urcu_txn_sw_record *r)
  * returning, and chaining keeps the committed old in ptr[0].
  */
 static inline
-void urcu_txn_sw__excl_slot_parkable(struct urcu_txn_sw_record *r)
+void urcu_txn_sw__excl_slot_installable(struct urcu_txn_sw_record *r)
 {
 	urcu_txn_sw__excl_slot_free(r->slot, r->tag, "install");
 	urcu_txn_sw__excl_slot_unchanged(r, "install");
@@ -108,7 +108,7 @@ void urcu_txn_sw__excl_slot_ours(
 }
 
 static inline
-void urcu_txn_sw__excl_slot_parkable(
+void urcu_txn_sw__excl_slot_installable(
 		struct urcu_txn_sw_record *r __attribute__((unused)))
 {
 }

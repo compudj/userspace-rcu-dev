@@ -8,7 +8,10 @@
 /*
  * rcu-txn-sw.h implements single-writer RCU pseudo-transactions.  This
  * abstraction atomically switches a set of pointers from an "old" value to a
- * "new" value with a single store, as observed by concurrent RCU readers.
+ * "new" value with a single store, as observed by concurrent RCU readers.  The
+ * pointers, the slots, are the edges of the data structure that an update
+ * re-points; the writer records each edge as its slot with the slot's old and
+ * new targets.
  *
  * Motivation
  * ----------
@@ -306,19 +309,19 @@ bool urcu_txn_sw_is_proxy(const void *v, uintptr_t tag)
 }
 
 /*
- * Does @v, loaded from a slot transacted under @tag, show the slot parked?
+ * Does @v, loaded from a slot transacted under @tag, hold an installed proxy?
  * Unlike urcu_txn_sw_is_proxy(), this answers false under a zero tag, which
  * every value matches and which marks no proxy.  A zero tag is legal for a
  * transaction that installs none.
  */
 static inline
-bool urcu_txn_sw__is_parked(const void *v, uintptr_t tag)
+bool urcu_txn_sw__holds_proxy(const void *v, uintptr_t tag)
 {
 	return tag && urcu_txn_sw_is_proxy(v, tag);
 }
 
 /*
- * Recover the record's address from a parked slot value.
+ * Recover the record's address from a slot value that holds an installed proxy.
  *
  * Subtracting the tag is equivalent to masking it off, since
  * urcu_txn_sw_is_proxy() has shown every tag bit set in @v.  It lets the
@@ -426,7 +429,7 @@ void urcu_txn_sw__record_settle(struct urcu_txn_sw_record *r)
  *
  *   - the slot, which is what two racing writers actually share, and so is
  *     where the real violation is visible.  In a correct single-writer
- *     program a slot being recorded or parked cannot already hold an
+ *     program a slot being recorded or installed to cannot already hold an
  *     installed proxy.  A proxy sitting there therefore means another
  *     writer is mid-transaction on that very slot right now.
  *     Symmetrically, at settle each slot must still hold this writer's
@@ -478,7 +481,7 @@ void urcu_txn_sw__excl_slot_free(void **slot, uintptr_t tag, const char *what)
 {
 	void *v = uatomic_load(slot, CMM_RELAXED);
 
-	if (urcu_txn_sw__is_parked(v, tag))
+	if (urcu_txn_sw__holds_proxy(v, tag))
 		urcu_txn_sw__excl_abort("slot=%p already holds an installed proxy (%p) at %s: another writer is mid-transaction on it\n",
 			(void *) slot, v, what);
 }
@@ -920,8 +923,8 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	 * slot holds @new_ptr directly: were it tagged, every later reader
 	 * would resolve it as a proxy and dereference garbage.
 	 */
-	urcu_assert_debug(!urcu_txn_sw__is_parked(old_ptr, tag));
-	urcu_assert_debug(!urcu_txn_sw__is_parked(new_ptr, tag));
+	urcu_assert_debug(!urcu_txn_sw__holds_proxy(old_ptr, tag));
+	urcu_assert_debug(!urcu_txn_sw__holds_proxy(new_ptr, tag));
 	/*
 	 * A caller-storage handle takes one record: no commit path accepts it
 	 * with more.  Trap here, at the second record, rather than at the
@@ -985,8 +988,9 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
  * 63 logical bits into one word, so distinct bit indexes are not distinct
  * slots.
  *
- * This skips a lookup among the records so far on every load and record, which
- * pays off only past a few dozen edges.  urcu_txn_sw_bitmap_set_range_prepare()
+ * This skips the lookup among the records so far on every load and record, a
+ * scan or, past URCU_TXN_SW_BLOOM_MIN records, a Bloom filter test: a small
+ * saving from the second record on.  urcu_txn_sw_bitmap_set_range_prepare()
  * alone in its transaction is the typical case: it touches each word once.
  *
  * Recording a slot twice on such a handle breaks the rule of
@@ -1067,7 +1071,7 @@ void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 	}
 	urcu_txn_sw__disjoint_check(t, slot, "load()");
 	v = uatomic_load(slot, CMM_RELAXED);
-	urcu_assert_debug(!urcu_txn_sw__is_parked(v, tag));
+	urcu_assert_debug(!urcu_txn_sw__holds_proxy(v, tag));
 	return v;
 }
 

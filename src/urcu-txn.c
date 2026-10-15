@@ -55,7 +55,7 @@ void urcu_txn_sw__commit_desc(struct urcu_txn_sw_desc *desc, unsigned int nr,
 	urcu_txn_sw__assert_distinct_slots(records, nr);
 	/* Install: readers still resolve to old, the selector being 0. */
 	for (i = 0; i < nr; i++) {
-		urcu_txn_sw__excl_slot_parkable(&records[i]);
+		urcu_txn_sw__excl_slot_installable(&records[i]);
 		urcu_txn_sw__record_install(&desc->group, &records[i]);
 	}
 	/* Flip: every proxy resolves to new. */
