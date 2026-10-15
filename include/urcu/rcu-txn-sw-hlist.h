@@ -108,6 +108,10 @@
  * after a grace period, as with cds_hlist_del_rcu().  Include this header after
  * an RCU flavor header.
  *
+ * The add forms take a node that no reader can reach, and build its next with
+ * a plain store, so they cannot move a node.  To move an entry to another
+ * bucket, delete its node and add a copy's, in one transaction.
+ *
  * Return values
  * -------------
  * Mutators return an int, negative on error, so that code written against the
