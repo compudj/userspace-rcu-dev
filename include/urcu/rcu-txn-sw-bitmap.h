@@ -59,17 +59,15 @@
  * has no UNDECIDED window at all, so a resolved word is always the flip's
  * linearized value, old before the selector store and new after.
  *
- * COMPOSITION -- and why this header composes where its sw siblings refuse to.
- * --------------------------------------------------------------------------
+ * COMPOSITION
+ * -----------
  * The transacted slot is the WORD, not the bit: 63 logical bits share one
  * physical word, so flips of DISTINCT bit indexes routinely land on the SAME
  * slot.  urcu_txn_sw_record() appends blindly and requires pairwise-distinct
  * slots, so recording each flip with it would install two proxies on one word
  * and settle them in record order, silently losing the earlier flip
  * (commit()'s debug scan catches it; an NDEBUG build does not).  For a bitmap
- * that collision is the COMMON case, not a corner, so "compose only
- * slot-disjoint edits" -- the stance of <urcu/rcu-txn-sw-list.h> and
- * <urcu/rcu-txn-sw-hlist.h> -- would be close to unusable here.
+ * that collision is the COMMON case, not a corner.
  *
  * So the _prepare forms below record through the engine's read-your-own-writes
  * pair instead (urcu_txn_sw_load / urcu_txn_sw_record_chain, <urcu/rcu-txn-sw.h>):
@@ -82,15 +80,14 @@
  * the selector store, ptr[1] the same word with every flip of this transaction
  * applied.
  *
- * Fusing is SUFFICIENT here and would not be for the sw list, an asymmetry
- * worth being explicit about.  A bitmap word's new value is a pure function of
- * THAT WORD's own old value, so reading the word's own pending state is the
- * whole job.  A list edit's new value is a NEIGHBOUR's pointer, so two edits
- * whose neighbourhoods touch build the write set from stale reads on
- * PAIRWISE-DISTINCT slots (the adjacent-delete trap in
- * urcu_txn_sw_list_add_after_prepare()) -- which same-slot fusion alone does
- * not repair; that traversal would have to read through urcu_txn_sw_load() too.
- * Hence: full composition here, disjoint-only there.
+ * Fusing is SUFFICIENT here, where the sw lists need more.  A bitmap word's new
+ * value is a pure function of THAT WORD's own old value, so reading the word's
+ * own pending state is the whole job.  A list edit's new value is a
+ * NEIGHBOUR's pointer, so two edits whose neighbourhoods touch would build the
+ * write set from stale reads of distinct slots, which same-slot fusion alone
+ * does not repair.  <urcu/rcu-txn-sw-list.h> and <urcu/rcu-txn-sw-hlist.h>
+ * therefore read every neighbour link through urcu_txn_sw_load() as well: see
+ * the adjacent-delete example above urcu_txn_sw_list_add_after_prepare().
  *
  * COMPOSITION / rank consistency.  rank()/select() read across several words but
  * a set/clear transacts only the ONE word it changes.  When a compressed-array
@@ -336,9 +333,8 @@ int urcu_txn_sw_bitmap__word_edit(struct urcu_txn_sw_txn *txn, uintptr_t *words,
  * WITHOUT committing.  Fold together with the accompanying mutation's edges and
  * commit once.  Returns 0, or -ENOMEM (sticky; also surfaces at commit).
  *
- * Unlike this header's sw siblings, these compose freely on ONE bitmap: flips
- * of distinct bits sharing a word fuse into a single record.  See the header
- * intro.
+ * These compose freely on ONE bitmap: flips of distinct bits sharing a word
+ * fuse into a single record.  See the header intro.
  *
  * @txn MUST BE A DEFAULT HANDLE for that to hold.  The fusion IS the engine's
  * read-your-own-writes pair, and urcu_txn_sw_declare_disjoint() switches it
