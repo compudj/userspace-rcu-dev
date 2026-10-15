@@ -765,24 +765,6 @@ void urcu_txn_sw_adopt(struct urcu_txn_sw_txn *t)
 }
 
 /*
- * True when the next record() on @t appends into capacity the handle already
- * owns, and so cannot fail.  A reserve() covering the transaction's record
- * bound is the deliberate way to make this hold; an unreserved handle also
- * satisfies it after its first record(), until URCU_TXN_SW_CAP records are
- * used.  A handle in the OOM state answers false.
- *
- * This is for the debug checks of a front-end that changes state outside the
- * transaction as it records, with a plain store that cannot be rolled back,
- * such as the writer-only pprev of <urcu/rcu-txn-sw-hlist.h>.  It is safe only
- * while no later record of the same transaction can fail.
- */
-static inline
-bool urcu_txn_sw__append_is_infallible(const struct urcu_txn_sw_txn *t)
-{
-	return t->state == URCU_TXN_SW_PREPARE && t->nr < t->cap;
-}
-
-/*
  * Release the handle's descriptor.  No proxy of it was installed, so no grace
  * period is owed.  Caller storage is not the engine's to free.
  */
@@ -972,7 +954,7 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
  * appended nothing, so a later load() of that slot returns the committed value.
  * commit() then publishes nothing, but an embedder that changes state outside
  * the transaction as it records must not derive it from such a load: it
- * reserves its record bound first, as <urcu/rcu-txn-sw-hlist.h> requires.
+ * reserves its record bound first.
  */
 
 /*
@@ -1129,9 +1111,8 @@ bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
  * A handle ends in commit() or in cancel(): one that is merely dropped leaks
  * its descriptor.  A handle in the OOM state may be cancelled as well.
  *
- * Only the records are dropped.  What an embedder changed outside the
- * transaction as it recorded is not rolled back, so such a transaction must be
- * committed: see <urcu/rcu-txn-sw-hlist.h>.
+ * Only the records are dropped: what an embedder changed outside the
+ * transaction as it recorded is not rolled back.
  */
 static inline
 void urcu_txn_sw_cancel(struct urcu_txn_sw_txn *t)
