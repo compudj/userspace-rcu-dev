@@ -27,11 +27,12 @@
  *
  * Single updates and transactions
  * -------------------------------
- * The _rcu forms make a single update.  Its one edge commits as a lone
- * store-release, on a handle over caller storage: no proxy is installed, no
- * descriptor is allocated, and the update cannot fail.  pprev is then written
- * with a plain store after the commit: the writers are mutually excluded, so no
- * other writer reads it in between.
+ * The _rcu forms make a single update, outside of any transaction: they publish
+ * its one edge with a store-release, as cds_hlist_add_head_rcu() does, then
+ * write pprev with a plain store.  The writers are mutually excluded, and every
+ * transaction settles its slots before its commit returns, so the slots they
+ * read hold no proxy, and no other writer reads pprev in between.  A single
+ * update allocates nothing and cannot fail.
  *
  * The _prepare forms record into a transaction of the caller's, which may
  * compose several updates, and which may fail or be cancelled.  They transact
@@ -387,34 +388,46 @@ int urcu_txn_sw_hlist_replace_prepare(struct urcu_txn_sw_txn *txn,
 }
 
 /*
- * The _rcu forms: each makes a single update, outside of any transaction of the
- * caller's.
- *
- * The update's one edge commits as a lone store-release, on a handle over one
- * on-stack record (urcu_txn_sw_init_inline()): no proxy is installed, no
- * descriptor is allocated and no grace period is owed.  pprev is then written
- * with a plain store.
+ * The _rcu forms: each makes a single update, outside of any transaction.  See
+ * "Single updates and transactions" above.
  *
  * Without an allocation they cannot fail, and always return 0.  The int return
  * is kept for source compatibility with the concurrent <urcu/rcu-txn-hlist.h>;
  * see "Return values" above.
  */
 
+/*
+ * Read a head->first or node->next slot outside of any transaction.  A debug
+ * build checks that it holds no proxy: one would be another writer's, in the
+ * middle of its commit.
+ */
+static inline
+struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist__load(
+		struct urcu_txn_sw_hlist_node **slot)
+{
+	struct urcu_txn_sw_hlist_node *v = *slot;
+
+	urcu_assert_debug(!urcu_txn_sw__holds_proxy(v, URCU_TXN_SW_HLIST_TAG));
+	return v;
+}
+
+/* Publish @newp in @slot: the store-release pairs with rcu_dereference(). */
+static inline
+void urcu_txn_sw_hlist__publish(struct urcu_txn_sw_hlist_node **slot,
+		struct urcu_txn_sw_hlist_node *newp)
+{
+	uatomic_store(slot, newp, CMM_RELEASE);
+}
+
 static inline
 int urcu_txn_sw_hlist__insert_at_slot_rcu(struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_node **slot)
 {
-	struct urcu_txn_sw_hlist_node *succ;
-	struct urcu_txn_sw_record rec;
-	struct urcu_txn_sw_txn txn;
+	struct urcu_txn_sw_hlist_node *succ = urcu_txn_sw_hlist__load(slot);
 
-	urcu_txn_sw_init_inline(&txn, &rec);
-	succ = urcu_txn_sw_hlist_pending_next(&txn, slot);
 	newp->next = succ;
 	newp->pprev = slot;
-	(void) urcu_txn_sw_record(&txn, (void **) slot, succ, newp,
-			URCU_TXN_SW_HLIST_TAG);
-	(void) urcu_txn_sw_commit(&txn);
+	urcu_txn_sw_hlist__publish(slot, newp);
 	if (succ != NULL)
 		succ->pprev = &newp->next;
 	return 0;
@@ -439,15 +452,10 @@ int urcu_txn_sw_hlist_add_before_rcu(struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_node *pos)
 {
 	struct urcu_txn_sw_hlist_node **slot = pos->pprev;
-	struct urcu_txn_sw_record rec;
-	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init_inline(&txn, &rec);
 	newp->next = pos;
 	newp->pprev = slot;
-	(void) urcu_txn_sw_record(&txn, (void **) slot, pos, newp,
-			URCU_TXN_SW_HLIST_TAG);
-	(void) urcu_txn_sw_commit(&txn);
+	urcu_txn_sw_hlist__publish(slot, newp);
 	pos->pprev = &newp->next;
 	return 0;
 }
@@ -456,15 +464,10 @@ static inline
 int urcu_txn_sw_hlist_del_rcu(struct urcu_txn_sw_hlist_node *elem)
 {
 	struct urcu_txn_sw_hlist_node **ppv = elem->pprev;
-	struct urcu_txn_sw_hlist_node *next;
-	struct urcu_txn_sw_record rec;
-	struct urcu_txn_sw_txn txn;
+	struct urcu_txn_sw_hlist_node *next =
+			urcu_txn_sw_hlist__load(&elem->next);
 
-	urcu_txn_sw_init_inline(&txn, &rec);
-	next = urcu_txn_sw_hlist_pending_next(&txn, &elem->next);
-	(void) urcu_txn_sw_record(&txn, (void **) ppv, elem, next,
-			URCU_TXN_SW_HLIST_TAG);
-	(void) urcu_txn_sw_commit(&txn);
+	urcu_txn_sw_hlist__publish(ppv, next);
 	if (next != NULL)
 		next->pprev = ppv;
 	return 0;
@@ -475,17 +478,12 @@ int urcu_txn_sw_hlist_replace_rcu(struct urcu_txn_sw_hlist_node *old,
 		struct urcu_txn_sw_hlist_node *newp)
 {
 	struct urcu_txn_sw_hlist_node **ppv = old->pprev;
-	struct urcu_txn_sw_hlist_node *next;
-	struct urcu_txn_sw_record rec;
-	struct urcu_txn_sw_txn txn;
+	struct urcu_txn_sw_hlist_node *next =
+			urcu_txn_sw_hlist__load(&old->next);
 
-	urcu_txn_sw_init_inline(&txn, &rec);
-	next = urcu_txn_sw_hlist_pending_next(&txn, &old->next);
 	newp->next = next;
 	newp->pprev = ppv;
-	(void) urcu_txn_sw_record(&txn, (void **) ppv, old, newp,
-			URCU_TXN_SW_HLIST_TAG);
-	(void) urcu_txn_sw_commit(&txn);
+	urcu_txn_sw_hlist__publish(ppv, newp);
 	if (next != NULL)
 		next->pprev = &newp->next;
 	return 0;
