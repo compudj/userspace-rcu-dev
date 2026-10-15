@@ -26,7 +26,7 @@
  * key(prev_rcu(q)) >= key(p).  A forward-only torn insert yields the
  * not-yet-back-linked predecessor, whose key is SMALLER than p's: caught.  A
  * reverse-only torn insert is caught symmetrically -- the forward walk does not
- * yet see X while prev_rcu already names it.
+ * yet see X while prev_rcu already returns it.
  *
  * (2) RUNS ONLY DURING AN INSERT-ONLY PHASE, and that restriction is not
  * incidental.  Under concurrent deletes the invariant is simply false: delete
@@ -142,13 +142,13 @@ static void *reader_fn(void *arg)
 			}
 			/*
 			 * Invariant (2).  Having just stepped prev_key -> k,
-			 * back-resolve: the node k names as its predecessor must
+			 * back-resolve: the node that k's prev points to must
 			 * have a key at least prev_key's.  It may be larger --
-			 * an insert can have landed between the two since -- but
-			 * a SMALLER one means k's prev still names a node the
-			 * forward ring has already moved past, which is a
-			 * forward-only publish of a two-edge op.  Skipped for
-			 * the first step, whose predecessor is the head.
+			 * an insert can have landed between the two since --
+			 * but a SMALLER one means k's prev still points to a
+			 * node the forward ring has already moved past, which
+			 * is a forward-only publish of a two-edge op.  Skipped
+			 * for the first step, whose predecessor is the head.
 			 */
 			if (insert_only && prev_key != 0) {
 				struct urcu_txn_sw_list_node *bp =

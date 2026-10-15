@@ -17,8 +17,8 @@
  * pprev encoding -- why a 1-pointer head needs no head special case
  * ----------------------------------------------------------------
  * A node's backward link is NOT a node pointer (as in the bidir list) but a
- * pointer to the SLOT that names the node -- either &prev->next, or the bucket
- * head slot &head->first itself:
+ * pointer to the SLOT that points to the node -- either &prev->next, or the
+ * bucket head slot &head->first itself:
  *
  *   Node: { struct urcu_txn_hlist_node *next;    (node ptr; transacted; MARK-able)
  *           struct urcu_txn_hlist_node **pprev;  (slot ptr; transacted) }
@@ -99,15 +99,15 @@
  * a racing deletion, and only ONE is the mark:
  *
  *  (1) A NEIGHBOUR was deleted -- handled by a structural slot conflict, NOT by
- *      the mark.  Removing a node X rewrites the SINGLE forward slot that names
- *      X (*X->pprev, i.e. &prev->next or &head->first).  An insert placed next
- *      to X, or a delete of X's predecessor, rewrites that SAME slot with the
- *      SAME expected old value, so the MCAS commits at most one of them; the
- *      loser fails its old-value check, aborts, re-reads and proceeds.  The
- *      head slot participates in exactly this way (it is named by a pprev value
- *      and CAS'd by inserts and first-node deletes just like an interior
- *      &prev->next) -- that is the single new lemma over the bidir list, and it
- *      is trivial.
+ *      the mark.  Removing a node X rewrites the SINGLE forward slot that
+ *      points to X (*X->pprev, i.e. &prev->next or &head->first).  An insert
+ *      placed next to X, or a delete of X's predecessor, rewrites that SAME
+ *      slot with the SAME expected old value, so the MCAS commits at most one
+ *      of them; the loser fails its old-value check, aborts, re-reads and
+ *      proceeds.  The head slot participates in exactly this way (a pprev value
+ *      points to it, and inserts and first-node deletes CAS it just like an
+ *      interior &prev->next) -- that is the single new lemma over the bidir
+ *      list, and it is trivial.
  *
  *  (2) The ANCHOR ITSELF was deleted -- the mark's one and only job.  An insert
  *      or delete handed a @pos/@elem that a peer is deleting loses the shared-slot
@@ -142,19 +142,20 @@
  *
  *  (1) A lost CAS is the normal protocol outcome, not a corner, and nothing
  *      undoes a plain store when it happens.  A pre-commit plain store survives
- *      the abort and leaves a live node naming a slot inside a node that never
- *      linked.
+ *      the abort and leaves a live node whose pprev points to a slot inside a
+ *      node that never linked.
  *
  *  (2) Storing post-commit instead (winner only) dodges (1) and opens a repair
  *      window, and in that window a stale pprev is not a slow hint but a
  *      DANGLING POINTER: pprev holds an address INSIDE another node.  Staleness
  *      is detectable (*pprev != elem) and repairable by a short forward walk,
  *      but hints accumulate on one slot -- insert A at &prev->next, then B at
- *      &prev->next, and A->pprev and B->pprev both name it while A's true slot
- *      is &B->next.  Unboundedly many nodes' pprev can name a single slot, and
- *      del(prev) can only fix its CURRENT successor's.  prev is freed after a
- *      grace period and the rest dangle.  RCU does not cover this: the pointer
- *      sits in a live node indefinitely, so no read-side section contains it.
+ *      &prev->next, and A->pprev and B->pprev both point to it while A's true
+ *      slot is &B->next.  Unboundedly many nodes' pprev can point to a single
+ *      slot, and del(prev) can only fix its CURRENT successor's.  prev is freed
+ *      after a grace period and the rest dangle.  RCU does not cover this: the
+ *      pointer sits in a live node indefinitely, so no read-side section
+ *      contains it.
  *
  * The SW header's post-commit store has no such window: its updaters are
  * mutually excluded, so none reads pprev before the store lands.  The MW
@@ -163,11 +164,11 @@
  * swing before reclaim at any price.
  *
  * The alternative, if the bare-CAS insert is ever worth its cost: drop pprev
- * ENTIRELY and have del take the head, walking to find the naming slot.  Insert
- * becomes a 1-edge bare CAS, del 2 edges, and the node halves to one pointer.
- * It costs the "@elem need not know its bucket" contract of del/replace, which
- * for short hash buckets may well be the better trade.  Softening pprev to a
- * hint is not on that menu -- see (2).
+ * ENTIRELY and have del take the head, walking to find the slot that points to
+ * the node.  Insert becomes a 1-edge bare CAS, del 2 edges, and the node halves
+ * to one pointer.  It costs the "@elem need not know its bucket" contract of
+ * del/replace, which for short hash buckets may well be the better trade.
+ * Softening pprev to a hint is not on that menu -- see (2).
  *
  * Reclaim, read/write contract, escalation
  * ----------------------------------------
@@ -337,11 +338,11 @@ int urcu_txn_hlist_empty(struct urcu_txn_hlist_head *head)
 
 /*
  * urcu_txn_hlist_insert_at_slot_prepare: the core composable primitive.  Record
- * the edges that make @slot name @newp, given that @slot currently resolves to
- * @succ (the caller read it -- via urcu_txn_load on the head or on a node's next
- * -- and VERIFIED IT UNMARKED), WITHOUT committing.  @slot is &head->first for
- * insert-at-head or &pos->next for insert-after; @succ is the (possibly NULL)
- * unmarked value it holds.
+ * the edges that make @slot point to @newp, given that @slot currently resolves
+ * to @succ (the caller read it -- via urcu_txn_load on the head or on a node's
+ * next -- and VERIFIED IT UNMARKED), WITHOUT committing.  @slot is &head->first
+ * for insert-at-head or &pos->next for insert-after; @succ is the (possibly
+ * NULL) unmarked value it holds.
  *
  * DO NOT STRIP A MARK AND PROCEED.  A marked value means the slot's owner is
  * deleted (or, for the head, sealed), and a next is never unmarked again -- so
@@ -360,7 +361,7 @@ int urcu_txn_hlist_empty(struct urcu_txn_hlist_head *head)
  * write set disjoint -- sound because a SINGLE-op commit provably touches
  * distinct slots -- but that line must NOT be copied into a composed bracket
  * unless the COMBINED write set is provably distinct too.  Two edits of one
- * bucket share a slot as soon as their nodes land adjacent (both name the
+ * bucket share a slot as soon as their nodes land adjacent (both write the
  * shared neighbour's "next", or &head->first): data-dependent, not knowable up
  * front.  On a disjoint handle the second prepare's loads then silently return
  * committed values and its stores blind-append a duplicate record -- silent
@@ -532,9 +533,9 @@ int urcu_txn_hlist_insert_after_rcu(struct urcu_txn_hlist_node *newp,
 /*
  * urcu_txn_hlist_insert_before_prepare: record an insert of @newp immediately
  * before @pos (kernel hlist_add_before), WITHOUT committing.  Serializes on the
- * slot that names @pos (*pos->pprev), which del(pos)/del(prev)/insert-at-slot all
- * CAS with old value @pos.  Returns 0, or -ENOENT if @pos was deleted.  OOM is
- * sticky to the commit.
+ * slot that points to @pos (*pos->pprev), which del(pos), del(prev) and
+ * insert-at-slot all CAS with old value @pos.  Returns 0, or -ENOENT if @pos
+ * was deleted.  OOM is sticky to the commit.
  */
 static inline
 int urcu_txn_hlist_insert_before_prepare(struct urcu_txn *txn,
@@ -598,11 +599,11 @@ int urcu_txn_hlist_insert_before_rcu(struct urcu_txn_hlist_node *newp,
 /*
  * urcu_txn_hlist_del_prepare: record the unlink of @elem into @txn WITHOUT
  * committing.  @elem is reached by the caller (it need NOT know the bucket:
- * pprev names the slot).  Composable form of del.  Returns 0 if recorded (on a
- * committed OK, THIS call removed @elem; reclaim it after a grace period),
- * -ENOENT if @elem was already deleted by a peer (nothing recorded; do NOT
- * reclaim), or -EAGAIN if the successor is mid-deletion (retry).  OOM is sticky
- * to the commit.
+ * pprev points to the slot).  Composable form of del.  Returns 0 if recorded
+ * (on a committed OK, THIS call removed @elem; reclaim it after a grace
+ * period), -ENOENT if @elem was already deleted by a peer (nothing recorded; do
+ * NOT reclaim), or -EAGAIN if the successor is mid-deletion (retry).  OOM is
+ * sticky to the commit.
  */
 static inline
 int urcu_txn_hlist_del_prepare(struct urcu_txn *txn,
@@ -616,11 +617,11 @@ int urcu_txn_hlist_del_prepare(struct urcu_txn *txn,
 		return -ENOENT;			/* already deleted by a peer */
 	next = (struct urcu_txn_hlist_node *) en;
 	/*
-	 * Read the slot that names @elem fresh this attempt.  If a peer changed
-	 * which slot names @elem (e.g. del of @elem's predecessor rewrote
-	 * elem->pprev), this @ppv is stale -- but the *ppv store below then fails
-	 * its old-value check (the stale slot no longer holds @elem) and the
-	 * commit aborts, so a retry re-reads the fresh slot.
+	 * Read the slot that points to @elem fresh this attempt.  If a peer
+	 * changed which slot points to @elem (e.g. del of @elem's predecessor
+	 * rewrote elem->pprev), this @ppv is stale -- but the *ppv store below
+	 * then fails its old-value check (the stale slot no longer holds @elem)
+	 * and the commit aborts, so a retry re-reads the fresh slot.
 	 */
 	ppv = (struct urcu_txn_hlist_node **)
 			urcu_txn_load(txn, (void **) &elem->pprev,
@@ -641,12 +642,13 @@ int urcu_txn_hlist_del_prepare(struct urcu_txn *txn,
 
 	/*
 	 * Mark elem (logical delete), unlink forward (*ppv: elem -> next), and
-	 * unlink backward (next->pprev: &elem->next -> ppv, i.e. next is now named
-	 * by elem's old slot).  *ppv (old value elem) is the slot a racing
-	 * insert-at-slot / del(predecessor) shares with us, so the MCAS serializes
-	 * every adjacency; marking &elem->next is what makes a racing
-	 * insert_after(elem) / del(elem) terminate with -ENOENT.  When next is
-	 * NULL the backward edge vanishes: a 2-edge delete storing MARK(NULL).
+	 * unlink backward (next->pprev: &elem->next -> ppv, i.e. elem's old
+	 * slot now points to next).  *ppv (old value elem) is the slot a racing
+	 * insert-at-slot / del(predecessor) shares with us, so the MCAS
+	 * serializes every adjacency; marking &elem->next is what makes a
+	 * racing insert_after(elem) / del(elem) terminate with -ENOENT.  When
+	 * next is NULL the backward edge vanishes: a 2-edge delete storing
+	 * MARK(NULL).
 	 */
 	urcu_txn_store_mw(txn, (void **) &elem->next, next,
 			urcu_txn_hlist_set_mark(next), URCU_TXN_HLIST_TAG);
