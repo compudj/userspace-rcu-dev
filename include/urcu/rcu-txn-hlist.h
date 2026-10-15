@@ -122,11 +122,11 @@
  * the bare head slot, not a node whose &next->next could coincide with a write
  * slot), so del/replace need no such guard skip.
  *
- * Why pprev stays transacted here (the SW hlist took it out; that does not
- * transfer)
- * ------------------------------------------------------------------------
- * The single-updater <urcu/rcu-txn-sw-hlist.h> writes pprev with an eager plain
- * store, on the grounds that it is writer-only.  Do not mirror that here.  The
+ * Why pprev stays transacted here
+ * -------------------------------
+ * The single-updater <urcu/rcu-txn-sw-hlist.h> transacts pprev in its _prepare
+ * forms, but its single-update _rcu forms write it with a plain store after the
+ * commit, on the grounds that it is writer-only.  Do not mirror that here.  The
  * premise splits under concurrency: with one updater "writer-only" means
  * PRIVATE, while here it still means shared, concurrently read by peer
  * mutators, and lifetime-critical.
@@ -140,10 +140,10 @@
  * an already-PUBLISHED node (&succ->pprev, &pos->pprev, &next->pprev; the fresh
  * node's own links are already plain stores, built invisibly), so both bite:
  *
- *  (1) A lost CAS is the normal protocol outcome, not a corner.  The SW header
- *      closes its plain store against OOM with an up-front reserve(); no
- *      reserve can close an abort.  A pre-commit plain store survives the abort
- *      and leaves a live node naming a slot inside a node that never linked.
+ *  (1) A lost CAS is the normal protocol outcome, not a corner, and nothing
+ *      undoes a plain store when it happens.  A pre-commit plain store survives
+ *      the abort and leaves a live node naming a slot inside a node that never
+ *      linked.
  *
  *  (2) Storing post-commit instead (winner only) dodges (1) and opens a repair
  *      window, and in that window a stale pprev is not a slow hint but a
@@ -156,11 +156,11 @@
  *      grace period and the rest dangle.  RCU does not cover this: the pointer
  *      sits in a live node indefinitely, so no read-side section contains it.
  *
- * This is what the SW header's insistence on an EAGER store is really about --
- * a plain store is instantly visible to the sole updater, so no stale window
- * exists at all.  The MW equivalent of "eager" is "atomic with the commit",
- * which is the transaction.  del's &next->pprev edge is harder still: &elem->next
- * dies with elem, so it must swing before reclaim at any price.
+ * The SW header's post-commit store has no such window: its updaters are
+ * mutually excluded, so none reads pprev before the store lands.  The MW
+ * equivalent is "atomic with the commit", which is the transaction.  del's
+ * &next->pprev edge is harder still: &elem->next dies with elem, so it must
+ * swing before reclaim at any price.
  *
  * The alternative, if the bare-CAS insert is ever worth its cost: drop pprev
  * ENTIRELY and have del take the head, walking to find the naming slot.  Insert
