@@ -993,11 +993,14 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
  * urcu_txn_sw_record(), with the consequence stated there.
  * -DURCU_TXN_SW_DEBUG_DISJOINT traps it at the offending record or load.
  *
- * Call after init and before the first record().
+ * Call after init and before the first record().  On a handle whose reserve()
+ * failed it does nothing: the failure is sticky, and commit() reports it.
  */
 static inline
 void urcu_txn_sw_declare_disjoint(struct urcu_txn_sw_txn *t)
 {
+	if (t->state == URCU_TXN_SW_OOM)
+		return;
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	urcu_posix_assert(!t->nr);		/* before the first record */
 	t->disjoint = true;

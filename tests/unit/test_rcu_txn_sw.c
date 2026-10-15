@@ -32,7 +32,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS 35
+#define NR_TESTS 36
 
 /* Per-record tag: bit 0 of the proxy pointer (records are 16B-aligned). */
 #define TEST_TAG	1UL
@@ -385,6 +385,13 @@ int main(void)
 		ok(st == URCU_TXN_STATUS_MEMORY_ERROR && !t->desc &&
 			s1 == (void *) 0x60 && s2 == (void *) 0x70,
 			"commit in the sticky OOM state reports MEMORY_ERROR and publishes nothing");
+
+		urcu_txn_sw_init(t);
+		t->state = URCU_TXN_SW_OOM;	/* as a failed reserve() leaves it */
+		urcu_txn_sw_declare_disjoint(t);
+		ok(!t->disjoint &&
+			urcu_txn_sw_commit(t) == URCU_TXN_STATUS_MEMORY_ERROR,
+			"declare_disjoint() leaves a handle whose reserve() failed as it is");
 
 		urcu_txn_sw_init(t);
 		urcu_txn_sw_record(t, &s1, (void *) 0x60, (void *) 0x62, TEST_TAG);
