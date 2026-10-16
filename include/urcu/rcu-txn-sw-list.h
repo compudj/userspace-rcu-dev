@@ -21,8 +21,8 @@
  * for as long as a grace period.  This is why rculist.h offers no RCU-safe
  * reverse iterator.
  *
- * Every structural change to a doubly-linked list re-points exactly two
- * reader-visible edges, one forward and one backward:
+ * Every insertion into or deletion from a doubly-linked list re-points exactly
+ * two reader-visible edges, one forward and one backward:
  *
  *   insert E between P and N:   P->next: N -> E   and   N->prev: P -> E
  *   delete E between P and N:   P->next: E -> N   and   N->prev: E -> P

@@ -55,8 +55,8 @@
  *     the middle of the transaction.
  *
  *   - Every node an operation is anchored on must still be in the list as the
- *     transaction leaves it.  A single-writer delete leaves no deletion mark,
- *     so a _prepare cannot tell a deleted anchor from a live one.
+ *     transaction leaves it.  A single-writer delete leaves no deletion mark:
+ *     nothing in a deleted anchor distinguishes it from a live one.
  *
  *     Example: 1 -> 2 -> 3, del_prepare(2) then add_after_prepare(9, 2).  The
  *     delete records {&1->next: 2 -> 3} and {&3->pprev: &2->next -> &1->next}.

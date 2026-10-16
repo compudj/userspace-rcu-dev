@@ -89,9 +89,9 @@
  * reader resolving several proxy records over time observes a monotone
  * old...old,new...new sequence -- never new-then-old.  Embedders can rely
  * on this together with a fixed read order to avoid a per-traversal
- * snapshot (e.g. publishing the back edges of a re-parent through the
- * transaction before the forward edge, so a reader descending before it
- * walks back up can only ever progress old->new, never regress).
+ * snapshot: a reader that follows a forward edge of a transaction to its new
+ * target, then a back edge of the same transaction from that node, finds the
+ * back edge's new target, never its old one.
  *
  * Scope of "never new-then-old":  Monotonicity of the selector is
  * unconditional.  It is one word, stored once.  What a reader's sequence of
@@ -466,7 +466,7 @@ void urcu_txn_sw__excl_owner(const struct urcu_txn_sw_txn *t, const char *what)
 	pthread_t self = pthread_self();
 
 	if (!pthread_equal(t->excl_owner, self))
-		urcu_txn_sw__excl_abort("txn=%p: %s on a thread other than the one that initialized the handle -- one transaction is driven end to end by one thread\n",
+		urcu_txn_sw__excl_abort("txn=%p: %s on a thread other than the one that initialized or adopted the handle -- one transaction is driven end to end by one thread\n",
 			(const void *) t, what);
 }
 
@@ -931,8 +931,8 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
  * =======================================================================
  *
  * urcu_txn_sw_record() requires pairwise-distinct slots.  This suits an
- * embedder that knows its write sites, such as a list operation recording two
- * distinct edges: it pays no scan per store.
+ * embedder whose slots are distinct by construction, such as a list operation
+ * recording two edges: it pays no scan per store.
  *
  * An embedder whose write site is computed needs the opposite.  In a bitmap, 63
  * logical bits share one transacted word, so flips of distinct bits routinely
@@ -979,7 +979,8 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
  *
  * Recording a slot twice on such a handle breaks the rule of
  * urcu_txn_sw_record(), with the consequence stated there.
- * -DURCU_TXN_SW_DEBUG_DISJOINT traps it at the offending record or load.
+ * -DURCU_TXN_SW_DEBUG_DISJOINT traps it at the offending urcu_txn_sw_load() or
+ * urcu_txn_sw_record_chain().
  *
  * Call after init and before the first record().  On a handle whose reserve()
  * failed it does nothing: the failure is sticky, and commit() reports it.
@@ -1164,7 +1165,7 @@ extern void urcu_txn_sw__commit_desc(struct urcu_txn_sw_desc *desc,
  * @call_rcu_fn defers that reclaim, and is called only with two or more
  * records.  It has the signature of a flavor's call_rcu(), so an embedder
  * that selects its flavor at runtime passes flavor->update_call_rcu, and this
- * header binds no flavor at compile time.  An embedder that knows no reader can
+ * header binds no flavor at compile time.  An embedder in which no reader can
  * hold a proxy (single-threaded, or exclusive) may pass a function that calls
  * back synchronously.
  *
