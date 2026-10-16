@@ -14,26 +14,27 @@
  * walk strictly DECREASING ones.  Out-of-range keys, runaway walks and crashes
  * are caught here too (run under ASan/TSan to make the last loud).
  *
- * What (1) CANNOT catch is a torn two-edge publish, which is the headline
- * guarantee.  Take an insert of X between P and Q publishing only its forward
- * edge: the forward ring is P -> X -> Q, still strictly increasing, and the
- * reverse ring is Q -> P, still strictly decreasing.  Both walks are monotone,
- * so both pass.  Every torn state of a two-edge op is sorted in each direction
- * SEPARATELY -- that is what makes the invariant provably blind to it.
+ * What invariant (1) CANNOT catch is a torn two-edge publish, which is the
+ * headline guarantee.  Take an insert of X between P and Q publishing only its
+ * forward edge: the forward ring is P -> X -> Q, still strictly increasing, and
+ * the reverse ring is Q -> P, still strictly decreasing.  Both walks are
+ * monotone, so both pass.  Every torn state of a two-edge op is sorted in each
+ * direction SEPARATELY -- that is what makes the invariant provably blind to
+ * it.
  *
  * (2) CROSS-DIRECTION AGREEMENT, which is where a torn publish shows.  After
  * each forward step p -> q the reader also resolves prev_rcu(q) and requires
  * key(prev_rcu(q)) >= key(p).  A forward-only torn insert yields the
  * not-yet-back-linked predecessor, whose key is SMALLER than p's: caught.  A
- * reverse-only torn insert is caught symmetrically -- the forward walk does not
- * yet see X while prev_rcu already returns it.
+ * reverse-only torn insert is not caught: prev_rcu(q) returns X, whose key lies
+ * between p's and q's, as after a completed insert.
  *
- * (2) RUNS ONLY DURING AN INSERT-ONLY PHASE, and that restriction is not
- * incidental.  Under concurrent deletes the invariant is simply false: delete
- * p between the reader's two loads and prev_rcu(q) legitimately becomes the
- * node BEFORE p, whose key is smaller.  With inserts alone the legal outcomes
- * are exactly p itself or a node inserted between p and q, both with a key at
- * least p's, so any smaller one is a defect.
+ * Invariant (2) RUNS ONLY DURING AN INSERT-ONLY PHASE, and that restriction is
+ * not incidental.  Under concurrent deletes the invariant is simply false:
+ * delete p between the reader's two loads and prev_rcu(q) legitimately becomes
+ * the node BEFORE p, whose key is smaller.  With inserts alone the legal
+ * outcomes are exactly p itself or a node inserted between p and q, both with a
+ * key at least p's, so any smaller one is a defect.
  *
  * The phase change is handshaken rather than assumed: the writer publishes
  * g_phase = 1 and then waits for every reader to acknowledge.  A reader samples
