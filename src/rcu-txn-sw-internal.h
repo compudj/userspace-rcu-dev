@@ -22,8 +22,8 @@ extern "C" {
 
 /*
  * Commit the flip group: switch every record in the transaction from old to new
- * with a single store-release.  Must be called after the new targets are fully
- * built.
+ * with a single store-release.  Must be called once every record is installed:
+ * the store-release orders the installs before the flip.
  */
 static inline
 void urcu_txn_sw__group_commit(struct urcu_txn_sw_group *group)
