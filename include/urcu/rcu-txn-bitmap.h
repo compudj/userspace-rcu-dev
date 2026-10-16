@@ -50,7 +50,7 @@
  * higher bit's insert claims).  rank() is otherwise an optimistic read: the
  * word's value-CAS at commit re-validates the bits within that word.
  *
- * That covers a CONCURRENT writer moving the rank.  It says nothing about this
+ * That covers a CONCURRENT writer moving the rank.  It does not cover this
  * transaction's OWN pending flips, which are in the commit rather than in
  * conflict with it -- and the _rcu accessors cannot see them.  A bracket that
  * computes a rank after recording a flip must read through the _txn accessors;

@@ -55,7 +55,7 @@
  * of every node, field and head address.  A TAG CONFINED TO BITS >= 2 is not:
  * it additionally requires every such address -- node addresses, MARK-ed node
  * addresses, &node->next AT ITS OFFSET INSIDE THE CONTAINER, and &head->first,
- * the head's own alignment, which "aligned nodes" says nothing about -- to be
+ * the head's own alignment, which "aligned nodes" does not constrain -- to be
  * aligned past the tag's highest bit.  An hlist_node embedded at offset 8 of a
  * 16-aligned struct puts &h.next at 8 mod 16, which sets every bit of a bit-3
  * tag; a pprev slot then holds a value the resolve reads as a proxy.
@@ -110,10 +110,10 @@
  *      list, and it is trivial.
  *
  *  (2) The ANCHOR ITSELF was deleted -- the mark's one and only job.  An insert
- *      or delete handed a @pos/@elem that a peer is deleting loses the shared-slot
- *      race in (1); on retry it must tell "neighbour moved, re-read" apart from
- *      "my anchor is gone, give up".  It re-reads the anchor's next, sees the
- *      mark, and returns -ENOENT.
+ *      or delete handed a @pos/@elem that a peer is deleting loses the
+ *      shared-slot race in (1); on retry it must distinguish "neighbour moved,
+ *      re-read" from "my anchor is gone, give up".  It re-reads the anchor's
+ *      next, sees the mark, and returns -ENOENT.
  *
  * pprev is never marked for the same reason prev is not in the bidir list: no
  * operation reaches a node ONLY through pprev, so the forward "next" slots
@@ -166,9 +166,9 @@
  * The alternative, if the bare-CAS insert is ever worth its cost: drop pprev
  * ENTIRELY and have del take the head, walking to find the slot that points to
  * the node.  Insert becomes a 1-edge bare CAS, del 2 edges, and the node halves
- * to one pointer.  It costs the "@elem need not know its bucket" contract of
- * del/replace, which for short hash buckets may well be the better trade.
- * Softening pprev to a hint is not on that menu -- see (2).
+ * to one pointer.  It costs del/replace their contract of taking no bucket; for
+ * short hash buckets it may well be the better trade.  Softening pprev to a
+ * hint is not on that menu -- see (2).
  *
  * Reclaim, read/write contract, escalation
  * ----------------------------------------
@@ -598,12 +598,12 @@ int urcu_txn_hlist_insert_before_rcu(struct urcu_txn_hlist_node *newp,
 
 /*
  * urcu_txn_hlist_del_prepare: record the unlink of @elem into @txn WITHOUT
- * committing.  @elem is reached by the caller (it need NOT know the bucket:
- * pprev points to the slot).  Composable form of del.  Returns 0 if recorded
- * (on a committed OK, THIS call removed @elem; reclaim it after a grace
- * period), -ENOENT if @elem was already deleted by a peer (nothing recorded; do
- * NOT reclaim), or -EAGAIN if the successor is mid-deletion (retry).  OOM is
- * sticky to the commit.
+ * committing.  @elem is reached by the caller (no bucket is passed: pprev
+ * points to the slot).  Composable form of del.  Returns 0 if recorded (on a
+ * committed OK, THIS call removed @elem; reclaim it after a grace period),
+ * -ENOENT if @elem was already deleted by a peer (nothing recorded; do NOT
+ * reclaim), or -EAGAIN if the successor is mid-deletion (retry).  OOM is sticky
+ * to the commit.
  */
 static inline
 int urcu_txn_hlist_del_prepare(struct urcu_txn *txn,
@@ -660,10 +660,11 @@ int urcu_txn_hlist_del_prepare(struct urcu_txn *txn,
 }
 
 /*
- * Remove @elem, transacting through @domain.  @elem need not know its bucket.
- * Returns 1 if THIS call removed it (reclaim @elem after a grace period), 0 if
- * it was already deleted (do NOT reclaim), or -ENOMEM on descriptor OOM.
- * Self-contained bracket around urcu_txn_hlist_del_prepare().
+ * Remove @elem, transacting through @domain.  No bucket is passed: @elem's
+ * pprev points to its slot.  Returns 1 if THIS call removed it (reclaim @elem
+ * after a grace period), 0 if it was already deleted (do NOT reclaim), or
+ * -ENOMEM on descriptor OOM.  Self-contained bracket around
+ * urcu_txn_hlist_del_prepare().
  */
 static inline
 int urcu_txn_hlist_del_rcu(struct urcu_txn_hlist_node *elem,

@@ -100,16 +100,16 @@
  *   - THE TAG IS A PROPERTY OF THE SLOT, exactly as the kind is: every
  *     transaction and every reader touching one slot must use the SAME tag.
  *     Carrying it per record buys heterogeneous SLOTS in one engine, not
- *     per-record variation on one slot.  Park under tag 3 and probe under tag
- *     1 and urcu_txn_is_proxy() still says yes while the untag subtracts the
+ *     per-record variation on one slot.  Park under tag 3 and probe under tag 1
+ *     and urcu_txn_is_proxy() still returns true while the untag subtracts the
  *     wrong amount: a misaligned record pointer whose ->desc load is garbage,
  *     dereferenced by the resolve.  A crash, not an abort.  (The opposite
  *     mismatch -- parked narrow, probed wide -- merely misreads the proxy as a
  *     live value and aborts a CAS, which is why the hazard survives testing.)
  *   - SLOT LIFETIME: the backing memory of a transacted slot must outlive every
- *     transaction that can still name it -- reclaim it through call_rcu, or
- *     never.  A LOSING transaction writes the slot twice as well (plant, then
- *     settle back to old), so a peer that unlinks an object and frees it
+ *     transaction that can still reference it -- reclaim it through call_rcu,
+ *     or never.  A LOSING transaction writes the slot twice as well (plant,
+ *     then settle back to old), so a peer that unlinks an object and frees it
  *     immediately leaves the loser storing into freed memory.  Stated in full
  *     in <urcu/rcu-txn.h>; it binds direct users of this header identically.
  */
@@ -152,11 +152,11 @@ extern "C" {
  * it reported ~0 failures against 142M aborts and read as "the CAS is not what
  * is failing".
  *
- * It exists because "the commit aborted" is not a diagnosis.  A transaction
- * that aborts forever needs to say WHICH of its records lost its CAS and what
- * the slot held instead of the expected old; the record index alone localises
- * it to one edge of the structure being committed, which is usually enough to
- * tell a self-conflict from a live competitor.
+ * It exists because "the commit aborted" is not a diagnosis.  Diagnosing a
+ * transaction that aborts forever requires knowing WHICH of its records lost
+ * its CAS and what the slot held instead of the expected old; the record index
+ * alone localises it to one edge of the structure being committed, which is
+ * usually enough to distinguish a self-conflict from a live competitor.
  */
 #ifndef URCU_TXN_CAS_FAIL
 #define URCU_TXN_CAS_FAIL(idx, slot, old, seen)	do { } while (0)
@@ -170,7 +170,7 @@ extern "C" {
  * kind-mismatch case asserts loudly, but THIS one is silent by design (it sets
  * t->poisoned and lets commit abort), and the abort it produces is
  * indistinguishable at the caller from ordinary contention.  A caller chasing a
- * transaction that aborts forever has no way to tell the two apart.
+ * transaction that aborts forever has no way to distinguish the two.
  */
 #ifndef URCU_TXN_POISON
 #define URCU_TXN_POISON(slot, want, got)	do { } while (0)
@@ -974,10 +974,10 @@ void urcu_txn_free_rcu(struct rcu_head *head)
  *
  * And only under @flavor's own deferral.  Batches are per flavor (a grace
  * period is flavor-scoped; see urcu_slab_free_pending()), so the batch route
- * needs to know WHICH flavor's readers may still reach @t, and is taken only
- * when @call_rcu_fn is that flavor's update_call_rcu.  A NULL @flavor, a
- * custom deferral function, or a slab that declines all take the
- * per-descriptor call_rcu below -- correct, merely unbatched.
+ * depends on WHICH flavor's readers may still reach @t, and is taken only when
+ * @call_rcu_fn is that flavor's update_call_rcu.  A NULL @flavor, a custom
+ * deferral function, or a slab that declines all take the per-descriptor
+ * call_rcu below -- correct, merely unbatched.
  *
  * The layout precondition -- bytes [link_off, batch_off + 8) dead to readers
  * from this call until the splice -- holds by construction: that range is
@@ -1109,16 +1109,17 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 		urcu_txn_settle(t, planted, URCU_TXN_DESC_FAILED);
 		if (planted == 0) {
 			/*
-			 * Nothing was ever planted, so no slot has ever named
-			 * this descriptor and no reader can be resolving through
-			 * it -- the same "no proxy, no grace period" argument the
-			 * poisoned / nr == 0 / nr == 1 paths above make.  Worth
-			 * distinguishing because this IS the common abort: the
-			 * age-0 flat install failing its FIRST CAS.  Deferring
-			 * those adds a descriptor to the call_rcu queue per
-			 * abort and stretches slab reuse distance -- which is
-			 * already rate x grace-period latency -- on exactly the
-			 * abort-storm path where allocation churn hurts most.
+			 * Nothing was ever planted, so no slot has ever pointed
+			 * to this descriptor and no reader can be resolving
+			 * through it -- the same "no proxy, no grace period"
+			 * argument the poisoned / nr == 0 / nr == 1 paths above
+			 * make.  Worth distinguishing because this IS the
+			 * common abort: the age-0 flat install failing its
+			 * FIRST CAS.  Deferring those adds a descriptor to the
+			 * call_rcu queue per abort and stretches slab reuse
+			 * distance -- which is already rate x grace-period
+			 * latency -- on exactly the abort-storm path where
+			 * allocation churn hurts most.
 			 */
 			urcu_txn_destroy(t);
 		} else {
@@ -1136,14 +1137,15 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 }
 
 /*
- * Commit @t assuming EVERY record is SW-kind (caller-exclusive slots): park all,
- * flip, settle.  No partition, no sort, no CAS, no contention abort -- the
- * branch-lean path for a transaction the embedder knows carries no MW records.
- * Returns true when published; false only when the descriptor was poisoned by a
- * torn same-slot read-set (never a contention abort -- SW parks cannot fail).
- * Use urcu_txn_desc_commit() when MW records may be present; if one is present
+ * Commit @t assuming EVERY record is SW-kind (caller-exclusive slots): park
+ * all, flip, settle.  No partition, no sort, no CAS, no contention abort -- the
+ * branch-lean path for a transaction known to carry no MW records.  Returns
+ * true when published; false only when the descriptor was poisoned by a torn
+ * same-slot read-set (never a contention abort -- SW parks cannot fail).  Use
+ * urcu_txn_desc_commit() when MW records may be present; if one is present
  * anyway this delegates there rather than plain-storing over a concurrent CAS,
- * so the no-contention-abort property holds exactly while the precondition does.
+ * so the no-contention-abort property holds exactly while the precondition
+ * does.
  */
 static inline
 bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,

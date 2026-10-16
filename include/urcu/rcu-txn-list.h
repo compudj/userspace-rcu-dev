@@ -51,9 +51,10 @@
  *  (1) A NEIGHBOUR was deleted -- handled for free by a structural slot
  *      conflict, NOT by the mark.  Removing a node X from a doubly-linked list
  *      MUST rewrite X's predecessor's "next" pointer (that is the only forward
- *      pointer that names X).  An insert placed next to X also rewrites some
- *      node's "next".  So an adjacent insert and delete CAS the SAME "next"
- *      slot with the SAME expected old value, and the MCAS cannot commit both.
+ *      pointer that points to X).  An insert placed next to X also rewrites
+ *      some node's "next".  So an adjacent insert and delete CAS the SAME
+ *      "next" slot with the SAME expected old value, and the MCAS cannot commit
+ *      both.
  *
  *      Example -- list A <-> B <-> C, insert_after(newp, A) racing del(B):
  *
@@ -77,9 +78,9 @@
  *
  *  (2) The ANCHOR ITSELF was deleted -- this is the mark's one and only job.
  *      When the @pos handed to an insert is the node being deleted, the insert
- *      also loses the shared-slot race above; but on retry it must tell
- *      "neighbour moved, re-read and proceed" apart from "my anchor is gone,
- *      give up".  It re-reads @pos->next, sees the mark, and returns -ENOENT.
+ *      also loses the shared-slot race above; but on retry it must distinguish
+ *      "neighbour moved, re-read and proceed" from "my anchor is gone, give
+ *      up".  It re-reads @pos->next, sees the mark, and returns -ENOENT.
  *
  * That is also why @prev is never marked: no operation reaches a node ONLY
  * through a "prev" edge and would need a mark there to terminate its retry --
@@ -104,17 +105,18 @@
  *
  * The straggler is NOT the deleting transaction: the owner settles inside its
  * own commit (install -> decide -> settle -> defer free), so when del() returns
- * 1 nothing of the deleter's still names a slot.  It is a transaction that LOST
- * to the delete.  urcu_txn_settle() is a LOOP of plain stores over the planted
- * prefix, not one atomic operation, so a loser releases its slots one at a time.
- * Concretely: insert_before(elem) guards &elem->next and writes &elem->prev, so
- * it plants a proxy in both; when it aborts, converting &elem->next (the lower
- * address, hence settled first) is precisely what unblocks the del() that was
- * spinning on that slot.  The delete then commits and its caller call_rcu()s
- * @elem while the loser's store into &elem->prev has not yet landed -- and
- * nothing serializes that one, because a delete writes &elem->next and the two
- * NEIGHBOUR edges, never &elem->prev itself (see the "next"-only mark rationale
- * above: no delete names the removed node's own back pointer).
+ * 1 nothing of the deleter's still references a slot.  It is a transaction that
+ * LOST to the delete.  urcu_txn_settle() is a LOOP of plain stores over the
+ * planted prefix, not one atomic operation, so a loser releases its slots one
+ * at a time.  Concretely: insert_before(elem) guards &elem->next and writes
+ * &elem->prev, so it plants a proxy in both; when it aborts, converting
+ * &elem->next (the lower address, hence settled first) is precisely what
+ * unblocks the del() that was spinning on that slot.  The delete then commits
+ * and its caller call_rcu()s @elem while the loser's store into &elem->prev has
+ * not yet landed -- and nothing serializes that one, because a delete writes
+ * &elem->next and the two NEIGHBOUR edges, never &elem->prev itself (see the
+ * "next"-only mark rationale above: no delete records the removed node's own
+ * back pointer).
  *
  * Every such straggler is inside the RCU read-side section its own attempt runs
  * in, so a grace period drains the pending writes exactly as it drains readers.
@@ -299,14 +301,14 @@ int urcu_txn_list_empty(struct urcu_txn_list_head *head)
  * write set disjoint, which is sound because a SINGLE-op commit provably
  * touches distinct slots -- do not copy that line into a composed bracket
  * unless the COMBINED write set is provably distinct too.  Two edits of this
- * list can share a slot the moment their nodes land adjacent (both name the
- * shared neighbour's "next"), and that is data-dependent -- not knowable from
- * the keys.  On a disjoint handle the second prepare's loads then silently
- * return committed values (a stale neighbour) and its stores blind-append a
- * duplicate record: silent corruption.  The default read-your-own-writes handle
- * instead lets the prepare see the transaction's own pending edits and chains
- * the collision into one record.  See urcu_txn_declare_disjoint() in
- * <urcu/rcu-txn.h>.
+ * list can share a slot the moment their nodes land adjacent (both record the
+ * shared neighbour's "next"), and that is data-dependent -- the keys alone do
+ * not determine it.  On a disjoint handle the second prepare's loads then
+ * silently return committed values (a stale neighbour) and its stores
+ * blind-append a duplicate record: silent corruption.  The default
+ * read-your-own-writes handle instead lets the prepare see the transaction's
+ * own pending edits and chains the collision into one record.  See
+ * urcu_txn_declare_disjoint() in <urcu/rcu-txn.h>.
  *
  * Returns:
  *   0        the edges are recorded;
@@ -729,8 +731,8 @@ int urcu_txn_list_del_prepare(struct urcu_txn *txn,
 }
 
 /*
- * Remove @elem, transacting through @domain.  @elem need not name its list --
- * only the structure's shared domain.  Returns 1 if THIS call removed it (the
+ * Remove @elem, transacting through @domain.  The caller passes the structure's
+ * shared domain, not @elem's list.  Returns 1 if THIS call removed it (the
  * caller reclaims @elem after a grace period), 0 if it was already deleted (the
  * caller must NOT reclaim), or -ENOMEM on descriptor allocation failure.
  * Convenience bracket around urcu_txn_list_del_prepare().

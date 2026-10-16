@@ -26,15 +26,16 @@
  *
  * SLOT LIFETIME -- RCU is an EXISTENCE guarantee here, not just a courtesy to
  * readers.  The backing memory of every transacted slot must outlive every
- * transaction that can still name it: it must be reclaimed through call_rcu
- * (i.e. after a grace period) or be permanently allocated.  A transaction
- * writes a slot twice -- a CAS at install, a plain store at settle -- and a
- * transaction that LOSES does both as well: it plants a prefix, then settles
- * that prefix back to the old values.  So a peer that unlinks an object and
- * frees it immediately leaves the loser CASing or storing into freed memory.
- * Every attempt runs inside an RCU read-side critical section, so deferring the
- * free past a grace period is exactly what closes this: the grace period cannot
- * elapse while any transaction that could still name the slot is in flight.
+ * transaction that can still reference it: it must be reclaimed through
+ * call_rcu (i.e. after a grace period) or be permanently allocated.  A
+ * transaction writes a slot twice -- a CAS at install, a plain store at settle
+ * -- and a transaction that LOSES does both as well: it plants a prefix, then
+ * settles that prefix back to the old values.  So a peer that unlinks an object
+ * and frees it immediately leaves the loser CASing or storing into freed
+ * memory.  Every attempt runs inside an RCU read-side critical section, so
+ * deferring the free past a grace period is exactly what closes this: the grace
+ * period cannot elapse while any transaction that could still reference the
+ * slot is in flight.
  *
  * The same wait covers REUSE, not only freeing.  An unlinked object must not be
  * recycled into a fresh one before a grace period either: keeping the memory
@@ -46,9 +47,9 @@
  * Two commit entry points:
  *   - urcu_txn_commit() -- the sw-mw-aware path; use it when the write-set
  *     may contain MW records (store_mw / a load-validate guard).
- *   - urcu_txn_commit_sw() -- for a write-set the embedder knows is
- *     store_sw-only; it skips the multi-writer machinery (partition, sort,
- *     CAS-install, abort) entirely and cannot contention-abort.
+ *   - urcu_txn_commit_sw() -- for a write-set known to be store_sw-only; it
+ *     skips the multi-writer machinery (partition, sort, CAS-install, abort)
+ *     entirely and cannot contention-abort.
  */
 
 #include <errno.h>
@@ -115,8 +116,8 @@ extern "C" {
  *
  * (This is the opposite of a wasted-work rule, which would escalate an
  * expensive op SOONER because each failed attempt throws away more.
- * Measurement says wasted work is not the binding cost -- the serialization
- * is.)
+ * Measurements show that wasted work is not the binding cost -- the
+ * serialization is.)
  *
  * Why cost counts the LOADS.  Sizing the budget on the write set alone prices
  * the DESCENT at zero, and the descent is most of what the lane would
@@ -155,9 +156,9 @@ extern "C" {
 /*
  * Floor under the scaled budget.  It is what keeps a CHEAP transaction on a HOT
  * domain off the lane.  Cost measures what the ESCALATING op costs to
- * serialize; it says NOTHING about what the lane's other traffic costs, and
- * those are not the same thing -- escalating publishes domain->active, which
- * funnels every writer in the domain, however cheap the escalating op was.
+ * serialize; it does NOT measure what the lane's other traffic costs, and those
+ * are not the same thing -- escalating publishes domain->active, which funnels
+ * every writer in the domain, however cheap the escalating op was.
  *
  * A bidir-list delete measures cost 6 (max 7), so scaling alone gives it a
  * budget of ~16 retries.  Its natural retry tail runs past that: over 562M
@@ -721,7 +722,7 @@ void urcu_txn__note_poison(struct urcu_txn *txn, int poisoned)
 		if (!warned) {
 			warned = 1;
 			fprintf(stderr, "urcu-txn: commit ABORTed on a POISONED "
-				"descriptor: a same-slot record named an expected "
+				"descriptor: a same-slot record held an expected "
 				"old that disagrees with this transaction's own "
 				"pending new.  This is deterministic -- retrying "
 				"cannot clear it.  Check for a "
@@ -895,8 +896,8 @@ int urcu_txn__self_qualifies(const struct urcu_txn *txn)
  * because in both cases every event it can see reads in_fallback == 0.  That is
  * not a hypothetical gap: a lane held forever parks every other writer in the
  * domain, which presents as a whole-process hang whose thread dump is identical
- * to a livelock INSIDE the lane -- and telling those two apart is exactly what a
- * caller cannot do.  Three events in the acquire path settle it in one pass:
+ * to a livelock INSIDE the lane -- and distinguishing those two is exactly what
+ * a caller cannot do.  Three events in the acquire path settle it in one pass:
  * count ATTEMPT/HELD/RELEASE, and a lane that was taken and not returned is a
  * subtraction.
  *
@@ -1158,11 +1159,12 @@ coincide_known:
 		 * Blind append when the records cannot alias: at age 0, or on a
 		 * handle that PROMISED they cannot.  Keying on the age alone sent
 		 * a disjoint handle that retried through urcu_txn__reconcile()
-		 * for every record -- an O(nr) urcu_txn_find() per record, O(nr^2)
-		 * per attempt -- to look for a match its own declaration says can
-		 * never exist, which is exactly the work the declaration buys out.
-		 * With no match to find, reconcile degenerates to this same
-		 * urcu_txn_add() call, argument for argument.
+		 * for every record -- an O(nr) urcu_txn_find() per record,
+		 * O(nr^2) per attempt -- to look for a match that its own
+		 * declaration rules out, which is exactly the work the
+		 * declaration buys out.  With no match to find, reconcile
+		 * degenerates to this same urcu_txn_add() call, argument for
+		 * argument.
 		 *
 		 * The trade for a BROKEN promise: a retried disjoint handle used
 		 * to reconcile the duplicate away (and poison a disagreeing old);
@@ -1402,7 +1404,7 @@ int urcu_txn_store_sw(struct urcu_txn *txn, void **slot,
  * @call_rcu_fn.  Call between begin and end.  See urcu_txn_commit_sw_flavor()
  * for a write-set known to be store_sw-only.
  *
- * @call_rcu_fn MUST belong to the flavor whose readers can name the transacted
+ * @call_rcu_fn MUST belong to the flavor whose readers can reach the transacted
  * slots -- for a handle bound with urcu_txn_init_flavor(), that is
  * txn->flavor->update_call_rcu, which is what urcu_txn_commit() passes.  A
  * grace period is flavor-scoped, so the wrong one frees the descriptor while a

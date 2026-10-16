@@ -5,16 +5,16 @@
  *
  * WHY THIS IS NOT rcu-txn-list.h
  *
- * That header offers RCU traversal (urcu_txn_list_next_rcu, _prev_rcu,
- * _empty) and, at one point, a move-to-tail.  Those two features cannot be
- * used by the same caller, and the type system did not say so.  A traverser
- * standing on a moved node follows its NEW next and silently skips or repeats
- * an arbitrary span -- and that is not a race to be fixed with barriers:
- * grace periods govern RECLAMATION, not logical position, so there is no
- * instant at which the old next becomes safe again.  The only RCU-correct
- * relocation is copy-publish-retire, at an allocation and a grace period per
- * move.  (Mainline's dentry_lru_isolate does list_move_tail under lru_lock;
- * what makes it safe there is exclusion, not RCU.)
+ * That header offers RCU traversal (urcu_txn_list_next_rcu, _prev_rcu, _empty)
+ * and, at one point, a move-to-tail.  Those two features cannot be used by the
+ * same caller, and nothing in the types prevented it.  A traverser standing on
+ * a moved node follows its NEW next and silently skips or repeats an arbitrary
+ * span -- and that is not a race to be fixed with barriers: grace periods
+ * govern RECLAMATION, not logical position, so there is no instant at which the
+ * old next becomes safe again.  The only RCU-correct relocation is
+ * copy-publish-retire, at an allocation and a grace period per move.
+ * (Mainline's dentry_lru_isolate does list_move_tail under lru_lock; what makes
+ * it safe there is exclusion, not RCU.)
  *
  * So a structure may offer relocation, or it may offer traversal.  This one
  * offers relocation.  There are no traversal accessors here, on purpose, and
@@ -35,9 +35,10 @@
  * edges.  That single property collapses three jobs a separate membership word
  * cannot do at once:
  *
- *   membership   owner names a deque, and it cannot desynchronise from the
- *                links because it is not separately maintained;
- *   identity     the pointer IS the deque, so a node knows which one it is on;
+ *   membership   owner points to a deque, and it cannot desynchronise from
+ *                the links because it is not separately maintained;
+ *   identity     the pointer IS the deque, so a node records which one it is
+ *                on;
  *   exclusion    the commit is the exclusion.  No claim protocol, no BUSY
  *                state: two concurrent pushes of one node both CAS
  *                &n->owner : NULL -> D, the loser aborts, retries, sees
@@ -138,15 +139,15 @@ struct urcu_txn_deque_node {
  * by every neighbouring one: it manufactured conflicts between operations that
  * are otherwise disjoint.
  *
- * ⚠ WHAT WOULD BRING IT BACK.  The argument rests on an invariant -- A LIVE RING
- * LINK NAMES A MEMBER -- which is what lets the load_validate on &n->prev carry
- * prev's membership.  remove(prev) rewrites its successor's prev, so a removed
- * node cannot stay named by a live link.  Add an operation that points a link
- * at a non-member, or drop the neighbour load_validates for speed, and a
- * removed node's stale `next` becomes reachable as an expected-old again -- the
- * hazard this file already warns about ("that CAS can even SUCCEED, because a
- * removed node's next is never cleared").  Then the version counter is needed
- * again, and this comment is the place to say so.
+ * ⚠ WHAT WOULD BRING IT BACK.  The argument rests on an invariant -- A LIVE
+ * RING LINK POINTS TO A MEMBER -- which is what lets the load_validate on
+ * &n->prev carry prev's membership.  remove(prev) rewrites its successor's
+ * prev, so no live link keeps pointing to a removed node.  Add an operation
+ * that points a link at a non-member, or drop the neighbour load_validates for
+ * speed, and a removed node's stale `next` becomes reachable as an expected-old
+ * again -- the hazard this file already warns about ("that CAS can even
+ * SUCCEED, because a removed node's next is never cleared").  Then the version
+ * counter is needed again, and this comment is the place to say so.
  */
 
 /*
@@ -329,7 +330,7 @@ int urcu_txn_deque_empty(struct urcu_txn_deque *d)
  *	&sentinel.prev	  : oldtail	-> n
  *
  * The node's own two links are TRANSACTED, not plain-stored.  It would be
- * tempting to write them plainly since owner == NULL says nobody else owns the
+ * tempting to write them plainly since owner == NULL means nobody else owns the
  * node -- but that is only true once the commit SUCCEEDS, and a losing peer
  * that had already plain-written them would have corrupted a node it does not
  * own.  That exact reasoning error is what the list shipped.
@@ -337,8 +338,8 @@ int urcu_txn_deque_empty(struct urcu_txn_deque *d)
  * Returns 0, -EEXIST if @n is already queued (terminal, nothing recorded), or
  * -ENOMEM (sticky to the commit).  Do NOT declare the handle disjoint when
  * @oldtail is the sentinel: &oldtail->next and &sentinel.prev are then two
- * slots of one object and the empty-deque case aliases nothing, but a caller
- * composing this with other records cannot know that.
+ * slots of one object and the empty-deque case aliases nothing, but nothing
+ * guarantees that to a caller composing this with other records.
  */
 static inline
 int urcu_txn_deque_push_tail_prepare(struct urcu_txn *txn,
@@ -351,9 +352,9 @@ int urcu_txn_deque_push_tail_prepare(struct urcu_txn *txn,
 	own = urcu_txn_load(txn, (void **) &n->owner, URCU_TXN_TAG);
 	/*
 	 * SEALED is terminal and is NOT the same answer as "already queued":
-	 * -EEXIST invites the caller to try again later, -ESTALE tells it the
-	 * node will never accept a push again.  Both are terminal for THIS
-	 * call, so both take the bracket's abandon path.
+	 * -EEXIST means the caller may try again later, -ESTALE that the node
+	 * will never accept a push again.  Both are terminal for THIS call, so
+	 * both take the bracket's abandon path.
 	 */
 	if (caa_unlikely(own == (void *) URCU_TXN_DEQUE_POISON))
 		return -ESTALE;			/* sealed; never again */
@@ -459,7 +460,7 @@ int urcu_txn_deque__remove_to(struct urcu_txn *txn,
 	 * are why: each carries expected-old @n, i.e. "prev still points at n"
 	 * and "next still points back at n".  A neighbour that was removed and
 	 * re-added since the read presents the same link value -- but if the
-	 * links still say prev -> n -> next at commit, splicing @n out is the
+	 * links still read prev -> n -> next at commit, splicing @n out is the
 	 * correct edit whatever that neighbour's history was.  See the
 	 * no-membership-sequence note at the top of this file for the full
 	 * argument and for what would invalidate it.
@@ -496,7 +497,7 @@ int urcu_txn_deque_remove_prepare(struct urcu_txn *txn,
  * it.  Sealing is therefore an argument to the remove, not a second operation.
  *
  * After this returns 0 the node will never be queued again (until node_init),
- * so the caller may hand it to call_rcu knowing no deque can come to name it.
+ * so the caller may hand it to call_rcu: no deque can come to point to it.
  *
  * Returns 0, -ENOENT if @n is not queued or is queued elsewhere, -ESTALE if it
  * was already sealed (terminal, and NOT an error for a caller that only wants
@@ -541,11 +542,11 @@ int urcu_txn_deque_seal_prepare(struct urcu_txn *txn,
 }
 
 /*
- * UNSEAL, for storage being recycled.  Not a concurrent operation: the caller
- * must already know no peer can reach @n -- which is exactly what having just
- * reclaimed it after a grace period establishes.  urcu_txn_deque_node_init()
- * does the same thing and more; this exists for callers that reuse a node in
- * place and want to say what they mean.
+ * UNSEAL, for storage being recycled.  Not a concurrent operation: no peer may
+ * still reach @n -- which is exactly what having just reclaimed it after a
+ * grace period establishes.  urcu_txn_deque_node_init() does the same thing and
+ * more; this exists for callers that reuse a node in place and want to say what
+ * they mean.
  */
 static inline
 void urcu_txn_deque_node_unseal(struct urcu_txn_deque_node *n)
@@ -591,11 +592,11 @@ int urcu_txn_deque_rotate_head_prepare(struct urcu_txn *txn,
 	hn = urcu_txn_deque_resolve(
 			urcu_txn_load(txn, (void **) &h->next, URCU_TXN_TAG));
 	/*
-	 * hn == sent says the head is also the tail, which h != t just denied.
-	 * The two statements cannot both describe one deque, so the loads
-	 * straddled a concurrent mutation.  Reject it: committing on
-	 * inconsistent reads is how a general move puts two records with
-	 * different expected-olds on &sentinel.prev.
+	 * hn == sent means the head is also the tail, which h != t just ruled
+	 * out.  Both cannot hold for one deque, so the loads straddled a
+	 * concurrent mutation.  Reject it: committing on inconsistent reads is
+	 * how a general move puts two records with different expected-olds on
+	 * &sentinel.prev.
 	 */
 	if (hn == sent)
 		return -EAGAIN;

@@ -62,13 +62,13 @@
  * deletion; only ONE is the mark:
  *
  *  (1) A NEIGHBOUR moved -- a structural slot conflict, NOT the mark.  Every
- *      adjacency at level L is named by the single slot pred[L]->next[L].  An
+ *      adjacency at level L lives in the single slot pred[L]->next[L].  An
  *      insert between pred[L] and its successor, a delete of pred[L], and a
  *      delete of that successor all CAS THAT SAME slot with the same expected
  *      old value, so the MCAS commits at most one; the losers fail their
- *      old-value check, abort, re-search and proceed.  Unlike the hlist there is
- *      no backward "pprev" edge, so an insert's STRUCTURAL write at a level is
- *      only pred[L]->next[L]: every race at that level funnels through one
+ *      old-value check, abort, re-search and proceed.  Unlike the hlist there
+ *      is no backward "pprev" edge, so an insert's STRUCTURAL write at a level
+ *      is only pred[L]->next[L]: every race at that level funnels through one
  *      shared slot, and that funnel is what makes the level correct.
  *
  *      Both prepares nonetheless fold in a load-validate of the SUCCESSOR's
@@ -159,9 +159,9 @@
  * the net would never fire: at age 0 the descent reads committed values, and a
  * composed del(k)+insert(k) would report -EEXIST for the key it just deleted --
  * deterministically, and reproducibly on a fresh handle.  Both prepares
- * therefore report -EAGAIN instead whenever urcu_txn_tainted() says the attempt
- * read its own writes blind.  Callers already treat -EAGAIN as retry; nothing
- * else changes.
+ * therefore report -EAGAIN instead whenever urcu_txn_tainted() returns true:
+ * the attempt read its own writes blind.  Callers already treat -EAGAIN as
+ * retry; nothing else changes.
  *
  * Declaring the write set disjoint
  * --------------------------------
@@ -175,8 +175,8 @@
  * EVERY list both a del and an insert, of different keys -- and when the
  * incoming key lands adjacent to the outgoing node, the two prepares coincide
  * on one pred->next[L] slot.  That is data-dependent; the keys alone do not
- * tell you.  Declaring disjoint there suppresses the RYW consult at EVERY age,
- * so the insert's descent still sees the deleted node linked, picks it as
+ * determine it.  Declaring disjoint there suppresses the RYW consult at EVERY
+ * age, so the insert's descent still sees the deleted node linked, picks it as
  * pred/succ, and records a slot the del already recorded.  At age 0 the
  * duplicate blind-appends and the commit tears the tower.  At age 1+ the
  * reconcile sees a disagreeing old (the del's pending MARK) and poisons the
