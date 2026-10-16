@@ -147,7 +147,7 @@ extern "C" {
  * hands the memory back to libc when the burst ends.  Spilling is the valve
  * doing its job.
  *
- * So hitting it is a SIGNAL, not a limit to relax: it says blocks are not
+ * So hitting it is a SIGNAL, not a limit to relax: it means blocks are not
  * returning to their freelist fast enough, and the fix is on the reclaim side.
  * Raising the cap does buy throughput -- measured, a 384-cpu machine at 48
  * writers goes from ~36 to ~99 Mchurn/s once the cap stops binding -- but it
@@ -501,13 +501,13 @@ struct urcu_slab {
 	size_t batch_off;
 	unsigned long batch_max;	/* close a batch at this many blocks */
 	/*
-	 * Batch retirement, one entry per FLAVOR that has retired into this slab
-	 * (see struct urcu_slab_batch_arena): @flavor is the key -- each liburcu
-	 * flavor library defines exactly one struct rcu_flavor_struct, so its
-	 * address names the flavor -- and @arenas that flavor's batch arenas,
-	 * [nclass * ncpu] like ->arenas.  A grace period is flavor-scoped, so
-	 * a batch never mixes flavors: each one is closed and spliced through
-	 * its own flavor's update_call_rcu.
+	 * Batch retirement, one entry per FLAVOR that has retired into this
+	 * slab (see struct urcu_slab_batch_arena): @flavor is the key -- each
+	 * liburcu flavor library defines exactly one struct rcu_flavor_struct,
+	 * so its address identifies the flavor -- and @arenas that flavor's
+	 * batch arenas, [nclass * ncpu] like ->arenas.  A grace period is
+	 * flavor-scoped, so a batch never mixes flavors: each one is closed and
+	 * spliced through its own flavor's update_call_rcu.
 	 *
 	 * Entries are installed lazily, under @batch_lock, by the first deferred
 	 * free of a flavor (urcu_slab_batch_arenas()): @arenas is written first,
@@ -623,8 +623,8 @@ unsigned long urcu_slab_count_chain(const struct cds_lfs_node *n,
 }
 
 /*
- * Footprint census.  st_reuse/st_carve say how allocation was SERVED; they
- * cannot say whether the memory the slab mapped is being used, which is a
+ * Footprint census.  st_reuse/st_carve count how allocation was SERVED; they do
+ * not measure whether the memory the slab mapped is being used, which is a
  * different question and the one that matters when the footprint looks large.
  *
  * Two ratios, deliberately separate, because they fail for different reasons:
@@ -2229,8 +2229,8 @@ counted:
 	 *
 	 * A lost increment closes a little late; a doubled close finds nothing
 	 * pending and returns.  Neither can stall reclaim: every push that does
-	 * not close a batch arms the fallback closer below, so a batch is closed
-	 * at least once per grace period no matter what this says.
+	 * not close a batch arms the fallback closer below, so a batch is
+	 * closed at least once per grace period whatever this counter holds.
 	 */
 	n_pending = uatomic_load(&ba->nr_pending, CMM_RELAXED) + 1;
 	uatomic_store(&ba->nr_pending, n_pending, CMM_RELAXED);
