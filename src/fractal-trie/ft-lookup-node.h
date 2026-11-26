@@ -1166,10 +1166,11 @@ struct cds_ft_inode_flag *ft_popcount_1l_scan_28(
 		struct cds_ft_inode_flag ***node_flag_ptr,
 		uint8_t n, enum ft_pf_target pf_hint)
 {
-	uint64_t w0 = *(const uint64_t *) &node->data[0];
-	uint64_t w1 = *(const uint64_t *) &node->data[8];
-	uint64_t w2 = *(const uint64_t *) &node->data[16];
-	uint64_t w3 = *(const uint64_t *) &node->data[24];
+	/* Relaxed loads: an in-place insert sets a bit concurrently (ft_pc_bm64). */
+	uint64_t w0 = ft_pc_bm64(node, 0);
+	uint64_t w1 = ft_pc_bm64(node, 8);
+	uint64_t w2 = ft_pc_bm64(node, 16);
+	uint64_t w3 = ft_pc_bm64(node, 24);
 	unsigned int word_idx = (unsigned int) n >> 6;
 	unsigned int bit_idx = (unsigned int) n & 63U;
 	uint64_t word, prefix_mask;
@@ -1490,9 +1491,11 @@ retry:
 				cds_find_prev_bit(bitmap->bitmap,
 					FT_ENTRY_PER_NODE, i - 1);
 
+			/* Only a hint, but a writer stores this slot concurrently. */
 			if (adj >= 0)
-				ft_maybe_prefetch_nta(((struct cds_ft_inode_flag **)
-					node->data)[adj]);
+				ft_maybe_prefetch_nta(uatomic_load(
+					&((struct cds_ft_inode_flag **)
+						node->data)[adj], CMM_RELAXED));
 		}
 		dbg_printf("ft_pigeon_node_get child_node_flag %p\n", child_node_flag);
 		*result_key = (uint8_t) i;

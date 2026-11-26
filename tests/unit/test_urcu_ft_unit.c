@@ -69,7 +69,7 @@
 #endif
 
 /*
- * 365 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
+ * 374 unconditional + 53 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  *
  * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
@@ -79,9 +79,9 @@
  * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (419 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (427 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (366 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (374 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* The longest key test_overlong_collapse builds (FT_MAX_KEY_LEN is 256). */
@@ -9758,6 +9758,326 @@ static int test_iteration_prefix_scoped_key_at_scope(void)
 }
 
 /*
+ * cds_ft_iter_set_key must drop the ordered-list cell which the iterator
+ * cached on its previous position.  A reader lands on "a" and leaves its
+ * read-side section.  "a" is removed, a grace period passes, "ab" is inserted
+ * and the same node object is inserted at "a" again, with a new cell.  The
+ * reader then sets the key "a", looks it up and steps: the next key is "ab".
+ * With the old cell still cached for that node, the step went through the
+ * freed cell and skipped "ab".
+ */
+static int test_iter_set_key_drops_cell_cursor(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *reader, *writer;
+	struct ft_test_node *a = node_alloc(1);
+	enum cds_ft_status s;
+	uint8_t key[8];
+	size_t key_len = 0;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	if (cds_ft_iter_create(ft, &reader) < 0 ||
+			cds_ft_iter_create(ft, &writer) < 0)
+		abort();
+
+	rcu_read_lock();
+	if (cds_ft_insert(ft, (const uint8_t *) "a", 1, &a->node)
+				!= CDS_FT_STATUS_OK ||
+			cds_ft_insert(ft, (const uint8_t *) "b", 1,
+				&node_alloc(2)->node) != CDS_FT_STATUS_OK ||
+			cds_ft_insert(ft, (const uint8_t *) "c", 1,
+				&node_alloc(3)->node) != CDS_FT_STATUS_OK)
+		abort();
+	/* The reader's first read-side section: land on "a". */
+	if (cds_ft_lookup_first(ft, reader) != CDS_FT_STATUS_OK ||
+			cds_ft_iter_node(reader) != &a->node)
+		abort();
+	rcu_read_unlock();
+	rcu_quiescent_state();
+
+	rcu_read_lock();
+	cds_ft_iter_set_key(writer, (const uint8_t *) "a", 1);
+	if (cds_ft_lookup(ft, writer) != CDS_FT_STATUS_OK ||
+			cds_ft_remove(ft, writer, &a->node) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	synchronize_rcu();
+	rcu_barrier();
+	rcu_read_lock();
+	cds_ft_node_init(&a->node);
+	if (cds_ft_insert(ft, (const uint8_t *) "ab", 2, &node_alloc(4)->node)
+				!= CDS_FT_STATUS_OK ||
+			cds_ft_insert(ft, (const uint8_t *) "a", 1, &a->node)
+				!= CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	rcu_quiescent_state();
+
+	/* The reader's second section: the documented way back in. */
+	rcu_read_lock();
+	cds_ft_iter_set_key(reader, (const uint8_t *) "a", 1);
+	s = cds_ft_lookup(ft, reader);
+	if (s == CDS_FT_STATUS_OK)
+		s = cds_ft_next(ft, reader);
+	if (s == CDS_FT_STATUS_OK)
+		(void) cds_ft_iter_get_key(reader, key, sizeof(key), &key_len);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || key_len != 2 || memcmp(key, "ab", 2)) {
+		fprintf(stderr, "iter_set_key_drops_cell_cursor: next from "
+			"\"a\" -> %s, key \"%.*s\", expected \"ab\"\n",
+			cds_ft_status_to_string(s),
+			s == CDS_FT_STATUS_OK ? (int) key_len : 0, key);
+		goto out;
+	}
+	ret = 0;
+out:
+	cds_ft_iter_destroy(reader);
+	cds_ft_iter_destroy(writer);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * cds_ft_lookup_last without the ordered list is a descent along the scope
+ * prefix padded with 0xff.  A leaf whose key is that prefix followed only by
+ * 0xff bytes is the greatest key, and a proper prefix of the padded key.  The
+ * descent skipped it for the next smaller key, or for NOT_FOUND when it was
+ * the only key.  cds_ft_lookup_nth_last(0) takes the same descent when the
+ * group keeps no rank statistics.
+ */
+struct last_ff_case {
+	const char *keys[4];	/* NULL-terminated */
+	const char *scope;
+	const char *expect;
+};
+
+static const struct last_ff_case last_ff[] = {
+	{ { "b", "\xff", NULL }, "", "\xff" },
+	{ { "\xff", NULL }, "", "\xff" },
+	{ { "b", "\xff\xff", NULL }, "", "\xff\xff" },
+	{ { "\xff", "\xff\xff", NULL }, "", "\xff\xff" },
+	{ { "\xff", "\xff\x01", NULL }, "", "\xff\x01" },
+	{ { "ab", "a\xff", "b", NULL }, "a", "a\xff" },
+	{ { "ab", "a\xff\xff", "b", NULL }, "a", "a\xff\xff" },
+};
+
+static int test_lookup_last_all_ff_key(void)
+{
+	unsigned int i, j;
+	int list, ret = 0;
+
+	for (list = 0; list < 2; list++) {
+		for (i = 0; i < CAA_ARRAY_SIZE(last_ff); i++) {
+			const struct last_ff_case *c = &last_ff[i];
+			struct cds_ft_group_attr *attr;
+			struct cds_ft_group *group;
+			struct cds_ft *ft;
+			struct cds_ft_iter *iter;
+			enum cds_ft_status s;
+			uint8_t key[8];
+			size_t key_len = 0;
+
+			if (cds_ft_group_attr_create(&attr) < 0)
+				abort();
+			if (cds_ft_group_attr_set_ordered_list(attr, list) < 0)
+				abort();
+			if (cds_ft_group_create(attr, &group) < 0)
+				abort();
+			cds_ft_group_attr_destroy(attr);
+			if (cds_ft_create(group, NULL, &ft) < 0)
+				abort();
+			if (cds_ft_iter_create(ft, &iter) < 0)
+				abort();
+			rcu_read_lock();
+			for (j = 0; c->keys[j]; j++) {
+				struct ft_test_node *n = node_alloc(j);
+
+				if (cds_ft_insert(ft, (const uint8_t *) c->keys[j],
+						strlen(c->keys[j]), &n->node)
+						!= CDS_FT_STATUS_OK)
+					abort();
+			}
+			cds_ft_iter_set_key(iter, (const uint8_t *) c->scope,
+				strlen(c->scope));
+			cds_ft_iter_set_prefix_len(iter, strlen(c->scope));
+			s = cds_ft_lookup_last(ft, iter);
+			if (s == CDS_FT_STATUS_OK)
+				(void) cds_ft_iter_get_key(iter, key, sizeof(key),
+					&key_len);
+			if (s != CDS_FT_STATUS_OK || key_len != strlen(c->expect) ||
+					memcmp(key, c->expect, key_len)) {
+				fprintf(stderr, "lookup_last case %u (list %s): %s, "
+					"key length %zu, expected the %zu byte "
+					"key\n", i, list ? "on" : "off",
+					cds_ft_status_to_string(s), key_len,
+					strlen(c->expect));
+				ret = -1;
+			}
+			if (!c->scope[0]) {
+				cds_ft_iter_reset(iter);
+				key_len = 0;
+				s = cds_ft_lookup_nth_last(ft, iter, 0);
+				if (s == CDS_FT_STATUS_OK)
+					(void) cds_ft_iter_get_key(iter, key,
+						sizeof(key), &key_len);
+				if (s != CDS_FT_STATUS_OK ||
+						key_len != strlen(c->expect) ||
+						memcmp(key, c->expect, key_len)) {
+					fprintf(stderr, "lookup_nth_last(0) case %u "
+						"(list %s): %s, key length %zu, "
+						"expected the %zu byte key\n", i,
+						list ? "on" : "off",
+						cds_ft_status_to_string(s), key_len,
+						strlen(c->expect));
+					ret = -1;
+				}
+			}
+			rcu_read_unlock();
+			cds_ft_iter_destroy(iter);
+			if (drain_and_destroy(ft, group) < 0)
+				ret = -1;
+		}
+	}
+	return ret;
+}
+
+/*
+ * Check the scope against a compressed run.
+ *
+ * The trie holds the single key "abcdef", so everything below the root's "a"
+ * slot is one compressed run.  A scope which the run leaves ("abXX", "aXcd",
+ * "abcX") holds no key.  A scope which ends inside the run ("ab", "abcd")
+ * holds the key, and the relational lookups must still compare the rest of
+ * the key: from "abzz" there is nothing greater in the scope "ab".
+ *
+ * The descent took a run met inside the scope prefix for the scope's subtree
+ * whenever the going-up loop, which is bounded at the prefix, did not run.
+ */
+static const struct scoped_rel_case scoped_run[] = {
+	/* 'F' first, 'T' last: the run leaves the scope prefix. */
+	{ 'F', "abXX", 4, NULL },
+	{ 'T', "abXX", 4, NULL },
+	{ 'F', "aXcd", 4, NULL },
+	{ 'T', "aXcd", 4, NULL },
+	{ 'F', "abcX", 4, NULL },
+	{ 'T', "abcX", 4, NULL },
+	{ 'F', "abzz", 4, NULL },
+	{ 'T', "abzz", 4, NULL },
+	{ 'G', "abXX", 4, NULL },
+	{ 'L', "abzz", 4, NULL },
+	/* The scope ends inside the run. */
+	{ 'F', "abcd", 4, "abcdef" },
+	{ 'T', "abcd", 4, "abcdef" },
+	{ 'F', "ab", 2, "abcdef" },
+	{ 'T', "ab", 2, "abcdef" },
+	{ 'G', "abca", 2, "abcdef" },
+	{ 'g', "abca", 2, "abcdef" },
+	{ 'L', "abzz", 2, "abcdef" },
+	{ 'l', "abzz", 2, "abcdef" },
+	/* ...and the key is on the wrong side of the query. */
+	{ 'G', "abzz", 2, NULL },
+	{ 'g', "abzz", 2, NULL },
+	{ 'L', "abc", 2, NULL },
+	{ 'l', "abc", 2, NULL },
+	{ 'L', "abca", 2, NULL },
+};
+
+static int test_iteration_prefix_scoped_compressed_run(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	unsigned int i;
+	int list, ret = 0;
+
+	for (list = 0; list < 2; list++) {
+		struct ft_test_node *n = node_alloc(0);
+		struct cds_ft_group_attr *attr;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			abort();
+		if (cds_ft_group_attr_set_ordered_list(attr, list) < 0)
+			abort();
+		if (cds_ft_group_create(attr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0)
+			abort();
+		if (cds_ft_iter_create(ft, &iter) < 0)
+			abort();
+		rcu_read_lock();
+		if (cds_ft_insert(ft, (const uint8_t *) "abcdef", 6, &n->node)
+				!= CDS_FT_STATUS_OK)
+			abort();
+		rcu_read_unlock();
+		for (i = 0; i < CAA_ARRAY_SIZE(scoped_run); i++) {
+			const struct scoped_rel_case *c = &scoped_run[i];
+			enum cds_ft_status s;
+			uint8_t key[8];
+			size_t key_len = 0;
+
+			cds_ft_iter_set_key(iter, (const uint8_t *) c->key,
+				strlen(c->key));
+			cds_ft_iter_set_prefix_len(iter, c->prefix_len);
+			rcu_read_lock();
+			switch (c->op) {
+			case 'F':
+				s = cds_ft_lookup_first(ft, iter);
+				break;
+			case 'T':
+				s = cds_ft_lookup_last(ft, iter);
+				break;
+			case 'l':
+				s = cds_ft_lookup_lt(ft, iter);
+				break;
+			case 'L':
+				s = cds_ft_lookup_le(ft, iter);
+				break;
+			case 'G':
+				s = cds_ft_lookup_ge(ft, iter);
+				break;
+			default:
+				s = cds_ft_lookup_gt(ft, iter);
+				break;
+			}
+			if (s == CDS_FT_STATUS_OK)
+				(void) cds_ft_iter_get_key(iter, key, sizeof(key),
+					&key_len);
+			rcu_read_unlock();
+			if (c->expect ? (s != CDS_FT_STATUS_OK ||
+					key_len != strlen(c->expect) ||
+					memcmp(key, c->expect, key_len)) :
+					s != CDS_FT_STATUS_NOT_FOUND) {
+				fprintf(stderr, "scoped op '%c' key '%s' prefix_len %zu "
+					"(list %s): %s '%.*s', expected %s\n",
+					c->op, c->key, c->prefix_len,
+					list ? "on" : "off",
+					cds_ft_status_to_string(s),
+					s == CDS_FT_STATUS_OK ? (int) key_len : 0,
+					key, c->expect ? c->expect : "NOT_FOUND");
+				ret = -1;
+			}
+		}
+		cds_ft_iter_destroy(iter);
+		if (drain_and_destroy(ft, group) < 0)
+			ret = -1;
+	}
+	return ret;
+}
+
+/*
  * for_each_entry_rcu: verify the typed-entry macro works.
  */
 static int test_iteration_for_each_entry(void)
@@ -18022,6 +18342,57 @@ static int test_rekey_known_nonterminating(void)
 }
 
 /*
+ * A destination which sorts right after the zero-length key.  With the ordered
+ * list on, that key's cell is then the list predecessor of the moved keys.  Its
+ * key rebuilds to a length of 0, which the splice-position check took for an
+ * unreadable walk: the rekey retried without end.  Like the legs above, a
+ * regression here hangs the suite.
+ */
+static int test_rekey_dst_after_nil_key(void)
+{
+	static const char *k1[] = { "", "bccc", NULL };
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_dst_after_nil_key: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (rekey_keeps_keys("nil-pred/merge", k1, "a", "b"))
+		return -1;
+	if (rekey_rankstats_keeps_keys("nil-pred/merge-rankstats", k1, "a", "b"))
+		return -1;
+
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "", 0, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bccc", 4, &node_alloc(2)->node);
+	s = cds_ft_rekey_graft(ft, (const uint8_t *) "a", 1,
+			(const uint8_t *) "b", 1);
+	if (s != CDS_FT_STATUS_OK ||
+			cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+			!ft_test_has_key(ft, "") || !ft_test_has_key(ft, "accc") ||
+			ft_test_has_key(ft, "bccc") ||
+			cds_ft_count_keys(ft) != 2) {
+		fprintf(stderr, "nil-pred/graft: rekey_graft a<-b next to the "
+			"zero-length key failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * ☑ REGRESSION GUARD (was an opt-in crasher; FIXED by the old-direction drop
  * arming).  An EXCLUSIVE trie used to SEGFAULT on the drain that follows this
  * rekey -- because the rekey destroyed a key first and left a dangling ordered
@@ -21298,6 +21669,285 @@ static int test_graft_self_error(void)
 }
 
 /*
+ * One leg of test_bulk_long_dst_key: move the key "abc" of an exclusive source
+ * under a @len byte key of an empty destination, with cds_ft_graft or with
+ * cds_ft_merge_at.
+ */
+static int bulk_long_dst_key(unsigned int len, bool merge)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct ft_test_node *n;
+	struct cds_ft_node *found = NULL;
+	uint8_t key[FT_TEST_OVL_MAX];
+	enum cds_ft_status s;
+	int ret = -1;
+
+	dst = create_varlen_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		abort();
+	n = node_alloc(0);
+	if (cds_ft_insert(src, (const uint8_t *) "abc", 3, &n->node)
+			!= CDS_FT_STATUS_OK) {
+		node_free(n);
+		goto out;
+	}
+	cds_ft_make_exclusive(src);
+	memset(key, 'y', len);
+	memcpy(key + len, "abc", 3);
+	rcu_read_lock();
+	if (merge)
+		s = cds_ft_merge_at(dst, key, len, src, NULL, 0);
+	else
+		s = cds_ft_graft(dst, key, len, src);
+	if (s != CDS_FT_STATUS_OK ||
+			cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+			cds_ft_eager_lookup_key(dst, key, len + 3, 0, &found)
+				!= CDS_FT_STATUS_OK ||
+			found != &n->node || cds_ft_count_keys(dst) != 1 ||
+			!cds_ft_empty(src)) {
+		fprintf(stderr, "bulk_long_dst_key: %s at a %u byte key "
+			"failed (%s)\n", merge ? "merge_at" : "graft", len,
+			cds_ft_status_to_string(s));
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A bulk attach under a long destination key spells that key with one
+ * compressed node, which can be 255 bytes long.  The node reserve of the bulk
+ * operations was filled up to the size class of a 127 byte node.  From 246
+ * bytes on, the node is in the next size class: the reserve underflowed, which
+ * is an assertion failure.
+ */
+static int test_bulk_long_dst_key(void)
+{
+	static const unsigned int lens[] = { 245, 246, 250, 253 };
+	unsigned int i;
+
+	for (i = 0; i < CAA_ARRAY_SIZE(lens); i++) {
+		if (bulk_long_dst_key(lens[i], false))
+			return -1;
+		if (cds_ft_merge_enabled() && bulk_long_dst_key(lens[i], true))
+			return -1;
+	}
+	return 0;
+}
+
+/* Insert @key in @ft; abort on failure. */
+static void keb_insert(struct cds_ft *ft, const char *key)
+{
+	struct ft_test_node *n = node_alloc(0);
+
+	if (cds_ft_insert(ft, (const uint8_t *) key, strlen(key), &n->node)
+			!= CDS_FT_STATUS_OK)
+		abort();
+}
+
+/* Remove every node at @key in @ft; return 0 on success. */
+static int keb_remove(struct cds_ft *ft, struct cds_ft_iter *iter,
+		const char *key)
+{
+	struct cds_ft_node *head = NULL, *next;
+
+	cds_ft_iter_set_key(iter, (const uint8_t *) key, strlen(key));
+	if (cds_ft_remove_all(ft, iter, &head) != CDS_FT_STATUS_OK)
+		return -1;
+	for (; head; head = next) {
+		next = cds_ft_node_next_rcu(head);
+		node_free_rcu(to_test_node(head));
+	}
+	return 0;
+}
+
+/* Is @expect the only key which an ordered walk of @ft reports? */
+static int keb_only_key(struct cds_ft *ft, struct cds_ft_iter *iter,
+		const char *what, const char *expect)
+{
+	uint8_t key[16];
+	size_t key_len = 0;
+
+	cds_ft_iter_reset(iter);
+	if (cds_ft_lookup_first(ft, iter) != CDS_FT_STATUS_OK ||
+			cds_ft_iter_get_key(iter, key, sizeof(key), &key_len)
+				!= CDS_FT_STATUS_OK ||
+			key_len != strlen(expect) ||
+			memcmp(key, expect, key_len) ||
+			cds_ft_next(ft, iter) != CDS_FT_STATUS_NOT_FOUND ||
+			cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "bulk_move_key_end_byte(%s): the walk reports "
+			"\"%.*s\" (%zu bytes), expected only \"%s\"\n", what,
+			(int) key_len, key, key_len, expect);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * One leg of test_bulk_move_key_end_byte.  The source holds @src_top and
+ * @src_top "ca": a key which ends at the moved prefix, and one below it.
+ * @op moves them under "x" of a destination which holds @dst_key (or nothing),
+ * then every key but "x" is removed, so that "x" drops from a prefix head
+ * into a slot.  An ordered walk must then report "x".
+ *
+ * @op: 'm' cds_ft_merge_at, 'g' cds_ft_graft, 's' cds_ft_graft_swap.  The
+ * latter two move a whole trie, so @src_top is "" for them.
+ */
+static int bulk_move_key_end(const char *what, char op, const char *src_top,
+		const char *dst_key)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct cds_ft_iter *iter;
+	char below[16];
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+			cds_ft_create(group, NULL, &src) < 0)
+		abort();
+	if (cds_ft_iter_create(dst, &iter) < 0)
+		abort();
+	snprintf(below, sizeof(below), "%sca", src_top);
+	rcu_read_lock();
+	keb_insert(src, src_top);
+	keb_insert(src, below);
+	if (dst_key)
+		keb_insert(dst, dst_key);
+	rcu_read_unlock();
+	cds_ft_make_exclusive(src);
+	if (op == 'm')
+		s = cds_ft_merge_at(dst, (const uint8_t *) "x", 1, src,
+				(const uint8_t *) src_top, strlen(src_top));
+	else if (op == 'g')
+		s = cds_ft_graft(dst, (const uint8_t *) "x", 1, src);
+	else
+		s = cds_ft_graft_swap(dst, (const uint8_t *) "x", 1, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "bulk_move_key_end_byte(%s): %s\n", what,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	/* graft_swap replaced whatever dst held under "x". */
+	if (keb_remove(dst, iter, "xca") ||
+			(dst_key && op != 's' && keb_remove(dst, iter, dst_key)))
+		fprintf(stderr, "bulk_move_key_end_byte(%s): a moved key is "
+			"missing\n", what);
+	else
+		ret = keb_only_key(dst, iter, what, "x");
+	rcu_read_unlock();
+out:
+	cds_ft_iter_destroy(iter);
+	drain_trie(src);
+	drain_trie(dst);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * The ordered cell of a head holds the last byte of its key, for the walk to
+ * spell.  A cross-trie move changes that byte for the one key which ends at
+ * the moved prefix.  When that key was the prefix head of the moved subtree,
+ * no path stamped it: the walk spelled the old byte, or a zero byte, once the
+ * keys below were gone.
+ *
+ * Last leg: a merge which is refused must leave the source's byte alone.
+ */
+static int test_bulk_move_key_end_byte(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct cds_ft_iter *iter;
+	int ret = -1;
+
+	if (cds_ft_merge_enabled()) {
+		if (bulk_move_key_end("merge_at, empty dst", 'm', "babc", NULL))
+			return -1;
+		if (bulk_move_key_end("merge_at, sibling in dst", 'm', "babc",
+				"xq"))
+			return -1;
+		if (bulk_move_key_end("merge_at, overlap in dst", 'm', "babc",
+				"xcb"))
+			return -1;
+		if (bulk_move_key_end("merge_at, whole source", 'm', "", NULL))
+			return -1;
+	}
+	if (bulk_move_key_end("graft", 'g', "", NULL))
+		return -1;
+	if (bulk_move_key_end("graft, other key in dst", 'g', "", "yy"))
+		return -1;
+	if (bulk_move_key_end("graft_swap, leaf in dst", 's', "", "x"))
+		return -1;
+	if (bulk_move_key_end("graft_swap, subtree in dst", 's', "", "xzz"))
+		return -1;
+	if (!cds_ft_merge_enabled())
+		return 0;
+
+	/* "xyzwv" + "ca" is one byte too long: the merge is refused. */
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_max_key_len(attr, 6) < 0 ||
+			cds_ft_group_attr_set_ordered_list(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+			cds_ft_create(group, NULL, &src) < 0)
+		abort();
+	if (cds_ft_iter_create(src, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	keb_insert(src, "babc");
+	keb_insert(src, "babcca");
+	rcu_read_unlock();
+	cds_ft_make_exclusive(src);
+	if (cds_ft_merge_at(dst, (const uint8_t *) "xyzwv", 5, src,
+			(const uint8_t *) "babc", 4)
+			!= CDS_FT_STATUS_OVERFLOW_ERROR) {
+		fprintf(stderr, "bulk_move_key_end_byte: the over-long merge "
+			"was not refused\n");
+	} else {
+		rcu_read_lock();
+		if (!keb_remove(src, iter, "babcca"))
+			ret = keb_only_key(src, iter, "refused merge", "babc");
+		rcu_read_unlock();
+	}
+	cds_ft_iter_destroy(iter);
+	drain_trie(src);
+	drain_trie(dst);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Graft that would exceed the group's max key length returns
  * OVERFLOW_ERROR.
  */
@@ -21570,6 +22220,112 @@ fail:
 	cds_ft_destroy(live);
 	cds_ft_group_destroy(group);
 	return -1;
+}
+
+/*
+ * One leg of test_graft_swap_nil_only_swap.  The live trie holds @live_key, the
+ * swap trie only its zero-length key.  They are swapped at @at, a prefix of
+ * @live_key, in a group whose keys are at most @max_len bytes long (0: the
+ * default).  Afterwards the live trie holds the swap node at @at, and the swap
+ * trie holds the live node at the rest of @live_key.
+ */
+static int graft_swap_nil_only(const char *live_key, const char *at,
+		size_t max_len, bool ordered_list)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap;
+	struct ft_test_node *ln, *sn;
+	struct cds_ft_node *found = NULL;
+	struct cds_ft_iter *iter;
+	const char *rest = live_key + strlen(at);
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (max_len && cds_ft_group_attr_set_max_key_len(attr, max_len) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &live) < 0 ||
+			cds_ft_create(group, NULL, &swap) < 0)
+		abort();
+	if (cds_ft_iter_create(live, &iter) < 0)
+		abort();
+
+	ln = node_alloc(1);
+	sn = node_alloc(2);
+	if (cds_ft_insert(live, (const uint8_t *) live_key, strlen(live_key),
+			&ln->node) != CDS_FT_STATUS_OK ||
+			cds_ft_insert(swap, (const uint8_t *) "", 0, &sn->node)
+				!= CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_lock();
+	cds_ft_make_exclusive(swap);
+	s = cds_ft_graft_swap(live, (const uint8_t *) at, strlen(at), swap);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_nil_only(%s at %s): %s\n", live_key,
+			at, cds_ft_status_to_string(s));
+		goto out;
+	}
+	/* An ordered descent: the one which walked past the maximum length. */
+	if (cds_ft_lookup_first(live, iter) != CDS_FT_STATUS_OK ||
+			cds_ft_iter_node(iter) != &sn->node ||
+			cds_ft_eager_lookup_key(live, (const uint8_t *) at,
+				strlen(at), 0, &found) != CDS_FT_STATUS_OK ||
+			found != &sn->node || cds_ft_count_keys(live) != 1 ||
+			cds_ft_verify(live, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_nil_only(%s at %s): the live trie "
+			"does not hold the swap node at the swap key\n",
+			live_key, at);
+		goto out;
+	}
+	if (cds_ft_eager_lookup_key(swap, (const uint8_t *) rest, strlen(rest),
+			0, &found) != CDS_FT_STATUS_OK ||
+			found != &ln->node || cds_ft_count_keys(swap) != 1 ||
+			cds_ft_verify(swap, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_nil_only(%s at %s): the swap trie "
+			"does not hold the live node\n", live_key, at);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	drain_trie(swap);
+	drain_trie(live);
+	rcu_barrier();
+	cds_ft_destroy(swap);
+	cds_ft_destroy(live);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A swap trie which holds only its zero-length key has a childless root.
+ * cds_ft_graft_swap placed that root below the root of the live trie, where a
+ * childless internal node stands for a leaf.  With a swap key as long as the
+ * group allows, the next ordered lookup failed its depth assertion.
+ */
+static int test_graft_swap_nil_only_swap(void)
+{
+	int list;
+
+	for (list = 0; list < 2; list++) {
+		/* The swap key is a leaf, at the maximum key length. */
+		if (graft_swap_nil_only("abc", "abc", 3, list))
+			return -1;
+		if (graft_swap_nil_only("a", "a", 1, list))
+			return -1;
+		/* The swap key ends inside a compressed run. */
+		if (graft_swap_nil_only("abcdef", "abc", 0, list))
+			return -1;
+	}
+	return 0;
 }
 
 /*
@@ -31572,6 +32328,110 @@ out_dst:
 	cds_ft_destroy(dst);
 	cds_ft_group_destroy(group);
 	return ret;
+}
+
+/*
+ * One leg of test_merge_lone_key_at_root.  @dkey is the only key of dst and
+ * @skey the only key of src.  cds_ft_merge_at moves the src key onto the dst
+ * key: the result is one chain of two nodes at @dkey, and an empty src.
+ */
+static int merge_lone_keys(const char *what, bool ordered_list,
+		const char *dkey, const char *skey)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	struct cds_ft_node *found = NULL, *p;
+	struct ft_test_node *n;
+	unsigned int count = 0;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &dst) < 0 ||
+			cds_ft_create(group, NULL, &src) < 0)
+		abort();
+
+	n = node_alloc(1);
+	if (cds_ft_insert(dst, (const uint8_t *) dkey, strlen(dkey),
+			&n->node) != CDS_FT_STATUS_OK) {
+		node_free(n);
+		goto out;
+	}
+	n = node_alloc(2);
+	if (cds_ft_insert(src, (const uint8_t *) skey, strlen(skey),
+			&n->node) != CDS_FT_STATUS_OK) {
+		node_free(n);
+		goto out;
+	}
+	cds_ft_make_exclusive(src);
+	s = cds_ft_merge_at(dst, (const uint8_t *) dkey, strlen(dkey),
+			src, (const uint8_t *) skey, strlen(skey));
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_lone_keys(%s, list %s): %s\n", what,
+			ordered_list ? "on" : "off", cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_eager_lookup_key(dst, (const uint8_t *) dkey, strlen(dkey),
+			0, &found) == CDS_FT_STATUS_OK)
+		for (p = found; p; p = cds_ft_node_next_rcu(p))
+			count++;
+	if (count != 2 || cds_ft_count_keys(dst) != 1 || !cds_ft_empty(src) ||
+			cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+			cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_lone_keys(%s, list %s): %u nodes at the "
+			"dst key (expected 2), %lu dst keys (expected 1), src "
+			"%s\n", what, ordered_list ? "on" : "off", count,
+			cds_ft_count_keys(dst),
+			cds_ft_empty(src) ? "empty" : "NOT empty");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A trie which holds only its zero-length key has a childless root.  A merge
+ * with such a root on one side, and no child on the other side either, has no
+ * child to add to the merged node.  The merged node was allocated when the
+ * first child was added: without one, the merged key chain was stored through
+ * a NULL node.
+ */
+static int test_merge_lone_key_at_root(void)
+{
+	int list;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_lone_key_at_root: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	for (list = 0; list < 2; list++) {
+		if (merge_lone_keys("leaf onto childless root", list, "", "abc"))
+			return -1;
+		if (merge_lone_keys("childless root onto childless root", list,
+				"", ""))
+			return -1;
+		if (merge_lone_keys("childless root onto leaf", list, "abc", ""))
+			return -1;
+	}
+	return 0;
 }
 
 /*
@@ -42445,6 +43305,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_lookup_longest_match_root);
 	RUN_TEST(test_lookup_relational);
 	RUN_TEST(test_lookup_first_last);
+	RUN_TEST(test_lookup_last_all_ff_key);
+	RUN_TEST(test_iter_set_key_drops_cell_cursor);
 
 	/* 4. Iteration */
 	diag("Iteration tests");
@@ -42453,6 +43315,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iteration_reverse_order);
 	RUN_TEST(test_iteration_prefix_scoped);
 	RUN_TEST(test_iteration_prefix_scoped_key_at_scope);
+	RUN_TEST(test_iteration_prefix_scoped_compressed_run);
 	RUN_TEST(test_iteration_for_each_entry);
 	RUN_TEST(test_iter_copy);
 	RUN_TEST(test_iter_reset);
@@ -42538,6 +43401,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_cut_run_dst_split_keeps_keys);
 	RUN_TEST(test_rekey_graft_publish_survives_detach);
 	RUN_TEST(test_rekey_known_nonterminating);
+	RUN_TEST(test_rekey_dst_after_nil_key);
 	RUN_TEST(test_rekey_exclusive_drain_after_loss);
 	RUN_TEST(test_rekey_fixed_len_atomic_or_refused);
 	RUN_TEST(test_rekey_varlen_ordered_splice);
@@ -42575,8 +43439,11 @@ int main(int argc, char **argv)
 	RUN_TEST(test_graft_different_group_error);
 	RUN_TEST(test_graft_self_error);
 	RUN_TEST(test_graft_overflow_error);
+	RUN_TEST(test_bulk_long_dst_key);
+	RUN_TEST(test_bulk_move_key_end_byte);
 	RUN_TEST(test_graft_swap_basic);
 	RUN_TEST(test_graft_swap_into_empty);
+	RUN_TEST(test_graft_swap_nil_only_swap);
 	RUN_TEST(test_graft_swap_extract_empty_compressed_parent);
 	RUN_TEST(test_graft_swap_extract_run_balance);
 	RUN_TEST(test_graft_swap_at_root);
@@ -42733,6 +43600,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_empty_source);
 	RUN_TEST(test_merge_at_root_empty_dst);
 	RUN_TEST(test_merge_duplicate_chains);
+	RUN_TEST(test_merge_lone_key_at_root);
 	RUN_TEST(test_merge_invalid_arguments);
 	RUN_TEST(test_merge_concurrent_source);
 	RUN_TEST(test_merge_prefix_subtree);

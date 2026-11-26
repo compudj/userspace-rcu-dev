@@ -579,6 +579,20 @@ int ft_merge_lock_overlap(const struct cds_ft *ft,
 }
 
 /*
+ * Is merge side @nf a childless internal node?  Such a node holds nothing but
+ * the key which ends at it.  Only a trie root can be one: anywhere else that
+ * key is a plain leaf in its parent's slot.  So this is the root of a trie
+ * which holds only its zero-length key.
+ */
+static inline
+bool ft_merge_bare_root(struct cds_ft_inode_flag *nf)
+{
+	if (ft_node_external(nf) || ft_node_compressed(nf))
+		return false;
+	return ft_meta_nr_child(cds_ft_item_to_metadata(ft_node_ptr(nf))) == 0;
+}
+
+/*
  * @d_prov: ABSOLUTE byte-depth of the OLD dst node whose slot provided @D.
  * That node is the holder of @D when @D is EXTERNAL: a dup-chain head hangs
  * off its provider.  An anchor is a function of the holder's absolute depth
@@ -752,6 +766,21 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 */
 	if (S_ext && D_ext) {
 		ft_glue_record_splice(c->gd, D_leaf, S_leaf, d_prov);
+		*nr_keys_ret = 1;
+		return D;
+	}
+
+	/*
+	 * A childless source root against a dst leaf is the same case: the
+	 * source's zero-length key lands on the full key of the dst leaf.
+	 * Splice, keep the dst leaf, and retire the bare source root like any
+	 * internal overlap node.  Building M here would leave a childless
+	 * internal node below the dst root.
+	 */
+	if (D_ext && S_leaf && ft_merge_bare_root(S)) {
+		ft_glue_record_splice(c->gd, D_leaf, S_leaf, d_prov);
+		if (!s_ov_fenced)
+			ft_glue_defer_free(c->gs, ft_node_ptr(S), false);
 		*nr_keys_ret = 1;
 		return D;
 	}
@@ -933,6 +962,25 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 		total_keys += ck;
 	}
 
+	/*
+	 * No child on either side: D is a childless root, and S is a leaf or
+	 * another childless root.  The first set_nth allocates M, and none ran.
+	 * The merged node is still a root, so it stays internal: allocate it.
+	 */
+	if (!M) {
+		struct cds_ft_inode *bare;
+
+		bare = alloc_cds_ft_node(ft, &ft_types[0], &Mmeta);
+		if (!bare)
+			return FT_MERGE_OOM;
+		M = ft_node_flag(bare, 0);
+		ft_glue_track(c->gd, M);
+		Mmeta->parent_word = NULL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		ft_meta_parent_slot_offset_set(Mmeta, 0);
+#endif
+	}
+
 	/* Merged external_nodes (the key terminating at M itself). */
 	if (S_leaf && D_leaf) {
 		M_ext = D_leaf;
@@ -1078,6 +1126,11 @@ void ft_merge_count(struct cds_ft *ft, struct cds_ft_inode_flag *S, unsigned int
 		: cds_ft_item_to_metadata(ft_node_ptr(D))->external_nodes);
 	if (S_ext && D_ext) {
 		cnt->ns++;
+		return;
+	}
+	if (D_ext && S_leaf && ft_merge_bare_root(S)) {
+		cnt->ns++;	/* bare src root spliced onto the dst leaf */
+		cnt->nf_src++;
 		return;
 	}
 	cnt->nb++;		/* fresh branch M */
@@ -3999,6 +4052,50 @@ out:
 
 #endif /* FEATURE_FT_MERGE */
 
+#ifdef FEATURE_FT_MERGE
+/*
+ * The source head whose key is exactly @src_key ends, after the merge, at
+ * @dst_key.  Set the last key byte in its cell to that of @dst_key, and return
+ * the cell with its previous byte in *@old (see ft_head_set_key_end_byte).
+ * NULL when there is nothing to stamp, or when the arguments are ones the
+ * merge refuses.
+ *
+ * The attach paths stamp a moved LEAF themselves.  They do not stamp the
+ * prefix head of a moved internal node, whatever path attaches it.  So do it
+ * here, for all of them, while the source is still exclusive and whole.
+ */
+static
+struct ft_ord_cell *ft_merge_stamp_key_end(struct cds_ft *dst_ft,
+		const uint8_t *dst_key, size_t dst_key_len,
+		struct cds_ft *src_ft,
+		const uint8_t *src_key, size_t src_key_len, uint8_t *old)
+{
+	const struct rcu_flavor_struct *flavor;
+	const struct cds_ft_key_map *km;
+	struct cds_ft_node *head = NULL;
+	struct ft_ord_cell *cell = NULL;
+	size_t max_len;
+
+	if (!dst_ft || !src_ft || dst_ft == src_ft ||
+			dst_ft->group != src_ft->group || !src_ft->exclusive)
+		return NULL;
+	max_len = dst_ft->group->max_key_len;
+	if (!dst_key_len || !dst_key || dst_key_len > max_len ||
+			src_key_len > max_len || (src_key_len && !src_key))
+		return NULL;
+	km = &dst_ft->group->key_map;
+	flavor = dst_ft->group->flavor;
+	flavor->read_lock();
+	if (cds_ft_eager_lookup_key(src_ft, src_key, src_key_len, 0, &head)
+			== CDS_FT_STATUS_OK)
+		cell = ft_head_set_key_end_byte(src_ft, head, km->identity ?
+			dst_key[dst_key_len - 1] :
+			km->key_to_ordinal[dst_key[dst_key_len - 1]], old);
+	flavor->read_unlock();
+	return cell;
+}
+#endif
+
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
@@ -4007,6 +4104,8 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 #ifdef FEATURE_FT_MERGE
 	{
 		enum cds_ft_status st__;
+		struct ft_ord_cell *end_cell;
+		uint8_t end_old = 0;
 
 		FT_BW_OP(FT_BW_MERGE_AT);
 		/*
@@ -4024,8 +4123,14 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		 */
 		CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY);
 
+		end_cell = ft_merge_stamp_key_end(dst_ft, dst_key, dst_key_len,
+				src_ft, src_key, src_key_len, &end_old);
 		st__ = ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
 				src_key, src_key_len);
+		/* A refused merge leaves the key where it was: so does this. */
+		if (st__ != CDS_FT_STATUS_OK && end_cell)
+			ft_meta_incoming_byte_set(
+				cds_ft_item_to_metadata(end_cell), end_old);
 		return st__;
 	}
 #else

@@ -3571,6 +3571,17 @@ retry_attach:
 			if (nil_key_root)
 				cds_ft_item_to_metadata(graft_run_first)->incoming_byte =
 					key[key_len - 1];
+			/*
+			 * A source root with children keeps its zero-length
+			 * key as a prefix head, now of the key @key.  No
+			 * placement stamps a prefix head, but its cell holds
+			 * the last byte of its key all the same.
+			 */
+			else if (key_len)
+				(void) ft_head_set_key_end_byte(dst_ft,
+					ft_dereference_external(
+						src_rmeta->external_nodes),
+					key[key_len - 1], NULL);
 			graft_run.run_first = graft_run_first;
 			graft_run.run_last = graft_run_last;
 			graft_run.pred = graft_pred;
@@ -4345,6 +4356,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 */
 		struct cds_ft_inode_flag *gs_pub_old = NULL;
 		bool swap_empty;
+		bool swap_nil_only;	/* swap holds only its zero-length key */
 		bool old_child_external = false;
 		bool have_insert = false;
 		unsigned long old_count = 0, swap_count;
@@ -4528,7 +4540,19 @@ retry_swap:
 #endif
 		swap_rmeta = ft_root_metadata(swap_ft);
 		swap_empty = (ft_meta_nr_child(swap_rmeta) == 0 && !swap_rmeta->external_nodes);
+		swap_nil_only = (ft_meta_nr_child(swap_rmeta) == 0 && swap_rmeta->external_nodes);
 		swap_count = swap_empty ? 0 : ft_nr_keys_get(swap_rmeta);
+		/*
+		 * The zero-length key of swap_ft becomes the key @key of dst.
+		 * Its cell holds the last byte of its key.  As the prefix head
+		 * of the swap root it is stamped by no placement.  Nothing
+		 * reads the byte of a zero-length key, and swap_ft is
+		 * exclusive, so set it before the build.
+		 */
+		if (key_len && swap_rmeta->external_nodes)
+			(void) ft_head_set_key_end_byte(dst_ft,
+				ft_dereference_external(swap_rmeta->external_nodes),
+				key[key_len - 1], NULL);
 
 		/*
 		 * Identify the displaced old-child and its key count.  KEY_SHORTER: the
@@ -4595,7 +4619,19 @@ retry_swap:
 		 * Insert side (cluster A): canonicalized swap content, placed at the
 		 * graft point in dst.  Empty swap inserts nothing (a remove).
 		 */
-		if (!swap_empty) {
+		if (swap_nil_only) {
+			/*
+			 * The swap content is one key, held by a childless root.
+			 * Such a node is only legal AT a root.  Placed below the
+			 * dst root it is a childless internal node where a leaf
+			 * belongs: with a @key as long as the group allows, the
+			 * next descent walks past the maximum key length.  Place
+			 * the key's chain head itself, as cds_ft_graft does.  The
+			 * emptied root is retired once swap_ft lets go of it.
+			 */
+			canon = (struct cds_ft_inode_flag *) ft_dereference_external(
+				swap_rmeta->external_nodes);
+		} else if (!swap_empty) {
 			canon = ft_compress_single_child_if_needed(dst_ft,
 				old_swap_root, &glue_insert);
 			if (canon == (struct cds_ft_inode_flag *) (long) -ENOMEM)
@@ -5264,6 +5300,16 @@ retry_swap:
 				swap_retire_txn = NULL;	/* consumed */
 				FT_TP(root_publish, (const void *) swap_ft,
 					(const void *) swap_ft->root);
+				/*
+				 * The childless root whose key chain went into
+				 * dst on its own: nothing names it any more, and
+				 * the exclusive swap_ft has no reader inside it.
+				 */
+				if (swap_nil_only) {
+					ft_meta_tombstone_set_flip(swap_rmeta);
+					free_cds_ft_node(swap_ft,
+						ft_node_ptr(old_swap_root));
+				}
 			}
 		} else {
 			/*

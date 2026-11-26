@@ -2920,8 +2920,8 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 	parent_compressed = parent_compressed || ft_node_skip_compressed(p);
 #endif
 	if (!parent_compressed)
-		meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
-			&ft_types[ft_node_type(p)], ft_node_ptr(p), slot));
+		ft_meta_incoming_byte_set(meta, FT_DT_IB_STORE(meta,
+			ft_slot_to_byte(&ft_types[ft_node_type(p)], ft_node_ptr(p), slot)));
 }
 
 /*
@@ -4724,7 +4724,42 @@ void ft_head_stamp_incoming_byte(const struct cds_ft *ft,
 	 */
 	if (!prev || !((uintptr_t) prev & FT_ORD_CELL_TAG))
 		return;
-	cds_ft_item_to_metadata(ft_ord_cell_ptr(prev))->incoming_byte = byte;
+	ft_meta_incoming_byte_set(cds_ft_item_to_metadata(ft_ord_cell_ptr(prev)),
+		byte);
+}
+
+/*
+ * Set the last key byte kept in the ordered cell of @head, a duplicate-chain
+ * head, to @byte.  Return the cell, with the byte it held in *@old, or NULL
+ * when the list is off or @head owns no cell.
+ *
+ * This is for the head whose key ENDS at the prefix a cross-trie operation
+ * moves.  When that head is the prefix head of the moved subtree, no
+ * placement stamps it: ft_head_stamp_incoming_byte skips a prefix head, which
+ * has no edge byte.  But the cell holds the last byte of the head's KEY, and
+ * that byte changes with the prefix.  The up-walk reads it as soon as the keys
+ * below are removed and the head drops into a slot.
+ *
+ * A plain store.  The caller guarantees that no reader reaches @head: it is in
+ * an exclusive source trie.
+ */
+static inline
+struct ft_ord_cell *ft_head_set_key_end_byte(const struct cds_ft *ft,
+		struct cds_ft_node *head, uint8_t byte, uint8_t *old)
+{
+	struct cds_ft_metadata *cmeta;
+	void *prev;
+
+	if (!ft->ordered_list || !head)
+		return NULL;
+	prev = ft_dereference_prev_resolved(head);
+	if (!prev || !((uintptr_t) prev & FT_ORD_CELL_TAG))
+		return NULL;
+	cmeta = cds_ft_item_to_metadata(ft_ord_cell_ptr(prev));
+	if (old)
+		*old = ft_meta_incoming_byte(cmeta);
+	ft_meta_incoming_byte_set(cmeta, byte);
+	return ft_ord_cell_ptr(prev);
 }
 
 /*
@@ -4873,9 +4908,9 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 				&& !ft_node_skip_compressed(parent_nf)
 #endif
 		   )
-			meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
-				&ft_types[ft_node_type(parent_nf)],
-				ft_node_ptr(parent_nf), slot));
+			ft_meta_incoming_byte_set(meta, FT_DT_IB_STORE(meta,
+				ft_slot_to_byte(&ft_types[ft_node_type(parent_nf)],
+				ft_node_ptr(parent_nf), slot)));
 		ft_ch_audit_parent_at(fn, line, ft, meta, parent_nf, excl);
 		rcu_assign_pointer(meta->parent_word, stored_parent);
 		ft_set_parent_slot(meta, parent_nf, slot);

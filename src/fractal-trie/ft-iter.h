@@ -363,7 +363,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 
 		if (pos == 0)
 			return 0;
-		out[--pos] = (uint8_t) hmeta->incoming_byte;
+		out[--pos] = ft_meta_incoming_byte(hmeta);
 	} else if (!ft_node_compressed(ft_resolve_skip_compressed(ft, nf))) {
 		/*
 		 * Parent is an internal (slot-array) node.  Write the head's edge
@@ -418,7 +418,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 
 			if (pos == 0)
 				return 0;
-			out[--pos] = (uint8_t) hmeta->incoming_byte;
+			out[--pos] = ft_meta_incoming_byte(hmeta);
 		}
 	}
 	/* else parent compressed: the head byte is covered by its key_bytes. */
@@ -500,7 +500,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 					ft_resolve_skip_compressed(ft, parent))) {
 				if (pos == 0)
 					return 0;
-				out[--pos] = (uint8_t) meta->incoming_byte;
+				out[--pos] = ft_meta_incoming_byte(meta);
 			}
 			from = nf;	/* whose parent_word produced the next @nf */
 			nf = parent;
@@ -943,6 +943,15 @@ void ft_iter_set_key_ordinals(struct cds_ft_iter *iter, const uint8_t *ordinals,
 	iter->path_len = 0;
 	iter->key_len = key_len;
 	iter->key_off = 0;	/* search key sits at the front of iter_key */
+	/*
+	 * Drop the cached cell with the position, as cds_ft_iter_bind_key
+	 * does.  cds_ft_iter_set_key is how an iterator is carried across a
+	 * dropped read-side lock, and the cell may be freed meanwhile.
+	 * ft_ord_cell_cursor trusts it whenever its node matches @node: a
+	 * node which was removed and inserted again matches.
+	 */
+	iter->ord_cell = NULL;
+	iter->ord_cell_node = NULL;
 }
 
 enum cds_ft_status cds_ft_iter_set_key(struct cds_ft_iter *iter, const uint8_t *key, size_t key_len)

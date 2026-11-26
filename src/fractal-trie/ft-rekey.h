@@ -1264,8 +1264,10 @@ int ft_rekey_ord_interleave(struct cds_ft *ft, struct cds_ft_inode_flag *D,
 			pool = np;
 			pool_cap = ncap;
 		}
-		memcpy(pool + pool_len, sbuf + (max_len - sfl) + src_len,
-			suf_len);
+		/* The pool is still NULL when the first suffixes are empty. */
+		if (suf_len)
+			memcpy(pool + pool_len,
+				sbuf + (max_len - sfl) + src_len, suf_len);
 		caps[nsrc].cell = sc;
 		caps[nsrc].suffix_off = pool_len;
 		caps[nsrc].suffix_len = suf_len;
@@ -1602,6 +1604,26 @@ int ft_rekey_climb_reaches_graft(struct cds_ft *ft,
 	return steps;
 }
 
+/*
+ * Is @cell the ordinal cell of the zero-length key?  That key is the prefix
+ * head of the root: it sits in the root's external_nodes.
+ */
+static
+bool ft_rekey_cell_is_nil_key(struct cds_ft *ft, struct ft_ord_cell *cell)
+{
+	struct cds_ft_inode_flag *root =
+		ft_resolve_flip_proxy(rcu_dereference(ft->root));
+	struct cds_ft_node *head = ft_dereference_external(
+		cds_ft_item_to_metadata(ft_node_ptr(root))->external_nodes);
+	void *prev;
+
+	if (!head)
+		return false;
+	prev = ft_dereference_prev_resolved(head);
+	return prev && ((uintptr_t) prev & FT_ORD_CELL_TAG) &&
+		ft_ord_cell_ptr(prev) == cell;
+}
+
 static
 int ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
 		size_t dst_len, struct ft_ord_cell *pred,
@@ -1622,7 +1644,13 @@ int ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
 		return 0;			/* tail insert, but pred is not the max */
 	if (pred && pred != sentinel) {
 		klen = ft_rebuild_key_upwalk(ft, pred, scratch, max_len);
-		if (!klen)
+		/*
+		 * The zero-length key rebuilds to a length of 0 too.  It is
+		 * the smallest key, so as @pred it brackets any destination.
+		 * Only for another cell is 0 an unreadable walk.  Taken for
+		 * one here, the caller retried without end.
+		 */
+		if (!klen && !ft_rekey_cell_is_nil_key(ft, pred))
 			return 0;		/* unreadable: torn */
 		if (ft_rekey_prefix_range_cmp(scratch + (max_len - klen),
 				klen, dst_ord, dst_len) >= 0)

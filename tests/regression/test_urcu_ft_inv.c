@@ -92,7 +92,8 @@
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
 /* +1 inv_graft_swap_whole_seam_points */
-#define NR_TESTS	(149 + NR_TESTS_REKEY_DLM)	/* +1: inv_compact_vs_graft; +1: inv_compact_vs_rekey; +1: inv_detach_orphan_shape; +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
+/* +1 inv_nil_key_insert_vs_remove_all; +1 inv_compact_one_shot_grace_period */
+#define NR_TESTS	(151 + NR_TESTS_REKEY_DLM)	/* +1: inv_compact_vs_graft; +1: inv_compact_vs_rekey; +1: inv_detach_orphan_shape; +1: inv_owned_long_runs; +1: inv_owned_prefix_dense_remove_all; +1: inv_ir_prefix_roundtrip; +1: inv_owned_prefix_dense_replace; +1: inv_owned_prefix_dense; +1: inv_guard_compressed_publish; +1: inv_concurrent_insert_unique_dense; +1: inv_prefix_pair_compressed_holder; +1: inv_prefix_siblings_compressed_holder; +1: inv_concurrent_insert_unique_prefix; +1: inv_prefix_dup_promote_vs_extension; +1: inv_prefix_shape_zoo */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -705,7 +706,7 @@ insert_u64(struct cds_ft *ft, uint64_t v, struct ft_test_node *n)
 
 	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
 	/* Stash the ordinal key bytes for speculative leaf-key capture. */
-	memcpy(n->okey, k, sizeof(n->okey));
+	memcpy(n->okey, k, sizeof(k));
 	return cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n->node);
 }
 
@@ -716,7 +717,7 @@ insert_replace_u64(struct cds_ft *ft, uint64_t v, struct ft_test_node *n,
 	uint8_t k[8] = { 0 };
 
 	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
-	memcpy(n->okey, k, sizeof(n->okey));
+	memcpy(n->okey, k, sizeof(k));
 	return cds_ft_insert_replace(ft, k, CDS_FT_LEN_DEFAULT, &n->node, old_ret);
 }
 
@@ -726,7 +727,7 @@ lookup_u64(struct cds_ft *ft, uint64_t v, struct cds_ft_node **out)
 	uint8_t k[8];
 
 	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
-	return cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, out);
+	return cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, 0, out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -11223,7 +11224,7 @@ static void *inv_replace_skipx_writer(void *arg)
 		 * later cds_ft_next the key 0.  The walk then asks for the
 		 * successor of the wrong key.
 		 */
-		memcpy(newn->okey, k, sizeof(newn->okey));
+		memcpy(newn->okey, k, sizeof(k));
 		rcu_read_lock();
 		pthread_mutex_lock(&ctx->lock);
 		/* Look up the current head under the writer mutex, then replace it
@@ -19211,7 +19212,7 @@ static void populate_range(struct cds_ft *ft, uint64_t base, unsigned int count)
 		uint8_t k[8] = { 0 };
 
 		cds_ft_u64_to_key(ft, base + i, k, 4);
-		memcpy(n->okey, k, sizeof(n->okey));
+		memcpy(n->okey, k, sizeof(k));
 		cds_ft_insert(ft, k, 4, &n->node);
 	}
 }
@@ -19633,7 +19634,7 @@ static void populate_at_prefix(struct cds_ft *ft, const uint8_t *prefix,
 		if (prefix_len)
 			memcpy(k, prefix, prefix_len);
 		k[kl++] = (uint8_t) i;		/* distinct suffix byte */
-		memcpy(n->okey, k, sizeof(n->okey));
+		memcpy(n->okey, k, sizeof(k));
 		if (cds_ft_insert(ft, k, kl, &n->node) != CDS_FT_STATUS_OK)
 			abort();
 	}
@@ -30756,6 +30757,223 @@ static int inv_rekey_shape_concurrent(void)
 	return 0;
 }
 
+/* ================================================================== */
+/*                                                                    */
+/*   The zero-length key: cds_ft_insert vs cds_ft_remove_all          */
+/*                                                                    */
+/*   The zero-length key is stored in the root's external_nodes       */
+/*   word.  One thread inserts duplicates of it while another         */
+/*   removes the whole chain, under the default writer strategy.      */
+/*   Each inserted node must be handed back by exactly one            */
+/*   remove_all, or still be in the trie at the end.                  */
+/*                                                                    */
+/* ================================================================== */
+
+struct nilra_ctx {
+	struct cds_ft *ft;
+	unsigned long inserted;		/* inserter only */
+	unsigned long returned;		/* remover only */
+	unsigned long bad_status;
+};
+
+static void *nilra_inserter(void *arg)
+{
+	struct nilra_ctx *c = (struct nilra_ctx *) arg;
+
+	rcu_register_thread();
+	while (!test_go_load())
+		caa_cpu_relax();
+	while (!test_stop_load()) {
+		struct ft_test_node *n = node_alloc(0);
+		enum cds_ft_status s;
+
+		rcu_read_lock();
+		s = cds_ft_insert(c->ft, (const uint8_t *) "", 0, &n->node);
+		rcu_read_unlock();
+		if (s == CDS_FT_STATUS_OK) {
+			c->inserted++;
+		} else {
+			uatomic_inc(&c->bad_status);
+			node_free(n);
+		}
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *nilra_remover(void *arg)
+{
+	struct nilra_ctx *c = (struct nilra_ctx *) arg;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	while (!test_go_load())
+		caa_cpu_relax();
+	while (!test_stop_load()) {
+		struct cds_ft_node *head = NULL, *next;
+		enum cds_ft_status s;
+
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, (const uint8_t *) "", 0);
+		s = cds_ft_remove_all(c->ft, iter, &head);
+		if (s == CDS_FT_STATUS_OK) {
+			for (; head; head = next) {
+				next = cds_ft_node_next_rcu(head);
+				c->returned++;
+				node_free_rcu(to_test_node(head));
+			}
+		} else if (s != CDS_FT_STATUS_NOT_FOUND) {
+			uatomic_inc(&c->bad_status);
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int nilra_run(bool list_on)
+{
+	struct nilra_ctx c;
+	struct cds_ft_group *group;
+	struct cds_ft_iter *iter;
+	struct cds_ft_node *head, *next;
+	pthread_t ins, rm;
+	struct timespec t0;
+	unsigned long left = 0;
+	int ret = 0;
+
+	memset(&c, 0, sizeof(c));
+	c.ft = list_on ? create_varlen_ord_ft(&group) :
+		create_varlen_nolist_ft(&group);
+	test_go_set(0);
+	test_stop_set(0);
+	pthread_create(&ins, NULL, nilra_inserter, &c);
+	pthread_create(&rm, NULL, nilra_remover, &c);
+	test_go_set(1);
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop_set(1);
+	pthread_join(ins, NULL);
+	pthread_join(rm, NULL);
+	rcu_thread_online();
+
+	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_lock();
+	if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK)
+		ret = -1;
+	cds_ft_iter_set_key(iter, (const uint8_t *) "", 0);
+	head = NULL;
+	if (cds_ft_remove_all(c.ft, iter, &head) == CDS_FT_STATUS_OK) {
+		for (; head; head = next) {
+			next = cds_ft_node_next_rcu(head);
+			left++;
+			node_free_rcu(to_test_node(head));
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	if (c.inserted != c.returned + left || c.bad_status) {
+		fprintf(stderr, "inv_nil_key_insert_vs_remove_all (list %s): "
+			"inserted %lu, handed back %lu, left in the trie %lu, "
+			"unexpected statuses %lu\n", list_on ? "on" : "off",
+			c.inserted, c.returned, left, c.bad_status);
+		ret = -1;
+	}
+	if (drain_and_destroy(c.ft, group))
+		ret = -1;
+	return ret;
+}
+
+static int inv_nil_key_insert_vs_remove_all(void)
+{
+	if (nilra_run(true))
+		return -1;
+	return nilra_run(false);
+}
+
+/* ================================================================== */
+/*                                                                    */
+/*   One-shot compaction lets grace periods complete                  */
+/*                                                                    */
+/*   A thread runs cds_ft_compact() passes back to back and reports   */
+/*   no quiescent state of its own.  A synchronize_rcu() in another   */
+/*   thread must still return: the pass reports quiescent states      */
+/*   between its steps.  Otherwise everything the pass retires stays  */
+/*   allocated until it returns.                                      */
+/*                                                                    */
+/* ================================================================== */
+
+#define CGP_NR_KEYS	4096
+#define CGP_MAX_PASSES	400
+
+struct cgp_ctx {
+	int waiting;
+	int done;
+};
+
+static void *cgp_sync_thread(void *arg)
+{
+	struct cgp_ctx *c = (struct cgp_ctx *) arg;
+
+	uatomic_store(&c->waiting, 1, CMM_RELEASE);
+	synchronize_rcu();
+	uatomic_store(&c->done, 1, CMM_RELEASE);
+	return NULL;
+}
+
+static int inv_compact_one_shot_grace_period(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(8, &group);
+	struct cgp_ctx c = { 0, 0 };
+	unsigned int pass;
+	pthread_t th;
+	uint64_t i;
+	int ret = 0;
+
+	rcu_read_lock();
+	for (i = 0; i < CGP_NR_KEYS; i++) {
+		if (insert_u64(ft, i * 0x9e3779b97f4a7c15ULL,
+				node_alloc(i)) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+	rcu_quiescent_state();
+
+	pthread_create(&th, NULL, cgp_sync_thread, &c);
+	while (!uatomic_load(&c.waiting, CMM_ACQUIRE))
+		caa_cpu_relax();
+	/* From here on, the only quiescent states are the pass's own. */
+	for (pass = 0; pass < CGP_MAX_PASSES &&
+			!uatomic_load(&c.done, CMM_ACQUIRE); pass++) {
+		if (cds_ft_compact(ft) != CDS_FT_COMPACT_DONE) {
+			fprintf(stderr, "inv_compact_one_shot_grace_period: "
+				"pass %u did not complete\n", pass);
+			ret = -1;
+			break;
+		}
+	}
+	if (!uatomic_load(&c.done, CMM_ACQUIRE)) {
+		fprintf(stderr, "inv_compact_one_shot_grace_period: no grace "
+			"period completed during %u one-shot passes\n", pass);
+		ret = -1;
+	}
+	rcu_thread_offline();
+	pthread_join(th, NULL);
+	rcu_thread_online();
+	if (drain_and_destroy(ft, group))
+		ret = -1;
+	return ret;
+}
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
@@ -31034,6 +31252,8 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_remove_all_prefix_coarse);
 	RUN_TEST(inv_concurrent_insert_replace_nolist);
 	RUN_TEST(inv_concurrent_insert_replace_coarse);
+	RUN_TEST(inv_nil_key_insert_vs_remove_all);
+	RUN_TEST(inv_compact_one_shot_grace_period);
 
 	rcu_barrier();
 	rcu_unregister_thread();
